@@ -2,7 +2,20 @@
 // No clipboard listener, GetClipboardData, SetClipboardData or SendInput in this test.
 #include "clipboard_preview_probe.h"
 #include <fstream>
+// Observe the actual system sample consumed by Show(), rather than racing it
+// against a separate GetCursorPos call while the user is moving their mouse.
+static bool observe_cursor{},cursor_sampled{};
+static POINT observed_cursor{};
+static DWORD cursor_error{};
+static BOOL ObserveCursorPosition(POINT* point){
+    const BOOL ok=GetCursorPos(point);
+    if(observe_cursor)cursor_error=ok?ERROR_SUCCESS:GetLastError();
+    if(ok&&observe_cursor&&!cursor_sampled){observed_cursor=*point;cursor_sampled=true;}
+    return ok;
+}
+#define GetCursorPos ObserveCursorPosition
 #include "../src/clipboard/panel.cpp"
+#undef GetCursorPos
 #include "export/png.h"
 #include <iostream>
 #include <psapi.h>
@@ -140,11 +153,33 @@ static int Appearance(){
     p.OpenMore();p.Present();p.CloseMore();p.Fold();expect(p.search_text_glyphs==0,"fold resets search rendering state");p.Enable(false,false);return failures?1:0;
 }
 static int Features(){
+    // The focused runner may itself use build/ as its working directory.
+    // Keep the existing preview paths valid in both supported invocation forms.
+    std::filesystem::create_directories(L"build");
     int failures=0;auto expect=[&](bool ok,const char* message){std::cout<<(ok?"PASS ":"FAIL ")<<message<<std::endl;failures+=!ok;};
     ClipboardPanel panel(nullptr,[]{});auto& p=*panel.impl_;p.test_mode=true;expect(p.Enable(true,false),"enable isolated feature audit");
     auto text=[](const std::wstring& value){clipboard::Entry e;e.text=value;e.kind=clipboard::Kind::Text;const auto* b=reinterpret_cast<const unsigned char*>(value.c_str());e.formats.push_back({CF_UNICODETEXT,{b,b+(value.size()+1)*2}});return e;};
     for(int i=0;i<12;++i)p.history.Add(text(i%3==0?L"https://example.com/long-wrapped-link-for-clipboard-layout/"+std::to_wstring(i):L"合成剪贴内容 "+std::to_wstring(i)));
+    for(float dpi:{1.f,1.5f,2.f})for(POINT point:{POINT{-1915,5},POINT{-10,1070},POINT{-900,500}}){
+        const RECT work{-1920,0,0,1080};const auto bounds=clipboard::PanelNearCursor(point,work,{static_cast<LONG>(400*dpi),static_cast<LONG>(744*dpi)},dpi);
+        expect(bounds.left>=work.left&&bounds.top>=work.top&&bounds.right<=work.right&&bounds.bottom<=work.bottom,"cursor placement fits negative-origin monitor work area at every DPI");
+    }
+    const auto cursor_diagnostic=[&](const char* phase){std::cout<<"CURSOR "<<phase<<" sampled="<<cursor_sampled<<" observed="<<observed_cursor.x<<","<<observed_cursor.y<<" error="<<cursor_error<<" has_summon="<<p.summon_cursor.has_value()<<" summon="<<(p.summon_cursor?p.summon_cursor->x:0)<<","<<(p.summon_cursor?p.summon_cursor->y:0)<<" pinned="<<p.pinned<<" expanded="<<p.expanded<<" opening="<<p.opening<<" foreground="<<GetForegroundWindow()<<" panel="<<p.window<<" native="<<p.native_window<<" folded="<<p.folded_window<<std::endl;};
+    const POINT strip_anchor=p.anchor;observe_cursor=true;cursor_sampled=false;p.Show();observe_cursor=false;cursor_diagnostic("first-show");p.StopOpening(true);cursor_diagnostic("first-settled");
+    expect(cursor_sampled&&p.summon_cursor&&p.summon_cursor->x==observed_cursor.x&&p.summon_cursor->y==observed_cursor.y,"explicit normal summon samples current pointer");
+    p.summon_cursor=POINT{MAXLONG,MAXLONG};observe_cursor=true;cursor_sampled=false;p.Show();observe_cursor=false;cursor_diagnostic("second-show");p.StopOpening(true);cursor_diagnostic("second-settled");
+    expect(cursor_sampled&&p.summon_cursor&&p.summon_cursor->x==observed_cursor.x&&p.summon_cursor->y==observed_cursor.y,"every explicit summon replaces previous transient position");
+    p.Fold();expect(!p.summon_cursor&&p.anchor.x==strip_anchor.x&&p.anchor.y==strip_anchor.y,"fold restores unchanged strip anchor");
+    p.Show(false);p.StopOpening(true);expect(!p.summon_cursor,"edge strip expansion retains its remembered position");p.Fold();
+    p.pinned=true;p.Show();p.StopOpening(true);expect(!p.summon_cursor&&p.anchor.x==strip_anchor.x&&p.anchor.y==strip_anchor.y,"pinned summon keeps original position");p.pinned=false;p.Fold();
     p.expanded=true;p.Filter();p.Place();p.Render();p.Key(VK_END);const auto old=p.selected;expect(p.scroll==7,"End reveals oldest item");
+    BYTE cleanup_original[256]{},cleanup_keys[256]{};GetKeyboardState(cleanup_original);
+    cleanup_keys[VK_CONTROL]=cleanup_keys[VK_SHIFT]=0x80;SetKeyboardState(cleanup_keys);p.Key(VK_RETURN);
+    expect(p.copy_plain&&p.copy_remove_whitespace&&p.last_read_id==old,"Ctrl+Shift+Enter requests whitespace-free plain text from selected record");
+    cleanup_keys[VK_CONTROL]=0;SetKeyboardState(cleanup_keys);p.Key(VK_RETURN);
+    expect(p.copy_plain&&!p.copy_remove_whitespace,"Shift+Enter retains plain text without cleanup");
+    cleanup_keys[VK_SHIFT]=0;SetKeyboardState(cleanup_keys);p.Key(VK_RETURN);
+    expect(!p.copy_plain&&!p.copy_remove_whitespace,"Enter retains rich paste semantics");SetKeyboardState(cleanup_original);
     const auto click=[&](int action,uint64_t id){p.Render();for(const auto& hit:p.hits)if(hit.action==action&&hit.id==id){const int x=static_cast<int>((hit.rect.left+hit.rect.right)*p.scale/2),y=static_cast<int>((hit.rect.top+hit.rect.bottom)*p.scale/2);SendMessageW(p.window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));SendMessageW(p.window,WM_LBUTTONUP,0,MAKELPARAM(x,y));return;}expect(false,"action has a rendered hit target");};
     click(31,old);expect(p.history.Find(old)->favorite&&p.visible.front()==old&&p.selected==old&&p.scroll==0,"actual row pin click moves entry to visible top and preserves selection");
     p.history.Add(text(L"新复制的合成内容"));p.Filter();expect(p.visible.front()==old,"new content cannot push pin down");

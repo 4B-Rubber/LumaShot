@@ -61,6 +61,10 @@ std::vector<ui::Control> PropertyControls(Tool tool,NumberCombo combo,Box area,f
     return result;
 }
 }
+const wchar_t* ToolbarActionName(int id) {
+    constexpr std::array<LPCWSTR,19> names{L"选择 / 移动 V",L"矩形 R",L"圆形 E",L"箭头 A",L"铅笔 P",L"文字 T",L"马赛克 M",L"撤销 Ctrl+Z",L"重做 Ctrl+Y",L"保存 Ctrl+S",L"复制 Ctrl+C",L"取消 Esc",L"完成 Enter",L"置顶贴图 F3",L"序号",L"识别文字 / 表格",L"录制",L"长截图 L",L"截图翻译"};
+    return id>=0&&id<static_cast<int>(names.size())?names[static_cast<size_t>(id)]:L"";
+}
 Box ToolbarLayout::Button(int id)const {
     const float s=scale;
     if((id>=1&&id<=6)||id==14){const int index=id==14?6:id-1;const float w=(tools.right-tools.left)/columns;const float x=tools.left+(index%columns)*w,y=tools.top+(index/columns)*36*s;return {x,y,x+w-4*s,y+32*s};}
@@ -68,7 +72,7 @@ Box ToolbarLayout::Button(int id)const {
     // 17 = long capture; shares the recording availability (hidden while editing a pin).
     // 18 = screenshot translation (pin + OCR + translate); needs OCR, hidden while editing a pin.
     constexpr std::array<int,12> order{0,7,8,9,10,13,15,18,17,16,11,12};
-    const auto slots=[&](int action){return action==15?(ocr_available?2:0):(action==16||action==17)?(recording_available?1:0):action==18?(ocr_available&&recording_available?1:0):1;};
+    const auto slots=[&](int action){return action==15?(ocr_available?1:0):(action==16||action==17)?(recording_available?1:0):action==18?(ocr_available&&recording_available?1:0):1;};
     int total=0,slot=0;bool found=false;
     for(int action:order){total+=slots(action);if(action==id)found=true;else if(!found)slot+=slots(action);}
     if(!found)return {};
@@ -81,20 +85,24 @@ Box ToolbarLayout::Property(int id,Tool tool)const {
     return {};
 }
 ToolbarLayout PlaceToolbar(Box selection,RECT monitor,float scale,float expansion,Tool tool,NumberCombo combo) {
-    // Keep action labels and hit targets usable on narrow, high-DPI displays.
+    // Keep icon hit targets usable on narrow, high-DPI displays.
     scale=std::min(scale,float(monitor.right-monitor.left)/304.f);
     ToolbarLayout t;t.scale=scale;t.property_tool=tool;t.number_combo=combo;const float s=scale;
-    const float width=std::min(944.f,float(monitor.right-monitor.left)/s-16);const bool inlineActions=width>=844;
-    const int columns=std::clamp(int((width-24-(inlineActions?316:0))/82),1,7);t.columns=columns;
+    const bool compact=tool==Tool::Select;
+    const float actionWidth=compact?336.f:308.f,actionReserve=actionWidth+8;
+    const float width=std::min(compact?640.f:944.f,float(monitor.right-monitor.left)/s-16);
+    const bool inlineActions=width>=(compact?620.f:844.f);
+    const float toolsWidth=std::min(width-24-(inlineActions?actionReserve:0),compact?280.f:944.f);
+    const int columns=std::clamp(int(toolsWidth/(compact?36.f:82.f)),1,7);t.columns=columns;
     const float toolHeight=36.f*((7+columns-1)/columns);
-    t.tools={12*s,11*s,(width-12-(inlineActions?316:0))*s,(11+toolHeight)*s};
+    t.tools={12*s,11*s,(12+toolsWidth)*s,(11+toolHeight)*s};
     const float bodyTop=18+toolHeight+(inlineActions?0:36);
     t.colors={12*s,(bodyTop+6)*s,(width-12)*s,0};float propertyHeight=0;
     PropertyControls(tool,combo,t.colors,s,&propertyHeight);t.colors.bottom=t.colors.top+propertyHeight*s;
     const float fullHeight=bodyTop+6+propertyHeight+12;
     if(fullHeight*s>float(monitor.bottom-monitor.top)-16)return PlaceToolbar(selection,monitor,(float(monitor.bottom-monitor.top)-16)/fullHeight,expansion,tool,combo);
     const float height=bodyTop+(fullHeight-bodyTop)*std::clamp(expansion,0.f,1.f);
-    const float actionTop=inlineActions?12:14+toolHeight;const float actionLeft=std::max(12.f,width-320);
+    const float actionTop=inlineActions?12:14+toolHeight;const float actionLeft=std::max(12.f,width-12-actionWidth);
     t.actions={actionLeft*s,actionTop*s,(width-12)*s,(actionTop+30)*s};
     const float left=std::clamp(selection.right-width*s,float(monitor.left)+8*s,std::max(float(monitor.left)+8*s,float(monitor.right)-(width+8)*s));
     float top=selection.bottom+10*s;
@@ -106,8 +114,8 @@ ToolbarLayout PlaceToolbar(Box selection,RECT monitor,float scale,float expansio
 std::vector<ui::Control> ToolbarLayout::Controls(Tool tool)const {
     using ui::Kind;std::vector<ui::Control> result;
     ui::Control surface;surface.kind=Kind::Surface;surface.bounds=bounds;result.push_back(surface);
-    constexpr std::array<LPCWSTR,7> names{L"",L"矩形",L"圆形",L"箭头",L"铅笔",L"文字",L"马赛克"};
-    for(int i=0;i<19;++i){if((i==15&&!ocr_available)||((i==16||i==17)&&!recording_available)||(i==18&&!(ocr_available&&recording_available)))continue;ui::Control c;c.id=i;c.kind=Kind::Button;c.bounds=Button(i);c.text=i==15?L"OCR":i==14?L"序号":(i<=6?names[i]:L"");c.icon=i==15?-1:i;result.push_back(c);}
+
+    for(int i=0;i<19;++i){if((i==15&&!ocr_available)||((i==16||i==17)&&!recording_available)||(i==18&&!(ocr_available&&recording_available)))continue;ui::Control c;c.id=i;c.kind=Kind::Button;c.bounds=Button(i);c.accessible_name=ToolbarActionName(i);c.icon=i;result.push_back(c);}
     if(tool!=Tool::Select){auto properties=PropertyControls(tool,number_combo,colors,scale);result.insert(result.end(),properties.begin(),properties.end());}
     return result;
 }
@@ -195,4 +203,3 @@ bool AdjustPropertyValue(ViewState& state,int id,int steps) {
     *value=std::clamp(*value+float(steps),minimum,limit);return true;
 }
 }
-

@@ -47,10 +47,17 @@ public:
     // pick between equally good candidates on blank or periodic content.
     StitchResult Add(const Frame& frame,int hint=0);
     // After LowMatch the frame is held; the user can accept the best candidate.
-    StitchResult AcceptPending();
+    // fresh: a new capture of the same scroll position taken when the user
+    // decides (seconds later, so transient overlays and animations have
+    // usually finished). It is used instead when it matches cleanly or better.
+    // A segment accepted despite the low match is marked suspect: the next
+    // cleanly matching frame overwrites its rows that it shows differently.
+    StitchResult AcceptPending(const Frame* fresh=nullptr,int hint=0);
     void DropPending(){pending_.reset();}
     bool HasPending()const{return pending_.has_value();}
     int PendingShift()const{return pending_?pending_->shift:0;}
+    // Content rows rewritten from a later frame after a forced segment.
+    int RepairedRows()const{return repaired_rows_;}
     bool Undo();
     bool CanUndo()const{return !history_.empty();}
     bool Started()const{return width_>0;}
@@ -86,11 +93,14 @@ private:
     // Frame row y equals content row ref (-1: none) except columns [x0,x1),
     // which are stored in History::patch in row order.
     struct Line {int ref{-1};int x0{},x1{};};
-    struct History {int content_rows{};int header{};int shift{};RECT bounds{};std::vector<Line> lines;std::vector<uint32_t> patch;};
+    struct Repair {int row{};std::vector<uint32_t> pixels;}; // content row before a repair
+    struct History {int content_rows{};int header{};int shift{};RECT bounds{};std::vector<Line> lines;std::vector<uint32_t> patch;int suspect{-1};std::vector<Repair> repaired;};
     Estimate Find(const RowSignatures& f,int top,int bottom,int hint)const;
+    // Shift estimate plus the status Add would report (no Unchanged check).
+    Estimate Evaluate(const RowSignatures& f,int hint,StitchStatus* status)const;
     int ProfileFixedRows(const RowSignatures& f,bool from_top)const;
     double MatchRatio(const RowSignatures& f,int shift,int top,int bottom,int* informative=nullptr)const;
-    StitchResult Append(Frame frame,RowSignatures signatures,int shift,int top,int bottom);
+    StitchResult Append(Frame frame,RowSignatures signatures,int shift,int top,int bottom,bool forced=false);
     void DetectScrollbar(const Frame& frame,int shift,int top,int bottom);
     History Delta(int previous_header)const;
     Frame Restore(const History& entry)const;
@@ -104,6 +114,8 @@ private:
     std::vector<std::unique_ptr<uint32_t[]>> blocks_;
     int content_rows_{};
     int footer_{-1},header_{},scrollbar_{},last_shift_{},epoch_{};
+    int suspect_from_{-1};
+    int repaired_rows_{}; // first content row of a segment accepted despite a low match
     Frame last_;RowSignatures last_signatures_;
     std::vector<int> seams_;
     std::deque<History> history_;

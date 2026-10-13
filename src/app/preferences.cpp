@@ -63,6 +63,8 @@ Preferences Preferences::LoadFrom(const std::filesystem::path& path) {
     value.clipboard_strip_visible=GetPrivateProfileIntW(L"General",L"ClipboardStripVisible",1,path.c_str())!=0;
     value.clipboard_strip_hint_shown=GetPrivateProfileIntW(L"General",L"ClipboardStripHintShown",0,path.c_str())!=0;
     value.translate_auto_show=GetPrivateProfileIntW(L"General",L"TranslateAutoShow",1,path.c_str())!=0;
+    value.clothesline_enabled=GetPrivateProfileIntW(L"General",L"ClotheslineEnabled",1,path.c_str())!=0;
+    value.ocr_remove_whitespace=GetPrivateProfileIntW(L"General",L"OcrRemoveWhitespace",0,path.c_str())!=0;
     value.settings_page=std::clamp(static_cast<int>(GetPrivateProfileIntW(L"General",L"SettingsPage",0,path.c_str())),0,5);
     value.hotkeys_disabled=GetPrivateProfileIntW(L"General",L"HotkeysDisabled",0,path.c_str())!=0;
     value.disable_hotkeys_in_game=GetPrivateProfileIntW(L"General",L"DisableHotkeysInGame",0,path.c_str())!=0;
@@ -87,7 +89,11 @@ Preferences Preferences::LoadFrom(const std::filesystem::path& path) {
     value.translate_key=GetPrivateProfileIntW(L"General",L"TranslateHotkey",'Y',path.c_str());
     value.translate_modifiers=GetPrivateProfileIntW(L"General",L"TranslateModifiers",MOD_CONTROL|MOD_ALT,path.c_str());
     if(value.translate_key&&!ValidShortcut(value.translate_modifiers,value.translate_key)){value.translate_key='Y';value.translate_modifiers=MOD_CONTROL|MOD_ALT;}
+    shortcut(L"OcrHotkey",L"OcrModifiers",'O',value.ocr_key,value.ocr_modifiers);
+    shortcut(L"PinHotkey",L"PinModifiers",'P',value.pin_key,value.pin_modifiers);
     wchar_t folder[32768]{};
+    GetPrivateProfileStringW(L"General",L"OcrModelDirectory",L"",folder,32768,path.c_str());
+    value.ocr_model_directory=folder;
     GetPrivateProfileStringW(L"General",L"Folder",L"",folder,32768,path.c_str());
     value.save_directory=folder;
     value.update_auto_check=GetPrivateProfileIntW(L"General",L"UpdateAutoCheck",1,path.c_str())!=0;
@@ -127,6 +133,7 @@ void Preferences::SaveTo(const std::filesystem::path& destination) const {
     write(L"ClipboardStripVisible",clipboard_strip_visible?L"1":L"0");
     write(L"ClipboardStripHintShown",clipboard_strip_hint_shown?L"1":L"0");
     write(L"TranslateAutoShow",translate_auto_show?L"1":L"0");
+    write(L"ClotheslineEnabled",clothesline_enabled?L"1":L"0");
     write(L"SettingsPage",std::to_wstring(std::clamp(settings_page,0,5)));
     write(L"HotkeysDisabled",hotkeys_disabled?L"1":L"0");
     write(L"DisableHotkeysInGame",disable_hotkeys_in_game?L"1":L"0");
@@ -137,6 +144,10 @@ void Preferences::SaveTo(const std::filesystem::path& destination) const {
     write(L"GifHotkey",std::to_wstring(gif_key));write(L"GifModifiers",std::to_wstring(gif_modifiers));
     write(L"VideoHotkey",std::to_wstring(video_key));write(L"VideoModifiers",std::to_wstring(video_modifiers));
     write(L"ClipboardHotkey",std::to_wstring(clipboard_key));write(L"ClipboardModifiers",std::to_wstring(clipboard_modifiers));write(L"TranslateHotkey",std::to_wstring(translate_key));write(L"TranslateModifiers",std::to_wstring(translate_modifiers));
+    write(L"OcrRemoveWhitespace",ocr_remove_whitespace?L"1":L"0");
+    write(L"OcrModelDirectory",ocr_model_directory.native());
+    write(L"OcrHotkey",std::to_wstring(ocr_key));write(L"OcrModifiers",std::to_wstring(ocr_modifiers));
+    write(L"PinHotkey",std::to_wstring(pin_key));write(L"PinModifiers",std::to_wstring(pin_modifiers));
     SaveToolProperties(temporary,tools);
     // Remove obsolete tool selection while preserving all style preferences.
     if(!WritePrivateProfileStringW(L"General",L"LastTool",nullptr,temporary.c_str()))

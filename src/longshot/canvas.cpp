@@ -272,13 +272,16 @@ void LayeredCanvas::Paint(HWND window, Painter& painter, RECT screen, float scal
     const SIZE size{screen.right - screen.left, screen.bottom - screen.top};
     if (size.cx <= 0 || size.cy <= 0) return;
     // D2D draws in place into the layered DIB. Painter::Begin makes its brush
-    // per frame, so a resized DIB simply gets a new target.
-    if (!surface_ || size.cx != size_.cx || size.cy != size_.cy) {
+    // per frame, so a resized DIB simply gets a new target. The frame window
+    // follows the selection, so its size is often odd: the DIB is padded to
+    // even and only `size` is presented.
+    const SIZE padded{EvenSurfaceSize(size.cx), EvenSurfaceSize(size.cy)};
+    if (!surface_ || padded.cx != size_.cx || padded.cy != size_.cy) {
         target_.Reset();
-        surface_ = std::make_unique<DibSurface>(size.cx, size.cy);
-        size_ = size;
+        surface_ = std::make_unique<DibSurface>(padded.cx, padded.cy);
+        size_ = padded;
     }
-    if (!target_) target_ = CreateMemoryRenderTarget(painter.Factory(), surface_->Pixels(), size.cx, size.cy, size.cx);
+    if (!target_) target_ = CreateMemoryRenderTarget(painter.Factory(), surface_->Pixels(), padded.cx, padded.cy, padded.cx);
     target_->SetDpi(96, 96);
     target_->BeginDraw();
     target_->Clear(D2D1::ColorF(0, 0));

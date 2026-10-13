@@ -1,0 +1,78 @@
+LumaShot OCR speed, 2026-10-09. Intel Core i5-8400 (6C/6T), Windows 11, Release.
+tests/ocr_benchmark.cpp built against the old engine (ocr-old: 2 threads, lazy model load)
+and the new engine (ocr-final: 4 threads, Warmup, Service::Prewarm). Runs interleaved:
+old1, new1, old2, new2, old3, new3. Argument: 100 screenshots. AutoCAD and other apps open.
+service_* rows go through ocr::Service and lumashot_ocr_worker.exe (prewarmed: Prewarm, 700 ms, Submit).
+
+== fin-new1.log
+threads=4
+model_load_ms=377.174
+warmup_ms=14.9144
+first_recognize_ms=107.567
+screenshots=100 characters=7499 errors=28 CER=0.00373383 fixture_P50_ms=83.9853 fixture_P95_ms=102.845
+stages_avg preprocess=13.2865 detect=122.956 rec=324.538 decode=8.33666
+1080p_20lines_P50_ms=450.486 1080p_20lines_P95_ms=519.052 1080p_CER=0.00084246
+idle_cpu_ms_after_request_1s=0
+dense_ui_64_P50_ms=955.583 dense_found=64/64
+peak_working_set_MB=283.621 private_MB=248.133 sampled_peak_private_MB=268.043
+service_cold_first_ms=563.158 service_warm_P50_ms=125.368 service_warm_1080p_P50_ms=472.047
+service_prewarmed_first_ms=132.125 service_warm_P50_ms=139.536 service_warm_1080p_P50_ms=480.294
+== fin-new2.log
+threads=4
+model_load_ms=369.359
+warmup_ms=16.0097
+first_recognize_ms=80.4383
+screenshots=100 characters=7499 errors=28 CER=0.00373383 fixture_P50_ms=92.6955 fixture_P95_ms=147.981
+stages_avg preprocess=13.1375 detect=129.112 rec=357.394 decode=8.10518
+1080p_20lines_P50_ms=491.141 1080p_20lines_P95_ms=581.492 1080p_CER=0.00084246
+idle_cpu_ms_after_request_1s=0
+dense_ui_64_P50_ms=1029.76 dense_found=64/64
+peak_working_set_MB=277.449 private_MB=242.488 sampled_peak_private_MB=262.387
+service_cold_first_ms=580.525 service_warm_P50_ms=155.087 service_warm_1080p_P50_ms=497.263
+service_prewarmed_first_ms=122.283 service_warm_P50_ms=154.823 service_warm_1080p_P50_ms=501.161
+== fin-new3.log
+threads=4
+model_load_ms=358.59
+warmup_ms=13.7781
+first_recognize_ms=97.1619
+screenshots=100 characters=7499 errors=28 CER=0.00373383 fixture_P50_ms=90.5539 fixture_P95_ms=116.482
+stages_avg preprocess=13.8839 detect=134.987 rec=328.114 decode=8.24174
+1080p_20lines_P50_ms=465.967 1080p_20lines_P95_ms=537.941 1080p_CER=0.00084246
+idle_cpu_ms_after_request_1s=0
+dense_ui_64_P50_ms=1101.11 dense_found=64/64
+peak_working_set_MB=279.344 private_MB=248.57 sampled_peak_private_MB=268.652
+service_cold_first_ms=549.292 service_warm_P50_ms=142.149 service_warm_1080p_P50_ms=483.122
+service_prewarmed_first_ms=109.426 service_warm_P50_ms=125.843 service_warm_1080p_P50_ms=513.487
+== fin-old1.log
+threads=legacy
+model_load_ms=367.498
+first_recognize_ms=114.045
+screenshots=100 characters=7499 errors=28 CER=0.00373383 fixture_P50_ms=128.407 fixture_P95_ms=182.095
+stages_avg preprocess=13.3228 detect=157.961 rec=497.214 decode=8.11925
+1080p_20lines_P50_ms=646.505 1080p_20lines_P95_ms=761.102 1080p_CER=0.00084246
+dense_ui_64_P50_ms=1243.73 dense_found=64/64
+peak_working_set_MB=276.977 private_MB=242.375 sampled_peak_private_MB=262.281
+service_cold_first_ms=578.661 service_warm_P50_ms=157.541 service_warm_1080p_P50_ms=625.681
+service_prewarm=unsupported
+== fin-old2.log
+threads=legacy
+model_load_ms=357.787
+first_recognize_ms=110.004
+screenshots=100 characters=7499 errors=28 CER=0.00373383 fixture_P50_ms=121.228 fixture_P95_ms=154.385
+stages_avg preprocess=13.4732 detect=145.455 rec=481.758 decode=7.56606
+1080p_20lines_P50_ms=618.871 1080p_20lines_P95_ms=714.641 1080p_CER=0.00084246
+dense_ui_64_P50_ms=1189.24 dense_found=64/64
+peak_working_set_MB=279.34 private_MB=245.996 sampled_peak_private_MB=265.906
+service_cold_first_ms=578.684 service_warm_P50_ms=174.018 service_warm_1080p_P50_ms=673.206
+service_prewarm=unsupported
+== fin-old3.log
+threads=legacy
+model_load_ms=365
+first_recognize_ms=112.771
+screenshots=100 characters=7499 errors=28 CER=0.00373383 fixture_P50_ms=136.178 fixture_P95_ms=236.913
+stages_avg preprocess=13.7057 detect=152.961 rec=484.528 decode=7.03728
+1080p_20lines_P50_ms=620.74 1080p_20lines_P95_ms=740.168 1080p_CER=0.00084246
+dense_ui_64_P50_ms=1267.46 dense_found=64/64
+peak_working_set_MB=277.277 private_MB=243.965 sampled_peak_private_MB=263.867
+service_cold_first_ms=641.259 service_warm_P50_ms=172.22 service_warm_1080p_P50_ms=674.339
+service_prewarm=unsupported

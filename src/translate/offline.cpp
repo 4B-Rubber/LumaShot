@@ -5,9 +5,12 @@
 #include "update/http.h"
 #include "update/manifest.h"
 #include <windows.h>
-#include <dxgi.h>
+#include <dxgi1_4.h>
 #include <shlobj.h>
 #include <wrl/client.h>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -213,8 +216,16 @@ struct ServerState {
     HANDLE job{}, process{};
     std::string model, base;
     int active{};
-    bool cpu_only{};
+    bool cpu_only{}, gpu_failed{};
     PTP_TIMER timer{};
+    std::mutex warm_mutex;
+    std::jthread warm;
+    std::atomic<bool> warming{};
+    void StopWarm() {
+        std::jthread thread;
+        { std::lock_guard lock(warm_mutex); thread = std::move(warm); }
+        if (thread.joinable()) { thread.request_stop(); thread.join(); }
+    }
     void StopLocked() {
         if (job) TerminateJobObject(job, 0);
         if (process) { WaitForSingleObject(process, 3000); CloseHandle(process); }
@@ -224,6 +235,7 @@ struct ServerState {
         base.clear();
     }
     ~ServerState() {
+        StopWarm();
         if (timer) { SetThreadpoolTimer(timer, nullptr, 0, 0); WaitForThreadpoolTimerCallbacks(timer, TRUE); CloseThreadpoolTimer(timer); }
         StopLocked();
     }
@@ -464,7 +476,8 @@ bool Remove(const Model& model) {
 
 std::wstring ServerCommandLine(const fs::path& server, const fs::path& model, int port, bool cpu_only, const fs::path& log) {
     std::wstring command = L"\"" + server.wstring() + L"\" -m \"" + model.wstring() + L"\" --host 127.0.0.1 --port " + std::to_wstring(port)
-        + L" -c 4096 -np 1 --no-webui --log-file \"" + log.wstring() + L"\"";
+        + L" -c 6144 -np " + std::to_wstring(ServerSlots) + L" -kvu --no-webui --cache-ram 128 --threads-http " + std::to_wstring(ServerSlots + 1)
+        + L" --log-file \"" + log.wstring() + L"\"";
     if (cpu_only) command += L" -dev none";
     return command;
 }
@@ -480,7 +493,9 @@ std::optional<std::string> Acquire(const Model& model, std::stop_token stop, std
     const auto log = Root() / L"server.log";
     std::wstring last;
     // A broken GPU driver can crash the Vulkan backend; retry once on the CPU.
-    for (int attempt = s.cpu_only ? 1 : 0; attempt < 2; ++attempt) {
+    // A GPU whose free memory cannot hold the model is skipped up front.
+    const bool low_vram = PreferCpu(model, FreeVideoMemory());
+    for (int attempt = s.gpu_failed || low_vram ? 1 : 0; attempt < 2; ++attempt) {
         const bool cpu = attempt == 1;
         const int port = FreePort();
         if (!port) return fail(L"找不到可用的本机端口");
@@ -510,7 +525,7 @@ std::optional<std::string> Acquire(const Model& model, std::stop_token stop, std
             if (Healthy(s.base, stop)) { ready = true; break; }
             if (WaitForSingleObject(s.process, 250) == WAIT_OBJECT_0) { exited = true; break; }
         }
-        if (ready) { s.model = std::string(model.id); s.cpu_only = cpu; ++s.active; return s.base; }
+        if (ready) { s.model = std::string(model.id); s.cpu_only = cpu; s.gpu_failed = s.gpu_failed || (cpu && !low_vram); ++s.active; return s.base; }
         s.StopLocked();
         last = LogTail(log);
         if (!exited) return fail(L"离线引擎启动超时（3 分钟），请关闭占用内存的程序后重试");
@@ -532,8 +547,57 @@ void Release() {
 
 void Shutdown() {
     auto& s = State();
+    s.StopWarm();
     std::lock_guard lock(s.mutex);
     s.StopLocked();
+}
+
+bool ServerCpuOnly() {
+    auto& s = State();
+    std::lock_guard lock(s.mutex);
+    return s.process && WaitForSingleObject(s.process, 0) == WAIT_TIMEOUT && s.cpu_only;
+}
+
+void Prewarm(const Model& model, std::chrono::milliseconds delay) {
+    if (!RuntimeInstalled() || !ModelInstalled(model)) return;
+    auto& s = State();
+    std::lock_guard lock(s.warm_mutex);
+    if (s.warming.load()) return;
+    if (s.warm.joinable()) s.warm.join();   // finished: `warming` is cleared as its last step
+    s.warming = true;
+    s.warm = std::jthread([id = std::string(model.id), delay](std::stop_token stop) {
+        auto& state = State();
+        if (delay.count() > 0) {
+            std::mutex m; std::condition_variable_any wake; std::unique_lock wait(m);
+            wake.wait_for(wait, stop, delay, [] { return false; });
+        }
+        if (!stop.stop_requested()) if (const auto* found = FindModel(id)) { std::wstring reason; if (Acquire(*found, stop, &reason)) Release(); }
+        state.warming = false;
+    });
+}
+
+std::optional<std::uint64_t> FreeVideoMemory() {
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())))) return std::nullopt;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter, best;
+    std::uint64_t largest = 0;
+    for (UINT i = 0; factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+        if (desc.DedicatedVideoMemory >= (1ull << 30) && desc.DedicatedVideoMemory > largest) { largest = desc.DedicatedVideoMemory; best = adapter; }
+    }
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+    if (!best || FAILED(best.As(&adapter3))) return std::nullopt;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) return std::nullopt;
+    return info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+}
+
+bool PreferCpu(const Model& model, std::optional<std::uint64_t> free_vram) {
+    if (!free_vram) return false;   // no discrete GPU / unknown: let llama.cpp decide
+    // Weights + KV for the larger multi-slot context + compute buffers.
+    const double need = (double(model.vram_gb) + 0.25) * double(1ull << 30);
+    return double(*free_vram) < need;
 }
 
 bool ServerRunning() {

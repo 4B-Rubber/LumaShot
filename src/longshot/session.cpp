@@ -3,6 +3,7 @@
 #include "ui/acrylic.h"
 #include "ui/glass_surface.h"
 #include "ui/themed_message.h"
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <dwmapi.h>
@@ -21,6 +22,7 @@ constexpr wchar_t kBarClass[] = L"LumaShot.LongCaptureBar";
 constexpr wchar_t kPanelClass[] = L"LumaShot.LongCapturePanel";
 constexpr float kBarHeight = 52, kPanelWidth = 300;
 constexpr int kMaxHeight = 30000;
+constexpr int kLowMatchRetries = 2; // automatic second looks before asking about a poor overlap
 Session* g_hooked{};
 
 using Clock = std::chrono::steady_clock;
@@ -175,7 +177,17 @@ bool Session::Drain() {
             break;
         case Command::Force:
             if (stitcher_->HasPending()) {
-                const auto result = stitcher_->AcceptPending();
+                // Look once more before accepting: by the time the user decides,
+                // the overlay or animation that spoiled the overlap has usually
+                // gone, and a clean capture appends without baking it in.
+                std::optional<Frame> fresh;
+                try {
+                    DwmFlush();
+                    fresh = Capture();
+                } catch (const std::exception&) {
+                    fresh.reset();
+                }
+                const auto result = stitcher_->AcceptPending(fresh ? &*fresh : nullptr, stitcher_->PendingShift());
                 if (result.status == StitchStatus::Appended || result.status == StitchStatus::Limit) RecordSegment(pending_notches_);
                 pending_notches_ = 0;
                 problem_ = Problem::None;
@@ -366,6 +378,18 @@ void Session::AutoStep() {
         Publish();
         return;
     }
+    // A poor overlap right after a scroll is usually something still moving
+    // on screen: a sticky bar sliding in, a hover card, a fading toast, lazy
+    // images. Let it finish and look again before asking the user.
+    for (int attempt = 0; result.status == StitchStatus::LowMatch && attempt < kLowMatchRetries; ++attempt) {
+        auto again = Settle(attempt == 0 ? 250 : 500, 1200);
+        if (!again) return;
+        result = stitcher_->Add(*again, hint);
+    }
+    if (result.status == StitchStatus::Unchanged) {
+        Publish();
+        return;
+    }
     unchanged_steps_ = still_steps_ = 0;
     Handle(result, true, notches);
 }
@@ -388,7 +412,21 @@ void Session::ManualStep() {
     }
     if (!moving_) return;
     moving_ = false;
-    const StitchResult result = stitcher_->Add(current);
+    StitchResult result = stitcher_->Add(current);
+    if (result.status == StitchStatus::LowMatch) {
+        // Same as in auto mode: give transient overlays a moment to go away.
+        {
+            std::unique_lock lock(mutex_);
+            if (wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return cancel_ || finish_ || !commands_.empty(); }))
+                return;
+        }
+        Frame again = Capture();
+        RowSignatures again_rows = SignRows(again, guard_);
+        if (SamePositionRatio(last_sample_, again_rows) >= .98) result = stitcher_->Add(again);
+        else moving_ = true; // the user scrolled on; stitch when it settles again
+        last_sample_ = std::move(again_rows);
+        if (moving_) return;
+    }
     if (result.status == StitchStatus::Unchanged) return;
     Handle(result, false, 0);
 }

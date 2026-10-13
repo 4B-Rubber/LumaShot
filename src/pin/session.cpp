@@ -76,24 +76,27 @@ struct Reader {
     void End(){Require(remaining==0);}
 };
 constexpr uint64_t PayloadMagic=0x315441444e49504c,IndexMagic=0x315844494e49504c;
-void Header(Writer& w,uint64_t magic){w(magic);w(uint32_t{1});}
-void Header(Reader& r,uint64_t expected){uint64_t magic{};uint32_t version{};r(magic);r(version);Require(magic==expected&&version==1);}
+// Index version 2 adds the clothesline "hung" flag per pin; version 1 indexes
+// (written before) still load, their pins as not hung. Payload files stay v1.
+constexpr uint32_t PayloadVersion=1,IndexVersion=2;
+void Header(Writer& w,uint64_t magic,uint32_t version){w(magic);w(version);}
+uint32_t Header(Reader& r,uint64_t expected,uint32_t newest){uint64_t magic{};uint32_t version{};r(magic);r(version);Require(magic==expected&&version>=1&&version<=newest);return version;}
 std::wstring FileName(uint64_t nonce,uint64_t id,uint64_t revision){return L"pin-"+std::to_wstring(nonce)+L"-"+std::to_wstring(id)+L"-"+std::to_wstring(revision)+L".dat";}
 void Commit(const std::filesystem::path& temporary,const std::filesystem::path& final){Require(MoveFileExW(temporary.c_str(),final.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=FALSE);}
 bool Same(const std::shared_ptr<const Frame>& a,const std::shared_ptr<const Frame>& b){return a==b||(a&&b&&a->Width()==b->Width()&&a->Height()==b->Height()&&a->pixels==b->pixels);}
 void SaveContent(const std::filesystem::path& path,const PinSessionRecord& p){
-    Require(p.image&&p.ocr_image&&p.base);const auto temp=std::filesystem::path(path.native()+L".tmp");Writer w(temp);Header(w,PayloadMagic);w(Encode(*p.image));
+    Require(p.image&&p.ocr_image&&p.base);const auto temp=std::filesystem::path(path.native()+L".tmp");Writer w(temp);Header(w,PayloadMagic,PayloadVersion);w(Encode(*p.image));
     const bool same_ocr=Same(p.image,p.ocr_image),same_base=Same(p.image,p.base);w(same_ocr);if(!same_ocr)w(Encode(*p.ocr_image));w(same_base);if(!same_base)w(Encode(*p.base));w(p.annotations);w(p.decorations);w.Finish();Commit(temp,path);
 }
-void LoadContent(const std::filesystem::path& path,PinSessionRecord& p){Reader r(path);Header(r,PayloadMagic);std::vector<unsigned char> bytes;r(bytes);p.image=Decode(bytes);bool same{};r(same);if(same)p.ocr_image=p.image;else{r(bytes);p.ocr_image=Decode(bytes);}r(same);if(same)p.base=p.image;else{r(bytes);p.base=Decode(bytes);}r(p.annotations);r(p.decorations);r.End();Require(p.image->Width()==p.ocr_image->Width()&&p.image->Height()==p.ocr_image->Height()&&p.image->Width()==p.base->Width()&&p.image->Height()==p.base->Height());}
+void LoadContent(const std::filesystem::path& path,PinSessionRecord& p){Reader r(path);Header(r,PayloadMagic,PayloadVersion);std::vector<unsigned char> bytes;r(bytes);p.image=Decode(bytes);bool same{};r(same);if(same)p.ocr_image=p.image;else{r(bytes);p.ocr_image=Decode(bytes);}r(same);if(same)p.base=p.image;else{r(bytes);p.base=Decode(bytes);}r(p.annotations);r(p.decorations);r.End();Require(p.image->Width()==p.ocr_image->Width()&&p.image->Height()==p.ocr_image->Height()&&p.image->Width()==p.base->Width()&&p.image->Height()==p.base->Height());}
 }
 PinSessionStore::PinSessionStore(std::filesystem::path directory):directory_(std::move(directory)){GUID guid{};Check(CoCreateGuid(&guid));static_assert(sizeof(guid)==16);const auto* data=reinterpret_cast<const unsigned char*>(&guid);for(int i=0;i<8;++i)nonce_=(nonce_<<8)|data[i];}
 std::filesystem::path PinSessionStore::DefaultDirectory(){PWSTR value{};if(FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData,0,nullptr,&value)))return {};const auto directory=std::filesystem::path(value)/L"LumaShot"/L"pin-session";CoTaskMemFree(value);return directory;}
 std::vector<PinSessionRecord> PinSessionStore::Load(unsigned& skipped){
     unresolved_.clear();
     skipped=0;const auto path=directory_/L"session.index";if(!std::filesystem::exists(path))return {};
-    Reader r(path);Header(r,IndexMagic);const auto count=r.Count(1000);std::vector<PinSessionRecord> records;std::set<std::pair<uint64_t,uint64_t>> seen;
-    for(uint32_t i=0;i<count;++i){PinSessionRecord p;uint64_t nonce{};r(nonce);r(p.id);r(p.revision);r(p.origin);r(p.zoom);r(p.style);r(p.locked);r(p.recognize);Require(p.id&&p.revision&&p.zoom>0&&seen.insert({nonce,p.id}).second);
+    Reader r(path);const uint32_t version=Header(r,IndexMagic,IndexVersion);const auto count=r.Count(1000);std::vector<PinSessionRecord> records;std::set<std::pair<uint64_t,uint64_t>> seen;
+    for(uint32_t i=0;i<count;++i){PinSessionRecord p;uint64_t nonce{};r(nonce);r(p.id);r(p.revision);r(p.origin);r(p.zoom);r(p.style);r(p.locked);r(p.recognize);if(version>=2)r(p.hung);Require(p.id&&p.revision&&p.zoom>0&&seen.insert({nonce,p.id}).second);
         try{LoadContent(directory_/FileName(nonce,p.id,p.revision),p);records.push_back(std::move(p));}catch(...){++skipped;p.storage_nonce=nonce;p.image.reset();p.ocr_image.reset();p.base.reset();unresolved_.push_back(std::move(p));}
     }r.End();return records;
 }
@@ -101,9 +104,9 @@ void PinSessionStore::Save(const std::vector<PinSessionRecord>& records){
     Require(!directory_.empty()&&records.size()+unresolved_.size()<=1000);std::filesystem::create_directories(directory_);std::set<std::wstring> active;
     for(const auto& p:records){Require(p.id&&p.revision);const auto name=FileName(nonce_,p.id,p.revision);active.insert(name);if(!written_.contains(p.id)||written_.at(p.id)!=p.revision||!std::filesystem::exists(directory_/name)){SaveContent(directory_/name,p);written_[p.id]=p.revision;}}
     for(const auto& p:unresolved_)active.insert(FileName(p.storage_nonce,p.id,p.revision));
-    const auto temp=directory_/L"session.index.tmp";Writer w(temp);Header(w,IndexMagic);w(static_cast<uint32_t>(records.size()+unresolved_.size()));
-    for(const auto& p:records){w(nonce_);w(p.id);w(p.revision);w(p.origin);w(p.zoom);w(p.style);w(p.locked);w(p.recognize);}
-    for(const auto& p:unresolved_){w(p.storage_nonce);w(p.id);w(p.revision);w(p.origin);w(p.zoom);w(p.style);w(p.locked);w(p.recognize);}w.Finish();Commit(temp,directory_/L"session.index");
+    const auto temp=directory_/L"session.index.tmp";Writer w(temp);Header(w,IndexMagic,IndexVersion);w(static_cast<uint32_t>(records.size()+unresolved_.size()));
+    for(const auto& p:records){w(nonce_);w(p.id);w(p.revision);w(p.origin);w(p.zoom);w(p.style);w(p.locked);w(p.recognize);w(p.hung);}
+    for(const auto& p:unresolved_){w(p.storage_nonce);w(p.id);w(p.revision);w(p.origin);w(p.zoom);w(p.style);w(p.locked);w(p.recognize);w(p.hung);}w.Finish();Commit(temp,directory_/L"session.index");
     // Only after the new index is committed can obsolete screenshots be deleted.
     std::error_code error;for(const auto& file:std::filesystem::directory_iterator(directory_)){const auto name=file.path().filename().native();if(name.starts_with(L"pin-")&&(file.path().extension()==L".dat"||file.path().extension()==L".tmp")&&!active.contains(name))std::filesystem::remove(file.path(),error);}
 }

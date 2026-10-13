@@ -1,4 +1,5 @@
 #include "ocr/engine.h"
+#include "ocr/config.h"
 #include "export/png.h"
 #include "ui/render.h"
 #include "ocr/protocol.h"
@@ -12,6 +13,9 @@ int main(int argc,char** argv) {
     int failures=0;
     auto expect=[&](bool ok,const char* name){std::cout<<(ok?"PASS ":"FAIL ")<<name<<'\n';if(!ok)++failures;};
     try {
+        expect(ocr::ModelDirectoryError({}).empty(),"empty model directory selects bundled OCR");
+        expect(ocr::QuoteModelArgument(L"C:\\模型 files\\")==L"\"C:\\模型 files\\\\\"","model path quoting preserves Unicode spaces and trailing slash");
+        expect(ocr::QuoteModelArgument(L"a\"b")==L"\"a\\\"b\"","model argument quotes are escaped");
         std::vector<float> scores(10*4,0);
         const int ids[]={0,1,1,0,2,0,0,0,3,0};
         for(size_t i=0;i<10;++i)scores[i*4+ids[i]]=1;
@@ -42,8 +46,11 @@ int main(int argc,char** argv) {
             bool missing=false,corrupt=false;
             try{ocr::Engine unavailable(invalid);}catch(const std::exception&){missing=true;}
             {std::ofstream file(invalid/L"det.onnx",std::ios::binary);file<<"invalid synthetic model";}
+            {std::ofstream file(invalid/L"rec.onnx",std::ios::binary);file<<"invalid synthetic model";}
+            {std::ofstream file(invalid/L"dictionary.txt",std::ios::binary);file<<"A\n";}
+            expect(ocr::ModelDirectoryError(invalid).empty(),"model directory validates presence separately from ONNX compatibility");
             try{ocr::Engine unavailable(invalid);}catch(const std::exception&){corrupt=true;}
-            std::filesystem::remove(invalid/L"det.onnx");std::filesystem::remove(invalid);
+            std::filesystem::remove(invalid/L"det.onnx");std::filesystem::remove(invalid/L"rec.onnx");std::filesystem::remove(invalid/L"dictionary.txt");std::filesystem::remove(invalid);
             expect(missing&&corrupt,"missing and corrupt models report errors without changing installed assets");
             std::cout<<"load_ms "<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()<<'\n';
             Renderer renderer;Frame image=argc>2?ReadPng(argv[2]):renderer.Demo(false);

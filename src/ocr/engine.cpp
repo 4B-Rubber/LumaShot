@@ -1,4 +1,5 @@
 #include "ocr/engine.h"
+#include "ocr/config.h"
 #include <onnxruntime_cxx_api.h>
 #include <algorithm>
 #include <array>
@@ -26,8 +27,29 @@ struct Engine::Impl {
     Ort::SessionOptions options;
     Ort::Session detector{nullptr},recognizer{nullptr};
     std::vector<std::wstring> dictionary;
-    Impl(const std::filesystem::path& folder) {
-        options.SetIntraOpNumThreads(static_cast<int>(std::clamp(std::thread::hardware_concurrency(),1u,2u)));
+    int threads{};
+    static std::vector<int64_t> TensorShape(Ort::Session& session,bool input) {
+        const auto type=input?session.GetInputTypeInfo(0):session.GetOutputTypeInfo(0);
+        if(type.GetONNXType()!=ONNX_TYPE_TENSOR)throw std::runtime_error("OCR models must use float32 tensors");
+        const auto tensor=type.GetTensorTypeAndShapeInfo();
+        if(tensor.GetElementType()!=ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)throw std::runtime_error("OCR models must use float32 tensors");
+        return tensor.GetShape();
+    }
+    static std::vector<int64_t> Validate(Ort::Session& session,bool detection) {
+        if(session.GetInputCount()!=1||session.GetOutputCount()!=1)throw std::runtime_error("OCR models require exactly one input and one output");
+        const auto in=TensorShape(session,true),out=TensorShape(session,false);
+        if(in.size()!=4||(in[0]!=1&&in[0]>=0)||in[1]!=3||in[3]>=0||
+            (detection?in[2]>=0:(in[2]!=48&&in[2]>=0)))
+            throw std::runtime_error("Incompatible OCR input: expected NCHW BGR, dynamic width, detector dynamic height, recognizer height 48");
+        if(detection?(out.size()!=4||(out[0]!=1&&out[0]>=0)||out[1]!=1):
+            (out.size()!=3||(out[0]!=1&&out[0]>=0)))
+            throw std::runtime_error("Incompatible OCR output: expected detector [1,1,H,W] and CTC recognizer [1,T,C]");
+        return out;
+    }
+    Impl(const std::filesystem::path& folder,EngineOptions requested) {
+        if(!ModelDirectoryError(folder).empty())throw std::runtime_error("OCR model directory requires readable nonempty det.onnx, rec.onnx and dictionary.txt");
+        threads=std::clamp(requested.threads>0?requested.threads:DefaultThreads(),1,16);
+        options.SetIntraOpNumThreads(threads);
         options.SetInterOpNumThreads(1);
         options.AddConfigEntry("session.intra_op.allow_spinning","0");
         options.AddConfigEntry("session.inter_op.allow_spinning","0");
@@ -36,10 +58,20 @@ struct Engine::Impl {
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         detector=Ort::Session(env,(folder/L"det.onnx").c_str(),options);
         recognizer=Ort::Session(env,(folder/L"rec.onnx").c_str(),options);
+        Validate(detector,true);const auto recognition_shape=Validate(recognizer,false);
         std::ifstream file(folder/L"dictionary.txt",std::ios::binary);std::string line;
-        while(std::getline(file,line)){if(!line.empty()&&line.back()=='\r')line.pop_back();dictionary.push_back(Utf16(line));}
-        if(dictionary.size()!=18708)throw std::runtime_error("Missing or incompatible OCR dictionary");
-        dictionary.push_back(L" ");
+        while(std::getline(file,line)){
+            if(dictionary.empty()&&line.starts_with("\xef\xbb\xbf"))line.erase(0,3);
+            if(!line.empty()&&line.back()=='\r')line.pop_back();
+            if(line.empty()||line.size()>4096||dictionary.size()>=1000000)throw std::runtime_error("Invalid OCR dictionary entry or dictionary too large");
+            dictionary.push_back(Utf16(line));
+        }
+        if(file.bad()||dictionary.empty())throw std::runtime_error("Cannot read OCR dictionary");
+        // PP-OCR dictionaries usually omit the final space class. Also accept
+        // dictionaries containing every non-blank class explicitly.
+        if(recognition_shape[2]!=static_cast<int64_t>(dictionary.size()+1))dictionary.push_back(L" ");
+        if(recognition_shape[2]>0&&recognition_shape[2]!=static_cast<int64_t>(dictionary.size()+1))
+            throw std::runtime_error("OCR dictionary size does not match recognizer output classes");
     }
     static Ort::Value Run(Ort::Session& session,std::vector<float>& input,int h,int w) {
         const std::array<int64_t,4> shape{1,3,h,w};
@@ -52,8 +84,19 @@ struct Engine::Impl {
         return std::move(result.front());
     }
 };
-Engine::Engine(const std::filesystem::path& assets):impl_(std::make_unique<Impl>(assets)){}
+// Inference runs in the worker process only while the user waits for a
+// result. Measured on a 6-core i5-8400, four threads cut recognition time by
+// about a third versus two; six threads, operator spinning, batched lines and
+// parallel recognizer sessions gave no reliable further gain for more memory
+// or idle CPU (docs/ocr-verification.md).
+int DefaultThreads(){return static_cast<int>(std::clamp(std::thread::hardware_concurrency(),1u,4u));}
+Engine::Engine(const std::filesystem::path& assets,EngineOptions options):impl_(std::make_unique<Impl>(assets,options)){}
 Engine::~Engine()=default;
+int Engine::Threads() const{return impl_->threads;}
+void Engine::Warmup() {
+    std::vector<float> detection(static_cast<size_t>(3)*64*64,0.0f);Impl::Run(impl_->detector,detection,64,64);
+    std::vector<float> recognition(static_cast<size_t>(3)*48*256,0.0f);Impl::Run(impl_->recognizer,recognition,48,256);
+}
 // Precompute horizontal weights and fetch each BGRA pixel once for all three
 // BGR planes. The interpolation and model normalization stay unchanged.
 static std::vector<float> Input(const Frame& f,Box b,int h,int w,bool detection,int content_width=0) {
@@ -100,8 +143,9 @@ Text Engine::Recognize(const Frame& frame,Timings* timings) {
         const Box region{float(left),float(top),float(left+tw),float(top+th)};
         auto start=Clock::now();auto input=Input(frame,region,h,w,true);measured.preprocess_ms+=elapsed(start);
         start=Clock::now();auto result=Impl::Run(impl_->detector,input,h,w);measured.detection_ms+=elapsed(start);
-        const auto shape=result.GetTensorTypeAndShapeInfo().GetShape();
-        if(shape.size()!=4||shape[0]!=1||shape[1]!=1||shape[2]<1||shape[3]<1)throw std::runtime_error("Unexpected OCR detection output");
+        if(!result.IsTensor())throw std::runtime_error("OCR detector did not return a tensor");
+        const auto info=result.GetTensorTypeAndShapeInfo();const auto shape=info.GetShape();
+        if(info.GetElementType()!=ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT||shape.size()!=4||shape[0]!=1||shape[1]!=1||shape[2]<1||shape[3]<1||shape[2]>4096||shape[3]>4096)throw std::runtime_error("Unexpected OCR detection output; expected float32 [1,1,H,W] up to 4096 pixels per dimension");
         const int oh=static_cast<int>(shape[2]),ow=static_cast<int>(shape[3]);
         const auto* map=result.GetTensorData<float>();
         std::vector<uint8_t> visited(static_cast<size_t>(oh)*ow);std::vector<int> queue;
@@ -156,8 +200,9 @@ Text Engine::Recognize(const Frame& frame,Timings* timings) {
         const int width=std::max(128,(content+7)/8*8);
         auto start=Clock::now();auto input=Input(frame,box,48,width,false,content);measured.preprocess_ms+=elapsed(start);
         start=Clock::now();auto output=Impl::Run(impl_->recognizer,input,48,width);measured.recognition_ms+=elapsed(start);
-        const auto shape=output.GetTensorTypeAndShapeInfo().GetShape();
-        if(shape.size()!=3||shape[0]!=1)throw std::runtime_error("Unexpected OCR recognition shape");
+        if(!output.IsTensor())throw std::runtime_error("OCR recognizer did not return a tensor");
+        const auto info=output.GetTensorTypeAndShapeInfo();const auto shape=info.GetShape();
+        if(info.GetElementType()!=ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT||shape.size()!=3||shape[0]!=1||shape[1]<1||shape[2]!=static_cast<int64_t>(impl_->dictionary.size()+1))throw std::runtime_error("Unexpected OCR recognition output or dictionary class count mismatch");
         start=Clock::now();auto line=DecodeCtc({output.GetTensorData<float>(),output.GetTensorTypeAndShapeInfo().GetElementCount()},
             static_cast<size_t>(shape[1]),static_cast<size_t>(shape[2]),impl_->dictionary,box,float(content)/float(width));
         measured.decode_ms+=elapsed(start);

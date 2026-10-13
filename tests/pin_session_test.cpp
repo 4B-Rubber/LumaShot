@@ -3,6 +3,8 @@
 #include "app/preferences.h"
 #include <iostream>
 #include <fstream>
+#include <cstring>
+#include <iterator>
 namespace lumashot {
 struct PinSessionLifecycleTest {
 static int Child(const std::wstring& mode,const std::filesystem::path& path){
@@ -54,6 +56,47 @@ static int Run(){
         expect(manager.FlushSession(),"explicit close durably removes restored pin");
     }
     {PinManager manager(nullptr);expect(manager.EnableSession(lifecycle)&&manager.pins_.empty(),"closed pin does not reappear on subsequent restart");}
+    // Clothesline: pins hung on the rope stay hung across restarts (reboot,
+    // reinstall) instead of all reappearing stacked on the screen.
+    {
+        auto hung=first;hung.hung=true;PinSessionStore hung_store(root/L"store-hung");hung_store.Save({hung,second});
+        auto back=hung_store.Load(skipped);
+        expect(back.size()==2&&!skipped&&back[0].hung&&!back[1].hung,"hung flag round trips through the session index");
+        // An index written by the previous version (v1, no hung flag) still loads.
+        const auto index=root/L"store-hung"/L"session.index";hung_store.Save({hung});
+        std::vector<char> bytes;{std::ifstream in(index,std::ios::binary);bytes.assign(std::istreambuf_iterator<char>(in),{});}
+        bool v1_ok=bytes.size()>13;
+        if(v1_ok){const uint32_t one=1;std::memcpy(bytes.data()+8,&one,4);bytes.pop_back();std::ofstream out(index,std::ios::binary|std::ios::trunc);out.write(bytes.data(),std::streamsize(bytes.size()));}
+        PinSessionStore old_store(root/L"store-hung");const auto old=old_store.Load(skipped);
+        expect(v1_ok&&old.size()==1&&!skipped&&!old[0].hung&&old[0].origin==hung.origin,"version 1 index loads with pins not hung");
+    }
+    const auto hang_dir=root/L"hang";RECT home{};
+    {
+        PinManager manager(nullptr);expect(manager.EnableSession(hang_dir),"enable session for the clothesline case");
+        manager.Create(*image,*image,{300,260},std::nullopt,{},false);manager.Create(*image,*image,{520,300},std::nullopt,{},false);
+        auto& pin=*manager.pins_.begin()->second;GetWindowRect(pin.window,&home);manager.HangPin(pin);
+        expect(pin.hung&&!IsWindowVisible(pin.window)&&manager.FlushSession(),"hanging a pin is checkpointed");
+        if(manager.line_)manager.line_->Hide();
+    }
+    {
+        PinManager manager(nullptr);expect(manager.EnableSession(hang_dir)&&manager.pins_.size()==2,"both pins restored after restart");
+        if(manager.pins_.size()==2){
+            auto& hung_pin=*manager.pins_.begin()->second;auto& open_pin=*manager.pins_.rbegin()->second;
+            expect(hung_pin.hung&&!IsWindowVisible(hung_pin.window)&&manager.line_&&manager.line_->Contains(hung_pin.id),"hung pin comes back hidden, on the rope");
+            expect(!manager.line_->Visible()&&!manager.line_->GlowVisible(),"restoring does not drop the rope onto the screen");
+            expect(!open_pin.hung&&IsWindowVisible(open_pin.window)&&!manager.line_->Contains(open_pin.id),"open pin is restored open");
+            expect(std::abs(hung_pin.hang_origin.x-home.left)<=1&&std::abs(hung_pin.hang_origin.y-home.top)<=1,"hung pin keeps its home position for retrieval");
+            manager.line_->Remove(hung_pin.id);manager.RetrievePin(hung_pin.id,{100,10,180,55});
+            const auto end=GetTickCount64()+700;MSG msg{};while(GetTickCount64()<end){while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}Sleep(5);}
+            expect(!hung_pin.hung&&IsWindowVisible(hung_pin.window)&&manager.FlushSession(),"retrieved pin is saved as open");
+        }
+        if(manager.line_)manager.line_->Hide();
+    }
+    {
+        PinManager manager(nullptr);bool open=manager.EnableSession(hang_dir)&&manager.pins_.size()==2;
+        for(const auto& [id,pin]:manager.pins_)open=open&&!pin->hung&&IsWindowVisible(pin->window);
+        expect(open,"after retrieving, the next restart shows it on screen again");
+    }
     expect(Process(L"--write",root/L"process")&&Process(L"--read-two",root/L"process"),"separate process exits and restarts restore both unclosed pins");
     expect(Process(L"--close-one",root/L"process")&&Process(L"--read-one",root/L"process"),"explicit close survives another process restart");
     expect(Process(L"--shutdown",root/L"shutdown")&&Process(L"--read-two",root/L"shutdown"),"Windows end-session messages preserve pins while their windows are destroyed");

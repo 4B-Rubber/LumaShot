@@ -1,4 +1,5 @@
 #include "app/hotkeys.h"
+#include "translate/engine.h"
 #include "app/settings_dialog.h"
 #include "app/startup.h"
 #include "ui/tray_menu.h"
@@ -7,6 +8,7 @@
 #include "app/settings_process.h"
 #include "pin/annotation.h"
 #include "model/mark_properties.h"
+#include "model/text_cleanup.h"
 #include "ocr/availability.h"
 #include "app/application.h"
 #include "app/translation_settings.h"
@@ -45,6 +47,7 @@ constexpr UINT kTrayCheckUpdate=40,kTrayCancelUpdate=41,kTrayInstallUpdate=42,kT
 // notification that the strip was dragged onto its close target.
 constexpr UINT kTrayClipboardStrip=11,kTrayEnableClipboard=12,kStripDismissed=WM_APP+121;
 constexpr UINT kTrayTranslate=13,kTrayTranslationSettings=14;
+constexpr UINT kTrayQuickOcr=15,kTrayQuickPin=16,kQuickOcrReady=WM_APP+122;
 constexpr wchar_t kTrayTip[]=L"LumaShot · 截图与标注";
 static Point GlobalPoint(RECT r,LPARAM lp) {return {float(r.left+GET_X_LPARAM(lp)),float(r.top+GET_Y_LPARAM(lp))};}
 static void PlaceNumberBadge(Mark& mark,Point p){const auto b=Normalize(mark.a,mark.b);const float dx=p.x-(b.left+b.right)/2,dy=p.y-(b.top+b.bottom)/2;mark.a.x+=dx;mark.b.x+=dx;mark.a.y+=dy;mark.b.y+=dy;}
@@ -88,6 +91,7 @@ Application::~Application() {
     FlushProperties();
     element_scanner_.Cancel();
     magnifier_.Close();
+    quick_ocr_.reset();
     pins_.reset();
     worker_.request_stop();if(worker_.joinable())worker_.join();
     updater_.reset(); // cancels an in-flight check/download and joins promptly
@@ -138,6 +142,8 @@ int Application::Run(bool capture_now,bool demo,bool diagnostic_session) {
     pins_=std::make_unique<PinManager>(main_);
     pins_->sticker_style=[this]{return preferences_.pin_style;};
     pins_->translate_auto_show=[this]{return preferences_.translate_auto_show;};
+    pins_->clothesline_enabled=[this]{return preferences_.clothesline_enabled;};pins_->ClotheslineConfigChanged();
+    pins_->SetOcrModelDirectory(preferences_.ocr_model_directory);
     pins_->dark_theme=[this]{return preferences_.Dark();};
     pins_->clipboard_format=[this]{return preferences_.paste_as_file?preferences_.paste_file_format:-1;};
     pins_->open_translation_settings=[this]{if(!LaunchTranslationSettings(preferences_.Dark()))Notice(L"无法打开翻译设置。");};
@@ -187,7 +193,7 @@ int Application::Run(bool capture_now,bool demo,bool diagnostic_session) {
         }
         WaitForWork();
     }
-    KillTimer(main_,20);for(int id=1;id<=3;++id)UnregisterHotKey(main_,id);return client_output_.empty()?0:client_exit_;
+    KillTimer(main_,20);for(size_t i=0;i<Shortcuts(preferences_).size();++i)UnregisterHotKey(main_,static_cast<int>(i)+1);return client_output_.empty()?0:client_exit_;
 }
 
 // Both the main loop and the settings child wait must service swap-chain frame
@@ -247,8 +253,13 @@ LRESULT CALLBACK Application::MainProc(HWND window,UINT message,WPARAM wp,LPARAM
             if((wp==2||wp==3)&&app->recording_process_.Active()){app->recording_process_.Show();return 0;}
             if(wp==2||wp==3){if(!app->active_&&!app->pending_&&!app->recording_process_.Start(wp==2,app->preferences_.Dark()))app->Notice(L"无法启动录制，请检查录制组件是否完整。");return 0;}
             if(wp==4){if(!app->ocr_available_){app->Notice(L"截图翻译需要文字识别组件。");return 0;}if(!app->active_&&!app->pending_){app->translate_request_=true;app->Start();app->translate_request_=false;}return 0;}
+            if(wp==5||wp==6){
+                if(wp==5&&!app->ocr_available_){app->Notice(L"快捷识别需要文字识别组件。");return 0;}
+                if(!app->active_&&!app->pending_){app->quick_request_=wp==5?QuickCapture::Text:QuickCapture::Pin;app->Start();app->quick_request_=QuickCapture::None;}return 0;
+            }
             if(wp==1)app->Start();return 0;}
         if(message==kOcrReady){app->pins_->Ready();return 0;}
+        if(message==kQuickOcrReady){app->QuickOcrReady();return 0;}
         if(message==kTranslateReady){app->pins_->TranslationReady(uint64_t(wp));return 0;}
         if(message==kTranslationConfigChanged){app->pins_->TranslationConfigChanged();return 0;}
         if(message==kPinSaveReady||(message==WM_TIMER&&wp==kPinSaveReady)){app->pins_->Saved();return 0;}
@@ -280,6 +291,8 @@ void Application::TrayMenu() {
     HMENU menu=CreatePopupMenu();
     AppendMenuW(menu,MF_STRING,1,L"开始截图");
     AppendMenuW(menu,MF_STRING,2,L"3 秒后截图");
+    if(ocr_available_)AppendMenuW(menu,MF_STRING,kTrayQuickOcr,(preferences_.ocr_key?L"识别并复制（"+ShortcutLabel(preferences_.ocr_modifiers,preferences_.ocr_key)+L"）":std::wstring(L"识别并复制")).c_str());
+    AppendMenuW(menu,MF_STRING,kTrayQuickPin,(preferences_.pin_key?L"置顶贴图（"+ShortcutLabel(preferences_.pin_modifiers,preferences_.pin_key)+L"）":std::wstring(L"置顶贴图")).c_str());
     if(ocr_available_)AppendMenuW(menu,MF_STRING,kTrayTranslate,(preferences_.translate_key?L"截图翻译（"+ShortcutLabel(preferences_.translate_modifiers,preferences_.translate_key)+L"）":std::wstring(L"截图翻译")).c_str());
     AppendMenuW(menu,MF_STRING,6,L"录制 GIF…");AppendMenuW(menu,MF_STRING,7,L"录制屏幕…");
     AppendMenuW(menu,MF_STRING|(preferences_.include_cursor?MF_CHECKED:0),3,L"包含鼠标指针");
@@ -310,6 +323,7 @@ void Application::TrayMenu() {
     if(choice==3){preferences_.include_cursor=!preferences_.include_cursor;settings_writer_.Request(preferences_);settings_writer_.Flush();}
     if(choice==8&&clipboard_panel_)clipboard_panel_->Show();
     if(choice==kTrayTranslate)PostMessageW(main_,LaunchCommandMessage,4,0);
+    if(choice==kTrayQuickOcr||choice==kTrayQuickPin)PostMessageW(main_,LaunchCommandMessage,choice==kTrayQuickOcr?5:6,0);
     if(choice==kTrayTranslationSettings&&!LaunchTranslationSettings(preferences_.Dark()))Notice(L"无法打开翻译设置。");
     if(choice==kTrayClipboardStrip)SetClipboardStripVisible(!preferences_.clipboard_strip_visible);
     if(choice==kTrayEnableClipboard)EnableClipboardFromTray();
@@ -539,7 +553,8 @@ void Application::Settings() {
         clipboard_panel_->SetStripVisible(preferences_.clipboard_strip_visible);
     }
     if(clipboard_panel_&&!clipboard_panel_->Enable(preferences_.clipboard_enabled,preferences_.Dark()))Notice(L"剪贴板监听无法启动，请重新开启。");
-    if(pins_)pins_->RefreshAppearance();
+    if(pins_){pins_->SetOcrModelDirectory(preferences_.ocr_model_directory);pins_->RefreshAppearance();pins_->ClotheslineConfigChanged();}
+    if(quick_ocr_)quick_ocr_->SetModelDirectory(preferences_.ocr_model_directory);
 }
 bool Application::AnnotatePin(uint64_t id,std::shared_ptr<const Frame> image,Document annotations,RECT bounds){
     if(active_||pending_)return false;
@@ -580,6 +595,8 @@ void Application::Start() {
     if(active_||pending_)return;
     if(longshot_&&longshot_->Active())return; // one live capture at a time
     const bool translate=std::exchange(translate_request_,false);translate_next_=false;
+    quick_capture_=std::exchange(quick_request_,QuickCapture::None);
+    quick_remove_whitespace_=preferences_.ocr_remove_whitespace;
     capture_started_=Diagnostics::Now();
     element_scanner_.Cancel();element_windows_.clear();element_regions_.clear();
     if(demo_) {
@@ -605,6 +622,15 @@ void Application::Start() {
         L"拖动框选 / 单击窗口 · F 全屏 · A 全部屏幕 · Esc 取消";
     translate_capture_=translate;
     if(translate)state_.hint=L"截图翻译 · 拖动框选要翻译的区域 / 单击窗口 · F 全屏 · Esc 取消";
+    // Offline engine: load the model while the user selects the region (after the screen grab).
+    if(translate)translate::Prewarm(translate::LoadConfig(translate::DefaultConfigPath()),std::chrono::milliseconds(250));
+    // OCR worker: start it and load the models during selection as well.
+    if(translate&&pins_&&ocr_available_)pins_->PrewarmOcr();
+    if(quick_capture_==QuickCapture::Text) {
+        state_.hint=L"识别并复制 · 框选后自动复制文字并退出 · F 全屏 · Esc 取消";
+        if(ocr_available_){if(!quick_ocr_)quick_ocr_=std::make_unique<ocr::Service>(main_,kQuickOcrReady);quick_ocr_->SetModelDirectory(preferences_.ocr_model_directory);quick_ocr_->Prewarm();}
+    }
+    if(quick_capture_==QuickCapture::Pin)state_.hint=L"置顶贴图 · 框选后直接贴图 · F 全屏 · Esc 取消";
     const uint64_t generation=++generation_;
     const bool include=preferences_.include_cursor;pending_=true;
     worker_=std::jthread([this,generation,include,cursor=std::move(cursor)](std::stop_token stop) {
@@ -669,6 +695,11 @@ void Application::ResultReady() {
         cursor_patch_=std::make_shared<Frame>(std::move(result->cursor_patch));
         frame_=std::make_shared<Frame>(std::move(result->frame));
         acrylic_=std::make_shared<Frame>(std::move(result->acrylic));ShowViews();
+    }else if(result->quick_text){
+        if(!quick_ocr_)quick_ocr_=std::make_unique<ocr::Service>(main_,kQuickOcrReady);
+        quick_ocr_->SetModelDirectory(preferences_.ocr_model_directory);
+        quick_ocr_pending_=true;state_.busy=true;state_.hint=L"正在识别文字… · Esc 取消";
+        quick_ocr_->Submit(1,generation_,std::make_shared<Frame>(std::move(result->ocr_frame)));Invalidate();
     }else if(result->editing==kImageEditId){
         auto done=std::move(image_edit_done_);image_edit_done_=nullptr;const int follow=std::exchange(image_edit_follow_,0);
         pin_edit_id_=0;pin_edit_source_.reset();Cancel(false);
@@ -747,6 +778,8 @@ void Application::UpdateMagnifier() {
 }
 void Application::Invalidate() {SyncToolbarMotion();UpdatePinEditRegion();for(auto& view:views_)InvalidateRect(view->window,nullptr,FALSE);}
 void Application::Cancel(bool close_demo) {
+    if(quick_ocr_)quick_ocr_->Cancel(1);
+    quick_ocr_pending_=false;quick_capture_=QuickCapture::None;quick_request_=QuickCapture::None;
     line_vertices_.clear();state_.polyline_confirmed=0;state_.polyline_active=false;state_.line_snap.reset();
     if(active_){ClosePicker(true);RememberProperties();}FlushProperties();
     const auto edited=std::exchange(pin_edit_id_,0);if(edited)close_demo=false;
@@ -789,12 +822,15 @@ void Application::UpdateToolbar(POINT point) {
         chosen=view->bounds;scale=float(GetDpiForWindow(view->window))/96;break;
     }
     toolbar_monitor_=chosen;
-    state_.toolbar=PlaceToolbar(state_.selection,chosen,scale,toolbar_transition_.Value(GetTickCount64()),state_.PropertyTool()==Tool::Select?state_.closing_tool:state_.PropertyTool(),state_.number_combo);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
+    const auto now=GetTickCount64();
+    const auto tool=state_.PropertyTool()==Tool::Select&&toolbar_transition_.Active(now)?state_.closing_tool:state_.PropertyTool();
+    state_.toolbar=PlaceToolbar(state_.selection,chosen,scale,toolbar_transition_.Value(now),tool,state_.number_combo);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
 }
 void Application::AnimateToolbar() {
     const auto now=GetTickCount64();
     if(!state_.selected){KillTimer(main_,9);return;}
-    state_.toolbar=PlaceToolbar(state_.selection,toolbar_monitor_,state_.toolbar.scale,toolbar_transition_.Value(now),state_.PropertyTool()==Tool::Select?state_.closing_tool:state_.PropertyTool(),state_.number_combo);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
+    const auto tool=state_.PropertyTool()==Tool::Select&&toolbar_transition_.Active(now)?state_.closing_tool:state_.PropertyTool();
+    state_.toolbar=PlaceToolbar(state_.selection,toolbar_monitor_,state_.toolbar.scale,toolbar_transition_.Value(now),tool,state_.number_combo);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
     if(!toolbar_transition_.Active(now)){KillTimer(main_,9);state_.closing_tool=Tool::Select;}
     state_.hover=-1;Invalidate();
 }
@@ -999,7 +1035,7 @@ void Application::PointerUp(View& view,Point point) {
         if(std::hypot(point.x-start_.x,point.y-start_.y)<3)state_.selection=WindowAt(NativePoint(start_));
         state_.selected=HasArea(state_.selection);
         // Translate hotkey: the selection itself is the command; pin, recognize and translate at once.
-        if(state_.selected&&translate_capture_){translate_next_=true;Finish(false,true,true);if(!pending_)translate_next_=false;return;}
+        if(state_.selected&&FinishQuickSelection())return;
         if(state_.selected)state_.hint=preferences_.include_cursor?L"包含原鼠标指针 · 双击选区 / Enter / Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消":L"双击选区 / Enter / Ctrl+C 复制 · Ctrl+S 保存 · Esc 取消";
     }
     if(draft_&&draft_->tool==Tool::Number&&draft_->number_combo==NumberCombo::Leader){
@@ -1250,20 +1286,57 @@ void Application::Key(View& view,WPARAM key) {
     if(control&&key=='Z'){document_.Undo();SyncSelectedProperties();Invalidate();return;}
     if(control&&key=='Y'){document_.Redo();SyncSelectedProperties();Invalidate();return;}
     if(control&&key=='S'){Finish(true);return;}
+    if(key==VK_RETURN&&state_.selected&&FinishQuickSelection())return;
     if(key==VK_RETURN||(control&&key=='C')){pin_edit_copy_=pin_edit_id_&&control&&key=='C';Finish(false);return;}
     if(key==VK_DELETE){document_.DeleteSelected();SyncSelectedProperties();Invalidate();return;}
     if(!state_.selected&&(key=='F'||key=='A')) {
         state_.selection=BoxOf(key=='A'?frame_->bounds:view.bounds);state_.selected=true;
-        if(translate_capture_){translate_next_=true;Finish(false,true,true);if(!pending_)translate_next_=false;return;}
+        if(FinishQuickSelection())return;
         UpdateToolbar({view.bounds.left,view.bounds.top});UpdateMagnifier();Invalidate();return;
     }
     if(state_.selected) {
+        if(key==VK_F3){Finish(false,true);return;}
+        if(key=='O'&&!control&&ocr_available_&&!pin_edit_id_){quick_capture_=QuickCapture::Text;quick_remove_whitespace_=preferences_.ocr_remove_whitespace;Finish(false);return;}
         if(key=='V')Command(0);if(key=='R')Command(1);if(key=='E')Command(2);if(key=='A')Command(3);
         if(key=='P')Command(4);if(key=='T')Command(5);if(key=='M')Command(6);
         if(key=='L')Command(17);
     }
 }
 
+bool Application::FinishQuickSelection(){
+    if(translate_capture_){translate_next_=true;Finish(false,true,true);if(!pending_)translate_next_=false;return true;}
+    if(quick_capture_==QuickCapture::Text){Finish(false);return true;}
+    if(quick_capture_==QuickCapture::Pin){Finish(false,true);return true;}
+    return false;
+}
+void Application::QuickOcrReady(){
+    if(quick_ocr_)for(auto& completion:quick_ocr_->Take())ApplyOcrCompletion(std::move(completion));
+}
+void Application::ApplyOcrCompletion(ocr::Completion completion){
+    if(!quick_ocr_pending_||!active_||completion.id!=1||completion.version!=generation_)return;
+    quick_ocr_pending_=false;state_.busy=false;
+    auto text=ocr::Selected(completion.text,ocr::All(completion.text));
+    if(quick_remove_whitespace_)text=RemoveTextWhitespace(text);
+    if(!completion.error.empty()||RemoveTextWhitespace(text).empty()){
+        state_.hint=completion.error.empty()?L"未识别到文字 · Enter 重试 · Esc 取消":L"识别失败 · Enter 重试 · Esc 取消";
+        if(!completion.error.empty())state_.hint=L"识别失败："+completion.error+L" · Enter 重试 · Esc 取消";Invalidate();return;
+    }
+    try{
+        publish_ocr_text_(main_,text);Cancel(false);
+        if(!diagnostic_session_&&!demo_){NOTIFYICONDATAW tray{sizeof(tray)};tray.hWnd=main_;tray.uID=1;tray.uFlags=NIF_INFO;tray.dwInfoFlags=NIIF_INFO|NIIF_NOSOUND;wcscpy_s(tray.szInfoTitle,L"LumaShot");wcscpy_s(tray.szInfo,L"文字已复制");Shell_NotifyIconW(NIM_MODIFY,&tray);}
+    }
+    catch(const std::exception&){state_.hint=L"复制失败，请释放剪贴板 · Enter 重试 · Esc 取消";Invalidate();}
+}
+void Application::Wheel(Point point,int steps){
+    if(state_.busy||state_.dragging||draft_||moving_||resizing_||mark_moving_)return;
+    int id=ui::HitTest(ToolbarControls(state_,document_),point);
+    // Away from a property control, the drawing area adjusts the active stroke.
+    // Text, mosaic, badges and empty selection retain their own interactions.
+    const auto tool=state_.PropertyTool();
+    if(id<0&&!Contains(state_.toolbar.bounds,point)&&Contains(state_.selection,point)&&
+        (tool==Tool::Rectangle||tool==Tool::Ellipse||tool==Tool::Arrow||tool==Tool::Pen))id=24;
+    if(AdjustPropertyValue(state_,id,steps)){ApplySelectedProperties();RememberProperties();Invalidate();}
+}
 void Application::Finish(bool save,bool pin,bool recognize) {
     if(!state_.selected||state_.busy||pending_)return;EndPolyline(false);state_.line_snap.reset();CommitText();
     std::filesystem::path path=client_output_;
@@ -1285,7 +1358,9 @@ void Application::Finish(bool save,bool pin,bool recognize) {
         preferences_.save_directory=path.parent_path();
         if(!demo_&&!diagnostic_session_){settings_writer_.Request(preferences_);settings_writer_.Flush();}
     }
+    const bool quick_text=quick_capture_==QuickCapture::Text&&!save&&!pin&&!pin_edit_id_&&client_output_.empty();
     recognize=ocr_available_&&(recognize||pin||pin_edit_id_!=0);
+    if(quick_capture_==QuickCapture::Pin)recognize=false;
     state_.busy=true;pending_=true;Invalidate();
     const std::shared_ptr<const Frame> frame=pin_edit_id_?pin_edit_source_:frame_;
     auto document=pin_edit_id_?PinAnnotationDocument(document_,pin_edit_bounds_,*pin_edit_source_):document_.Snapshot();
@@ -1294,18 +1369,19 @@ void Application::Finish(bool save,bool pin,bool recognize) {
     const bool paste_file=preferences_.paste_as_file;const int file_format=preferences_.paste_file_format;
     const uint64_t generation=generation_,editing=pin_edit_id_;const bool edit_copy=pin_edit_copy_&&!save;
     const bool client_export=!client_output_.empty();
-    worker_=std::jthread([this,frame,client_export,document=std::move(document),selection,path,generation,pin,recognize,cursor_patch,editing,edit_copy,paste_file,file_format](std::stop_token stop) {
+    worker_=std::jthread([this,frame,client_export,document=std::move(document),selection,path,generation,pin,recognize,quick_text,cursor_patch,editing,edit_copy,paste_file,file_format](std::stop_token stop) {
         auto result=std::make_unique<Result>();result->generation=generation;result->editing=editing;result->edit_copy=edit_copy;result->recognize=recognize;
         const HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
         std::filesystem::path temporary;
         try {
             if(FAILED(com))throw std::runtime_error("Cannot initialize image export");
-            Renderer renderer;result->frame=renderer.Flatten(*frame,document,selection);
+            if(quick_text){result->ocr_frame=PinOcrImage(*frame,cursor_patch.get(),document,selection);result->quick_text=true;}
+            else {Renderer renderer;result->frame=renderer.Flatten(*frame,document,selection);}
             if(editing||pin){result->annotation_base=Crop(*frame,selection);result->annotations=PinAnnotationDocument(document,selection,*result->annotation_base);}
             if(pin&&!editing&&!stop.stop_requested()) {
                 result->ocr_frame=PinOcrImage(*frame,cursor_patch.get(),document,selection);result->pinned=true;
             }
-            if(path.empty()&&((!pin&&!editing)||edit_copy)&&!stop.stop_requested()){
+            if(!quick_text&&path.empty()&&((!pin&&!editing)||edit_copy)&&!stop.stop_requested()){
                 auto file=paste_file?PrepareClipboardFile(result->frame,file_format):nullptr;
                 if(!stop.stop_requested())result->clipboard_image=PrepareClipboardImage(result->frame,file);
             }
@@ -1356,9 +1432,8 @@ LRESULT CALLBACK Application::OverlayProc(HWND window,UINT message,WPARAM wp,LPA
             if(app->state_.dropdown.Open()){app->Key(*view,GET_WHEEL_DELTA_WPARAM(wp)>0?VK_UP:VK_DOWN);return 0;}
             const Point point{float(GET_X_LPARAM(lp)),float(GET_Y_LPARAM(lp))};
             if(app->state_.picker.open){const int field=app->state_.picker.Hit(point);if(field>=3&&field<=6){app->state_.picker.Step(field,GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA);app->state_.PickerColor()=app->state_.picker.color;app->ApplySelectedProperties(true);app->Invalidate();}return 0;}
-            const int id=ui::HitTest(ToolbarControls(app->state_,app->document_),point);
             const int steps=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA*((GET_KEYSTATE_WPARAM(wp)&MK_SHIFT)?4:1);
-            if(AdjustPropertyValue(app->state_,id,steps)){app->ApplySelectedProperties();app->RememberProperties();app->Invalidate();}
+            app->Wheel(point,steps);
             return 0;
         }
         case WM_LBUTTONUP:app->PointerUp(*view,GlobalPoint(view->bounds,lp));return 0;
@@ -1387,15 +1462,6 @@ LRESULT CALLBACK Application::OverlayProc(HWND window,UINT message,WPARAM wp,LPA
 }
 
 }
-
-
-
-
-
-
-
-
-
 
 
 

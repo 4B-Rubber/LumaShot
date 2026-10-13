@@ -1,6 +1,8 @@
 #pragma once
 #include "translate/http_client.h"
+#include <chrono>
 #include <cstdint>
+#include <utility>
 #include <ctime>
 #include <filesystem>
 #include <map>
@@ -87,6 +89,16 @@ http::Request BuildRequest(const Credentials& credentials, const Job& job, const
 Outcome ParseResponse(const Credentials& credentials, const Job& job, const http::Response& response);
 // Chunks, sends, parses; LLM chunks that come back misaligned are retried per item.
 Outcome Run(const Credentials& credentials, const Job& job, std::stop_token stop, const http::Limits& limits = {});
+// Splits a job into ordered [begin, end) chunks: at most max_chars / max_items each,
+// balanced so that at least min(min_parts, items) chunks exist (one per worker).
+std::vector<std::pair<size_t, size_t>> PlanChunks(const Job& job, size_t max_chars, size_t max_items, size_t min_parts);
+// Sends the planned chunks over `workers` concurrent connections, keeping order;
+// a misaligned LLM chunk is split in half and retried (not item by item).
+Outcome RunParallel(const Credentials& credentials, const Job& job, std::stop_token stop, const http::Limits& limits,
+    size_t workers, size_t max_chars, size_t max_items);
+// Built-in offline engine selected and installed: start loading the model now
+// (background, returns immediately) so it overlaps region selection and OCR.
+void Prewarm(const Config& config, std::chrono::milliseconds delay = {});
 
 // OpenAI-compatible model discovery: GET {endpoint}/models → data[].id.
 http::Request ModelsRequest(const Credentials& credentials);

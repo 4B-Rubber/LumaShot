@@ -79,6 +79,8 @@ private:
     void MarksChanged();
     bool ConfirmDiscard();
     ComPtr<ID2D1Bitmap> CreateTile(int index, int level);
+    bool TileHasMarks(int index, int level) const;
+    ComPtr<ID2D1Bitmap> UploadTile(const Frame& pixels);
 
     Host host_;
     std::function<void(Viewer*)> closed_;

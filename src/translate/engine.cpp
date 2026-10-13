@@ -2,9 +2,11 @@
 #include "translate/crypto.h"
 #include "translate/json.h"
 #include "translate/offline.h"
+#include "translate/result_cache.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cwctype>
 #include <thread>
@@ -114,6 +116,13 @@ Protocol ProtocolFor(const Credentials& c) {
     return Protocol::JsonArray;
 }
 bool Offline(const Credentials& c) { return c.preset && c.preset->id == "offline"; }
+// Generous output ceiling for a translation of `job`: a degenerate repetition loop
+// stops here instead of running on until the context is full.
+size_t OutputBudget(const Job& job) {
+    size_t chars = 0;
+    for (const auto& text : job.texts) chars += text.size() + 1;
+    return std::min<size_t>(2048, 64 + 3 * chars);
+}
 bool Chinese(Language l) { return l == Language::ChineseSimplified || l == Language::ChineseTraditional; }
 // TranslateGemma language names/codes follow its model card (zh-Hans / zh-Hant are both "Chinese").
 std::string GemmaName(Language l) { return Chinese(l) ? std::string("Chinese") : std::string(Info(l).english); }
@@ -411,7 +420,7 @@ http::Request BuildRequest(const Credentials& c, const Job& job, const Stamp& st
                 + ") translator. Your goal is to accurately convey the meaning and nuances of the original " + s_name + " text while adhering to " + t_name
                 + " grammar, vocabulary, and cultural sensitivities.\nProduce only the " + t_name + " translation, without any additional explanations or commentary. Please translate the following "
                 + s_name + " text into " + t_name + ":\n\n\n" + json::Utf8(joined) + "<end_of_turn>\n<start_of_turn>model\n";
-            r.body = "{\"prompt\":" + json::Quote(prompt) + ",\"n_predict\":2048,\"temperature\":0,\"stream\":false,\"cache_prompt\":true}";
+            r.body = "{\"prompt\":" + json::Quote(prompt) + ",\"n_predict\":" + std::to_string(OutputBudget(job)) + ",\"temperature\":0,\"stream\":false,\"cache_prompt\":true}";
             break;
         }
         r.url = ChatUrl(c.endpoint);
@@ -429,7 +438,7 @@ http::Request BuildRequest(const Credentials& c, const Job& job, const Stamp& st
                 : "Translate the following segment into " + std::string(target.english) + ", without additional explanation.\n\n";
             body += "{\"role\":\"user\",\"content\":" + json::Quote(prompt + Joined(job)) + "}]";
             // Sampling recommended by the model card (llama-server field names).
-            if (Offline(c)) body += ",\"temperature\":0.7,\"top_k\":20,\"top_p\":0.6,\"repeat_penalty\":1.05";
+            if (Offline(c)) body += ",\"temperature\":0.7,\"top_k\":20,\"top_p\":0.6,\"repeat_penalty\":1.05,\"max_tokens\":" + std::to_string(OutputBudget(job));
         } else {
             const std::string system =
                 "You are a professional translation engine. Translate every string in the user's JSON array into "
@@ -599,21 +608,24 @@ Outcome ParseResponse(const Credentials& c, const Job& job, const http::Response
 }
 
 namespace {
-Outcome RunOne(const Credentials& c, const Job& job, std::stop_token stop, const http::Limits& limits) {
+Outcome RunOne(http::Client& client, const Credentials& c, const Job& job, std::stop_token stop, const http::Limits& limits) {
     const Stamp stamp{std::time(nullptr), c.preset->engine == Engine::Youdao ? crypto::Uuid() : std::to_string(GetTickCount64() % 1000000000ull + 10000)};
-    return ParseResponse(c, job, http::Send(BuildRequest(c, job, stamp), stop, limits));
+    return ParseResponse(c, job, client.Send(BuildRequest(c, job, stamp), stop, limits));
 }
 
 Outcome RunChunks(const Credentials& c, const Job& job, std::stop_token stop, const http::Limits& limits) {
     Outcome total;
+    http::Client client;
+    total.texts.reserve(job.texts.size());
     const size_t limit = ChunkLimit(c);
     const size_t max_items = c.preset->engine == Engine::DeepL ? 50 : Offline(c) ? 16 : (c.preset->engine == Engine::OpenAi ? 40 : 100);
     size_t index = 0;
     bool first_request = true;
+    bool single_only = false;
     while (index < job.texts.size()) {
         Job chunk{{}, job.source, job.target};
         size_t chars = 0;
-        while (index < job.texts.size() && chunk.texts.size() < max_items && (chunk.texts.empty() || chars + job.texts[index].size() <= limit)) {
+        while (index < job.texts.size() && chunk.texts.size() < (single_only ? 1 : max_items) && (chunk.texts.empty() || chars + job.texts[index].size() <= limit)) {
             chars += job.texts[index].size();
             chunk.texts.push_back(job.texts[index++]);
         }
@@ -621,23 +633,100 @@ Outcome RunChunks(const Credentials& c, const Job& job, std::stop_token stop, co
         // Baidu's standard tier allows one request per second.
         if (!first_request && c.preset->engine == Engine::Baidu) std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         first_request = false;
-        auto part = RunOne(c, chunk, stop, limits);
+        auto part = RunOne(client, c, chunk, stop, limits);
         if (!part.ok && part.format_mismatch && chunk.texts.size() > 1) {
+            // Remember this provider's batch failure for the rest of this job.
+            single_only = true;
             part = {};
             part.ok = true;
             for (const auto& text : chunk.texts) {
-                auto single = RunOne(c, Job{{text}, job.source, job.target}, stop, limits);
+                auto single = RunOne(client, c, Job{{text}, job.source, job.target}, stop, limits);
                 if (!single.ok) { part = std::move(single); break; }
-                part.texts.push_back(single.texts.front());
+                part.texts.push_back(std::move(single.texts.front()));
             }
         }
         if (!part.ok) { total.error = part.error; total.texts.clear(); return total; }
         if (total.detected.empty()) total.detected = part.detected;
-        total.texts.insert(total.texts.end(), part.texts.begin(), part.texts.end());
+        for (auto& text : part.texts) total.texts.push_back(std::move(text));
     }
     total.ok = true;
     return total;
 }
+
+Outcome Bisect(http::Client& client, const Credentials& c, const Job& chunk, std::stop_token stop, const http::Limits& limits) {
+    auto part = RunOne(client, c, chunk, stop, limits);
+    if (part.ok || !part.format_mismatch || chunk.texts.size() < 2 || stop.stop_requested()) return part;
+    const auto half = chunk.texts.begin() + static_cast<std::ptrdiff_t>(chunk.texts.size() / 2);
+    auto left = Bisect(client, c, Job{{chunk.texts.begin(), half}, chunk.source, chunk.target}, stop, limits);
+    if (!left.ok) return left;
+    auto right = Bisect(client, c, Job{{half, chunk.texts.end()}, chunk.source, chunk.target}, stop, limits);
+    if (!right.ok) return right;
+    for (auto& text : right.texts) left.texts.push_back(std::move(text));
+    if (left.detected.empty()) left.detected = std::move(right.detected);
+    return left;
+}
+}
+
+std::vector<std::pair<size_t, size_t>> PlanChunks(const Job& job, size_t max_chars, size_t max_items, size_t min_parts) {
+    std::vector<std::pair<size_t, size_t>> plan;
+    const size_t n = job.texts.size();
+    if (!n) return plan;
+    max_chars = std::max<size_t>(1, max_chars);
+    max_items = std::max<size_t>(1, max_items);
+    size_t total = 0;
+    for (const auto& text : job.texts) total += text.size();
+    const size_t parts = std::max({(total + max_chars - 1) / max_chars, (n + max_items - 1) / max_items, std::min(std::max<size_t>(1, min_parts), n)});
+    const size_t target = std::max<size_t>(1, std::min(max_chars, (total + parts - 1) / parts));
+    for (size_t i = 0; i < n;) {
+        const size_t begin = i;
+        size_t chars = 0;
+        // Close a chunk once it reaches its share, so the remaining items still fill the other workers.
+        while (i < n && i - begin < max_items && (i == begin || (chars < target && chars + job.texts[i].size() <= max_chars))) chars += job.texts[i++].size();
+        plan.emplace_back(begin, i);
+    }
+    return plan;
+}
+
+Outcome RunParallel(const Credentials& c, const Job& job, std::stop_token stop, const http::Limits& limits, size_t workers, size_t max_chars, size_t max_items) {
+    Outcome total;
+    const auto plan = PlanChunks(job, max_chars, max_items, workers);
+    std::vector<Outcome> parts(plan.size());
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    const auto work = [&] {
+        http::Client client;
+        for (;;) {
+            if (failed.load() || stop.stop_requested()) return;
+            const size_t k = next++;
+            if (k >= plan.size()) return;
+            const auto first = job.texts.begin() + static_cast<std::ptrdiff_t>(plan[k].first);
+            const auto last = job.texts.begin() + static_cast<std::ptrdiff_t>(plan[k].second);
+            parts[k] = Bisect(client, c, Job{{first, last}, job.source, job.target}, stop, limits);
+            if (!parts[k].ok) failed = true;
+        }
+    };
+    {
+        std::vector<std::jthread> pool;
+        for (size_t i = 1; i < std::min(std::max<size_t>(1, workers), plan.size()); ++i) pool.emplace_back(work);
+        work();
+    }
+    if (stop.stop_requested()) { total.error = L"已取消"; return total; }
+    for (const auto& part : parts) if (!part.ok && !part.error.empty()) { total.error = part.error; return total; }
+    for (const auto& part : parts) if (!part.ok) { total.error = L"翻译服务没有返回结果"; return total; }
+    total.texts.reserve(job.texts.size());
+    for (auto& part : parts) {
+        if (total.detected.empty()) total.detected = part.detected;
+        for (auto& text : part.texts) total.texts.push_back(std::move(text));
+    }
+    total.ok = total.texts.size() == job.texts.size();
+    if (!total.ok) total.error = L"模型返回的译文条数与原文不一致";
+    return total;
+}
+
+void Prewarm(const Config& config, std::chrono::milliseconds delay) {
+    const auto c = Resolve(config);
+    if (!c || !Offline(*c)) return;
+    if (const auto* model = offline::FindModel(c->model)) offline::Prewarm(*model, delay);
 }
 
 Outcome Run(const Credentials& c, const Job& job, std::stop_token stop, const http::Limits& limits) {
@@ -646,16 +735,22 @@ Outcome Run(const Credentials& c, const Job& job, std::stop_token stop, const ht
     if (!Offline(c)) return RunChunks(c, job, stop, limits);
     const auto* model = offline::FindModel(c.model);
     if (!model) { total.error = L"未知的离线模型"; return total; }
+    if (stop.stop_requested()) { total.error = L"已取消"; return total; }
+    static ResultCache cache;
+    if (auto cached = cache.Find(c.model, job)) return std::move(*cached);
     std::wstring reason;
     const auto base = offline::Acquire(*model, stop, &reason);
     if (!base) { total.error = reason; return total; }
+    struct ReleaseServer { ~ReleaseServer() { offline::Release(); } } release;
     Credentials local = c;
     local.endpoint = *base + "/v1";
     // First tokens on a cold CPU can take a while; never cut a local job short.
     http::Limits relaxed = limits;
     relaxed.receive = std::max(relaxed.receive, std::chrono::milliseconds(std::chrono::minutes(3)));
-    total = RunChunks(local, job, stop, relaxed);
-    offline::Release();
+    // The server decodes ServerSlots sequences as one batch: about the cost of one on
+    // memory-bound hardware, so balanced concurrent chunks finish ~2x sooner.
+    total = RunParallel(local, job, stop, relaxed, offline::ServerSlots, 700, 16);
+    if (!stop.stop_requested()) cache.Store(c.model, job, total);
     return total;
 }
 

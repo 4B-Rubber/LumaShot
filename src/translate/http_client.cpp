@@ -43,7 +43,14 @@ bool PrivateHost(std::wstring_view host) {
     return o[0] == 127 || o[0] == 10 || (o[0] == 172 && o[1] >= 16 && o[1] <= 31) || (o[0] == 192 && o[1] == 168) || (o[0] == 169 && o[1] == 254);
 }
 
-Response Send(const Request& request, std::stop_token stop, const Limits& limits) {
+struct Client::Impl {
+    Internet session;
+    bool local{};
+};
+Client::Client() : impl_(std::make_unique<Impl>()) {}
+Client::~Client() = default;
+
+Response Client::Send(const Request& request, std::stop_token stop, const Limits& limits) {
     Response result;
     if (stop.stop_requested()) { result.status = Status::Canceled; return result; }
     const auto wide = json::Utf16(request.url);
@@ -61,9 +68,15 @@ Response Send(const Request& request, std::stop_token stop, const Limits& limits
     if (object.empty()) object = L"/";
 
     const std::wstring agent = L"LumaShot/" LUMASHOT_VERSION_WTEXT;
-    Internet session, connection, handle;
-    if (local) session.value = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    else {
+    Internet connection, handle;
+    auto& session = impl_->session;
+    if (session.value && impl_->local != local) {
+        WinHttpCloseHandle(session.value);
+        session.value = nullptr;
+    }
+    impl_->local = local;
+    if (!session.value && local) session.value = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    else if (!session.value) {
         session.value = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!session.value) session.value = WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     }
@@ -90,7 +103,7 @@ Response Send(const Request& request, std::stop_token stop, const Limits& limits
         on_stop.reset();
         if (closed) { handle.value = nullptr; status = Status::Canceled; }
         result.status = status;
-        return result;
+        return std::move(result);
     };
     const auto network = [&] {
         result.error = GetLastError();
@@ -115,5 +128,8 @@ Response Send(const Request& request, std::stop_token stop, const Limits& limits
         result.body.append(buffer.data(), read);
     }
     return finish(Status::Ok);
+}
+Response Send(const Request& request, std::stop_token stop, const Limits& limits) {
+    return Client{}.Send(request, stop, limits);
 }
 }

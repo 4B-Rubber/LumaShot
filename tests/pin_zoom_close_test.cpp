@@ -42,7 +42,9 @@ struct PinTest {
                 if(mode!=0)expect(tools&&IsWindowVisible(tools)&&!selected.selection.Empty(),"synthetic text selection shows real tools");
                 if(mode==0){manager.Zoom(selected,120,{200,200});expect(selected.zoom_animating,"animation active before close");}
                 const HWND focus=mode==2?tools:window;SetFocus(focus);
-                SendMessageW(focus,WM_KEYDOWN,VK_ESCAPE,0);
+                // Escape first dismisses a text selection; the next Escape closes the pin.
+                if(mode!=0){SendMessageW(focus,WM_KEYDOWN,VK_ESCAPE,0);expect(IsWindow(window)&&selected.selection.Empty(),"first Escape dismisses the text selection and keeps the pin");}
+                SendMessageW(IsWindow(focus)&&IsWindowVisible(focus)?focus:window,WM_KEYDOWN,VK_ESCAPE,0);
                 expect(!IsWindow(window)&&(!tools||!IsWindow(tools))&&!selected.zoom_animating,"Escape closes focused pin and owned tools, including text-selected and locked pins");
                 expect(IsWindow(zoom_window),"Escape leaves other pins untouched");
                 manager.Ready();expect(!manager.pins_.contains(id),"closed pin is removed without stale state");

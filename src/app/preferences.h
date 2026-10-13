@@ -9,6 +9,8 @@ namespace lumashot {
 struct Preferences {
     ToolProperties tools=[] {ToolProperties value;value.width=2;return value;}();
     bool include_cursor{true};
+    bool ocr_remove_whitespace{false};
+    std::filesystem::path ocr_model_directory;
     bool start_with_windows{true};
     bool paste_as_file{true};
     bool clipboard_enabled{false};
@@ -20,6 +22,8 @@ struct Preferences {
     bool clipboard_strip_hint_shown{false};
     // Switch the pin to the translated rendering as soon as a translation finishes.
     bool translate_auto_show{true};
+    // Top-edge clothesline (drag a pin to the screen top or press H). Off returns hung pins home.
+    bool clothesline_enabled{true};
     // Last section shown in the settings window (0 shortcuts … 5 general).
     int settings_page{};
     bool hotkeys_disabled{false};
@@ -33,6 +37,8 @@ struct Preferences {
     UINT video_modifiers{MOD_CONTROL | MOD_ALT},video_key{'R'};
     UINT clipboard_modifiers{MOD_WIN},clipboard_key{'V'};
     UINT translate_modifiers{MOD_CONTROL|MOD_ALT},translate_key{'Y'};
+    UINT ocr_modifiers{MOD_CONTROL|MOD_ALT},ocr_key{'O'};
+    UINT pin_modifiers{MOD_CONTROL|MOD_ALT},pin_key{'P'};
     std::filesystem::path save_directory;
     // Updater: daily automatic check (after startup), last successful check in
     // Unix seconds, proxy prefixes from the last verified manifest ('|'-separated),

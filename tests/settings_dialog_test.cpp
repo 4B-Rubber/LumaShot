@@ -15,10 +15,10 @@ void Key(Settings& s,UINT key,bool down){s.Input(key,down);Expect(input_blocked,
 void Finish(Settings& s){SendMessageW(s.window,Finished,0,0);Expect(!s.hook&&!s.recording&&!s.draining&&!input_blocked,"hook removed after complete chord");}
 void Snapshot(Settings& s,const wchar_t* file,float scale){
     RECT previous{};GetWindowRect(s.window,&previous);const float old=s.scale;
-    std::array<RECT,27> rects{};constexpr int ids[]={128,119,120,103,101,115,126,132,129,127,130,131,116,117,118,121,122,123,124,125,110,111,112,113,IDOK,IDCANCEL,114};
-    for(int i=0;i<27;++i){GetWindowRect(GetDlgItem(s.window,ids[i]),&rects[i]);MapWindowPoints(nullptr,s.window,reinterpret_cast<POINT*>(&rects[i]),2);}
+    std::array<RECT,std::size(Controls)> rects{};const auto& ids=Controls;
+    for(int i=0;i<static_cast<int>(std::size(ids));++i){GetWindowRect(GetDlgItem(s.window,ids[i]),&rects[i]);MapWindowPoints(nullptr,s.window,reinterpret_cast<POINT*>(&rects[i]),2);}
     SetWindowPos(s.window,nullptr,0,0,int(PanelWidth*scale),int(PanelHeight*scale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);s.scale=scale;
-    for(int i=0;i<27;++i){const auto r=rects[i];SetWindowPos(GetDlgItem(s.window,ids[i]),nullptr,int(r.left/old*scale),int(r.top/old*scale),int((r.right-r.left)/old*scale),int((r.bottom-r.top)/old*scale),SWP_NOZORDER|SWP_NOACTIVATE);}
+    for(int i=0;i<static_cast<int>(std::size(ids));++i){const auto r=rects[i];SetWindowPos(GetDlgItem(s.window,ids[i]),nullptr,int(r.left/old*scale),int(r.top/old*scale),int((r.right-r.left)/old*scale),int((r.bottom-r.top)/old*scale),SWP_NOZORDER|SWP_NOACTIVATE);}
     s.RenderSurface();auto frame=MakeFrame({0,0,s.surface_width,s.surface_height});
     const auto* pixels=s.surface->Pixels();Expect((pixels[0]>>24)==0,"production surface has fully transparent outer corner");
     const auto hasInk=[&](RECT bounds,UINT32 ink){
@@ -63,7 +63,7 @@ void CALLBACK Drive(HWND,UINT,UINT_PTR timer,DWORD){
     RECT outer{},client{};GetWindowRect(w,&outer);GetClientRect(w,&client);POINT origin{};ClientToScreen(w,&origin);
     Expect(!(GetWindowLongPtrW(w,GWL_STYLE)&(WS_CAPTION|WS_THICKFRAME|WS_BORDER)),"actual dialog has no system caption or border");
     Expect(origin.x==outer.left&&origin.y==outer.top&&client.right==outer.right-outer.left&&client.bottom==outer.bottom-outer.top,"actual client and window extents agree");
-    for(int id:{128,115,116,117,118,121,122,123,124,125,126,132,129,127,130,131,113,IDCANCEL,IDOK}){RECT r{};GetWindowRect(GetDlgItem(w,id),&r);Expect(r.left>=outer.left&&r.right<=outer.right&&r.top>=outer.top&&r.bottom<=outer.bottom,"file paste and footer controls fully inside real window bounds");}
+    for(int id:{142,143,144,145,146,147,128,115,116,117,118,121,122,123,124,125,126,132,129,127,130,131,113,IDCANCEL,IDOK}){RECT r{};GetWindowRect(GetDlgItem(w,id),&r);Expect(r.left>=outer.left&&r.right<=outer.right&&r.top>=outer.top&&r.bottom<=outer.bottom,"file paste and footer controls fully inside real window bounds");}
     if(scenario==4){
         if(phase++==0){
             const DWORD foreground=GetWindowThreadProcessId(GetForegroundWindow(),nullptr),current=GetCurrentThreadId();
@@ -83,6 +83,10 @@ void CALLBACK Drive(HWND,UINT,UINT_PTR timer,DWORD){
         for(int i=0;i<21;++i)s.RenderSurface();
         std::cout<<"Settings full-frame average ms: "<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-render_start).count()/20<<std::endl;
         Expect(s.formats.size()==count&&s.surface.get()==surface,"full redraw reuses text formats and a single surface");
+        for(int id:ShortcutControls){RECT r{};GetWindowRect(GetDlgItem(w,id),&r);MapWindowPoints(nullptr,w,reinterpret_cast<POINT*>(&r),2);Expect(r.bottom<int(FooterTop*s.scale),"all seven shortcuts fit above footer");}
+        Expect(!s.draft.ocr_remove_whitespace,"OCR whitespace removal defaults off");SendMessageW(w,WM_COMMAND,144,0);Expect(s.draft.ocr_remove_whitespace,"OCR whitespace switch updates draft");SendMessageW(w,WM_COMMAND,144,0);
+        Expect(!s.SetOcrModel(std::filesystem::current_path()/L"missing-model"),"missing OCR model files are rejected");
+        SendMessageW(w,WM_COMMAND,146,0);Expect(s.draft.ocr_model_directory.empty(),"restore built-in OCR clears model directory");
         Expect(s.draft.start_with_windows,"login startup defaults on");SendMessageW(w,WM_COMMAND,127,0);Expect(!s.draft.start_with_windows,"startup switch disables draft");SendMessageW(w,WM_COMMAND,127,0);Expect(s.draft.start_with_windows,"startup switch enables draft");
         Expect(!s.draft.clipboard_enabled,"clipboard history defaults off");SendMessageW(w,WM_COMMAND,126,0);Expect(s.draft.clipboard_enabled,"clipboard switch enables draft");SendMessageW(w,WM_COMMAND,126,0);Expect(!s.draft.clipboard_enabled,"clipboard switch disables draft");
         Expect(!s.draft.clipboard_persist,"clipboard history persistence defaults off");SendMessageW(w,WM_COMMAND,129,0);Expect(s.draft.clipboard_persist,"persistence switch enables draft");SendMessageW(w,WM_COMMAND,113,0);Expect(!s.draft.clipboard_persist,"restore defaults turns persistence off");
@@ -105,6 +109,10 @@ void CALLBACK Drive(HWND,UINT,UINT_PTR timer,DWORD){
          SendMessageW(w,WM_COMMAND,111,0);pages(L"settings-light-p");SendMessageW(w,WM_COMMAND,112,0);Expect(s.draft.theme==2,"dark theme preview updates draft");pages(L"settings-dark-p");}
         SendMessageW(w,WM_COMMAND,138,0);Expect(s.tr_name==L"DeepSeek"&&!s.tr_ready,"translation page summarises the isolated engine config");
         Expect(s.draft.translate_auto_show,"translated pin switch defaults on");SendMessageW(w,WM_COMMAND,141,0);Expect(!s.draft.translate_auto_show,"translated pin switch toggles draft");SendMessageW(w,WM_COMMAND,141,0);
+        SendMessageW(w,WM_COMMAND,139,0);{const auto shown=[&](int id){return (GetWindowLongPtrW(GetDlgItem(w,id),GWL_STYLE)&WS_VISIBLE)!=0;};RECT r{};GetWindowRect(GetDlgItem(w,147),&r);MapWindowPoints(nullptr,w,reinterpret_cast<POINT*>(&r),2);
+         Expect(s.page==4&&shown(147)&&!shown(141)&&r.bottom<int(FooterTop*s.scale),"clothesline switch sits on the appearance page above the footer");}
+        Expect(s.draft.clothesline_enabled,"clothesline switch defaults on");SendMessageW(w,WM_COMMAND,147,0);Expect(!s.draft.clothesline_enabled,"clothesline switch toggles draft");
+        Snapshot(s,L"settings-clothesline-off.png",1);SendMessageW(w,WM_COMMAND,147,0);Expect(s.draft.clothesline_enabled,"clothesline switch toggles back on");
         SendMessageW(w,WM_COMMAND,135,0);Snapshot(s,L"settings-dark-150.png",1.5f);
         SendMessageW(w,WM_COMMAND,103,0);Expect(s.recording&&s.hook,"recording installs hook on demand");
         Key(s,VK_LWIN,true);Key(s,VK_LCONTROL,true);Key(s,VK_F11,true);Expect(s.draft.modifiers==(MOD_WIN|MOD_CONTROL)&&s.draft.key==VK_F11,"Win plus Ctrl plus F11 captured");
@@ -124,7 +132,7 @@ void CALLBACK Drive(HWND,UINT,UINT_PTR timer,DWORD){
         bool registered=RegisterHotKey(nullptr,88,MOD_CONTROL|MOD_ALT|MOD_SHIFT,VK_F10)!=FALSE;Expect(registered,"synthetic conflict registered");
         s.draft.modifiers=MOD_CONTROL|MOD_ALT|MOD_SHIFT;s.draft.key=VK_F10;SendMessageW(w,WM_COMMAND,IDOK,0);
         Expect(s.error&&!IsWindowEnabled(GetDlgItem(w,IDOK))&&!callback_called,"conflict stays inline and blocks save");Snapshot(s,L"settings-conflict.png",1);
-        if(registered)UnregisterHotKey(nullptr,88);SendMessageW(w,WM_COMMAND,113,0);Expect(s.draft.key=='A'&&s.draft.modifiers==(MOD_CONTROL|MOD_ALT)&&s.draft.theme==0&&s.draft.include_cursor&&s.draft.paste_as_file&&s.draft.paste_file_format==0&&s.draft.pin_style==DefaultPinStyle,"restore defaults changes dialog settings only");
+        s.draft.clothesline_enabled=false;if(registered)UnregisterHotKey(nullptr,88);SendMessageW(w,WM_COMMAND,113,0);Expect(s.draft.clothesline_enabled,"restore defaults turns the clothesline back on");Expect(s.draft.key=='A'&&s.draft.modifiers==(MOD_CONTROL|MOD_ALT)&&s.draft.theme==0&&s.draft.include_cursor&&s.draft.paste_as_file&&s.draft.paste_file_format==0&&s.draft.pin_style==DefaultPinStyle,"restore defaults changes dialog settings only");
         SendMessageW(w,WM_COMMAND,IDCANCEL,0);
     }else if(scenario==5){
         SendMessageW(w,WM_COMMAND,128,0);Key(s,VK_LCONTROL,true);Key(s,VK_F23,true);Key(s,VK_F23,false);Key(s,VK_LCONTROL,false);Finish(s);
@@ -134,6 +142,13 @@ void CALLBACK Drive(HWND,UINT,UINT_PTR timer,DWORD){
         SendMessageW(w,WM_COMMAND,119,0);Key(s,VK_LCONTROL,true);Key(s,VK_LSHIFT,true);Key(s,'G',true);Key(s,'G',false);Key(s,VK_LSHIFT,false);Key(s,VK_LCONTROL,false);Finish(s);
         Expect(s.draft.gif_key=='G'&&s.draft.gif_modifiers==(MOD_CONTROL|MOD_SHIFT)&&s.draft.key=='A',"GIF recorder edits independent shortcut");
         SendMessageW(w,WM_COMMAND,120,0);Key(s,VK_BACK,true);Key(s,VK_BACK,false);Finish(s);Expect(s.draft.video_key==0,"recording shortcut can be disabled");
+        for(int id:{142,143}){
+            SendMessageW(w,WM_COMMAND,id,0);Key(s,VK_LCONTROL,true);Key(s,id==142?VK_F17:VK_F18,true);Key(s,id==142?VK_F17:VK_F18,false);Key(s,VK_LCONTROL,false);Finish(s);
+            Expect(s.EditKey()==static_cast<UINT>(id==142?VK_F17:VK_F18)&&s.EditMods()==MOD_CONTROL,"OCR and pin each record their own shortcut");
+            const auto saved=s.EditKey();SendMessageW(w,WM_COMMAND,id,0);Key(s,VK_ESCAPE,true);Key(s,VK_ESCAPE,false);Finish(s);Expect(s.EditKey()==saved,"OCR and pin Escape restores previous shortcut");
+        }
+        s.draft.ocr_key=s.draft.pin_key;s.draft.ocr_modifiers=s.draft.pin_modifiers;Expect(!s.Validate(),"OCR and pin duplicates are rejected");
+        SendMessageW(w,WM_COMMAND,142,0);Key(s,VK_BACK,true);Key(s,VK_BACK,false);Finish(s);Expect(s.draft.ocr_key==0,"OCR shortcut can be disabled");
         s.draft.gif_key=s.draft.key;s.draft.gif_modifiers=s.draft.modifiers;Expect(!s.Validate(),"duplicate shortcuts blocked before parent submission");
         SendMessageW(w,WM_COMMAND,IDCANCEL,0);
     }else{
@@ -159,6 +174,12 @@ int main(){
         Expect(p.tools.width==9&&Settings::recorder==nullptr&&!input_blocked,"tool properties retained and hook lifetime closed");
     }
     const auto path=std::filesystem::current_path()/L"settings-roundtrip-test.ini";
+    {Preferences custom;custom.ocr_modifiers=MOD_CONTROL|MOD_SHIFT;custom.ocr_key=VK_F17;custom.pin_modifiers=MOD_ALT|MOD_SHIFT;custom.pin_key=VK_F18;custom.ocr_remove_whitespace=true;custom.ocr_model_directory=L"C:\\Synthetic\\OCR 模型";custom.SaveTo(path);
+     const auto loaded_custom=Preferences::LoadFrom(path);Preferences decoded_custom;
+     Expect(loaded_custom.ocr_key==VK_F17&&loaded_custom.pin_key==VK_F18&&loaded_custom.ocr_modifiers==custom.ocr_modifiers&&loaded_custom.pin_modifiers==custom.pin_modifiers&&loaded_custom.ocr_remove_whitespace&&loaded_custom.ocr_model_directory==custom.ocr_model_directory,"OCR and pin preferences persist including Unicode model path");
+     Expect(Decode(Encode(custom),decoded_custom)&&AllShortcuts(decoded_custom)==AllShortcuts(custom)&&decoded_custom.ocr_remove_whitespace&&decoded_custom.ocr_model_directory==custom.ocr_model_directory,"isolated settings IPC carries OCR and pin preferences");
+     auto invalid=Encode(custom);invalid.ocr_remove_whitespace=2;Expect(!Decode(invalid,decoded_custom),"IPC rejects invalid OCR boolean");
+     invalid=Encode(custom);std::fill(std::begin(invalid.ocr_model_directory),std::end(invalid.ocr_model_directory),L'x');Expect(!Decode(invalid,decoded_custom),"IPC rejects unterminated model path");}
     WritePrivateProfileStringW(L"Unrelated",L"Keep",L"yes",path.c_str());Preferences stored;stored.clipboard_enabled=true;stored.key=VK_F1;stored.modifiers=0;stored.gif_key='T';stored.gif_modifiers=MOD_CONTROL|MOD_SHIFT;stored.video_key=0;stored.clipboard_key=VK_F23;stored.clipboard_modifiers=MOD_WIN|MOD_SHIFT;stored.SaveTo(path);const auto loaded=Preferences::LoadFrom(path);Expect(loaded.clipboard_key==VK_F23&&loaded.clipboard_modifiers==(MOD_WIN|MOD_SHIFT),"clipboard shortcut file roundtrip");Expect(loaded.clipboard_enabled,"clipboard enable preference roundtrip");Preferences clipboard_decoded;Expect(Decode(Encode(stored),clipboard_decoded)&&clipboard_decoded.clipboard_enabled&&clipboard_decoded.clipboard_key==VK_F23&&clipboard_decoded.clipboard_modifiers==(MOD_WIN|MOD_SHIFT),"clipboard enable IPC roundtrip");
     Expect(loaded.key==VK_F1&&loaded.modifiers==0,"standalone function key survives settings reload without modifier fallback");
     Expect(!loaded.clipboard_persist,"clipboard history persistence defaults off on disk");
@@ -187,9 +208,14 @@ int main(){
      Expect(reread.settings_page==3&&!reread.translate_auto_show,"settings page and translated pin switch survive settings reload");
      Preferences decoded_page;Expect(Decode(Encode(page),decoded_page)&&decoded_page.settings_page==3&&!decoded_page.translate_auto_show,"isolated settings IPC carries settings page and translated pin switch");
      auto bad=Encode(page);bad.settings_page=6;Preferences rejected;Expect(!Decode(bad,rejected),"IPC rejects invalid settings page");std::filesystem::remove(path);}
+    {Expect(Preferences::LoadFrom(path).clothesline_enabled,"clothesline defaults on for settings files without the key");
+     Preferences off;off.clothesline_enabled=false;off.SaveTo(path);const auto reread=Preferences::LoadFrom(path);
+     Expect(!reread.clothesline_enabled,"clothesline switch survives settings reload");
+     Preferences decoded_off;Expect(Decode(Encode(off),decoded_off)&&!decoded_off.clothesline_enabled,"isolated settings IPC carries the clothesline switch");
+     Preferences on;Preferences decoded_on;decoded_on.clothesline_enabled=false;Expect(Decode(Encode(on),decoded_on)&&decoded_on.clothesline_enabled,"isolated settings IPC carries the clothesline switch turned on");
+     auto bad=Encode(off);bad.clothesline_enabled=2;Preferences rejected;Expect(!Decode(bad,rejected),"IPC rejects invalid clothesline switch");std::filesystem::remove(path);}
     std::filesystem::remove(translation_config);
     CoUninitialize();return failures?1:0;
 }
-
 
 

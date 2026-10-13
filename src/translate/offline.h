@@ -107,6 +107,18 @@ std::optional<std::string> Acquire(const Model& model, std::stop_token stop, std
 void Release();
 void Shutdown();
 bool ServerRunning();
+bool ServerCpuOnly();                 // the running server was started without GPU offload
+// Starts loading `model` in the background (no-op while running or loading) so
+// the model is ready by the time OCR finishes; arms the idle shutdown when done.
+void Prewarm(const Model& model, std::chrono::milliseconds delay = {});
+// Free local video memory of the largest discrete GPU (DXGI budget minus usage);
+// nullopt when there is no discrete GPU or the query is unsupported.
+std::optional<std::uint64_t> FreeVideoMemory();
+// A discrete GPU without room for the whole model makes Vulkan page or split the
+// model, which is slower than the CPU and loads several times longer.
+bool PreferCpu(const Model& model, std::optional<std::uint64_t> free_vram);
+// Concurrent requests the server decodes as one batch (continuous batching).
+inline constexpr int ServerSlots = 3;
 inline constexpr std::chrono::minutes IdleShutdown{5};
 std::wstring ServerCommandLine(const std::filesystem::path& server, const std::filesystem::path& model, int port, bool cpu_only, const std::filesystem::path& log);
 }

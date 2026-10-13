@@ -66,6 +66,9 @@ Copy-Item -LiteralPath (Join-Path $root 'deps/lexilla-source.json') -Destination
 New-Item -ItemType Directory -Force -Path (Join-Path $output 'licenses/lumatext') | Out-Null
 Copy-Item -Path (Join-Path $root 'deps/lumatext/licenses/*') -Destination (Join-Path $output 'licenses/lumatext')
 New-Item -ItemType Directory -Force -Path (Join-Path $output 'docs') | Out-Null
+foreach ($file in @('custom-ocr.md','github-feedback-2026-10-02.md')) {
+    Copy-Item -LiteralPath (Join-Path $root "docs/$file") -Destination (Join-Path $output 'docs')
+}
 Copy-Item -LiteralPath (Join-Path $root 'docs/pin-selection-tools.md') -Destination (Join-Path $output 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'docs/ocr-table.md') -Destination (Join-Path $output 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'docs/ocr-runtime-size.md') -Destination (Join-Path $output 'docs')

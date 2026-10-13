@@ -1,5 +1,6 @@
 // Offline translation: catalog, hardware fit, command line, install markers
 // and the resumable, verified downloader against a loopback HTTP server.
+#include <iostream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -179,6 +180,18 @@ void CommandLine() {
     const auto gpu = offline::ServerCommandLine(L"C:\\r\\llama-server.exe", L"C:\\m\\a b.gguf", 5123, false, L"C:\\o\\server.log");
     Expect(gpu.find(L"-m \"C:\\m\\a b.gguf\"") != std::wstring::npos && gpu.find(L"--host 127.0.0.1 --port 5123") != std::wstring::npos && gpu.find(L"--no-webui") != std::wstring::npos && gpu.find(L"-dev none") == std::wstring::npos, "server binds loopback, quotes paths");
     Expect(offline::ServerCommandLine(L"s", L"m", 1, true, L"l").ends_with(L" -dev none"), "cpu fallback disables devices");
+    Expect(gpu.find(L"--cache-ram 128") != std::wstring::npos && gpu.find(L"--threads-http 4") != std::wstring::npos,
+        "offline server bounds history memory and HTTP workers");
+    Expect(gpu.find(L"-np 3 -kvu") != std::wstring::npos && gpu.find(L"-c 6144") != std::wstring::npos && offline::ServerSlots == 3,
+        "offline server batches three slots over one shared KV pool");
+    const auto& small_model = *offline::FindModel("hy-mt1.5-1.8b");
+    const auto& big = *offline::FindModel("hy-mt1.5-7b");
+    constexpr std::uint64_t mib = 1ull << 20;
+    Expect(!offline::PreferCpu(small_model, std::nullopt), "no discrete GPU: llama.cpp decides");
+    Expect(offline::PreferCpu(small_model, 43 * mib) && offline::PreferCpu(small_model, 1500 * mib), "busy 3 GB GPU: 1.8B runs on the CPU");
+    Expect(!offline::PreferCpu(small_model, 2700 * mib), "free 3 GB GPU: 1.8B offloads");
+    Expect(offline::PreferCpu(big, 4096 * mib) && !offline::PreferCpu(big, 7000 * mib), "7B needs its full VRAM budget");
+    if (const auto free = offline::FreeVideoMemory()) std::cout << "info: free video memory " << (*free / mib) << " MiB\n";
 }
 
 void Markers(const fs::path& root) {

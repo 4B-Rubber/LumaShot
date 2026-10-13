@@ -7,8 +7,10 @@
 #include "update/manifest.h"
 #include "translate/engine.h"
 #include "capture/frame.h"
+#include "ocr/config.h"
 #include <memory>
 #include <commctrl.h>
+#include <shobjidl.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -30,15 +32,18 @@ constexpr UINT Changed=WM_APP+71,Finished=WM_APP+72;
 // Layout in DIP: sidebar navigation + one page at a time. The window only
 // scales down when the work area is smaller than the panel itself.
 constexpr float PanelWidth=780,PanelHeight=560,SideWidth=196,ContentLeft=220,ContentRight=756,CardTop=88,RowHeight=58,FooterTop=500;
-constexpr int Controls[]={135,136,137,138,139,140,103,119,120,128,133,134,141,101,115,126,132,129,127,131,130,116,117,118,121,122,123,124,125,110,111,112,113,IDOK,IDCANCEL,114};
+constexpr float ShortcutRowHeight=50;
+constexpr int ShortcutControls[]={103,119,120,128,133,142,143};
+constexpr bool IsShortcutControl(int id){for(int candidate:ShortcutControls)if(id==candidate)return true;return false;}
+constexpr int Controls[]={142,143,144,145,146,135,136,137,138,139,140,103,119,120,128,133,134,141,101,115,126,132,129,127,131,130,116,117,118,121,122,123,124,125,110,111,112,147,113,IDOK,IDCANCEL,114};
 // Page that owns a control; -1 for the always-visible sidebar and footer.
 constexpr int PageOf(int id){
     switch(id){
-    case 103:case 119:case 120:case 128:case 133:return 0;
-    case 101:case 115:case 116:case 117:case 118:return 1;
+    case 103:case 119:case 120:case 128:case 133:case 142:case 143:return 0;
+    case 101:case 115:case 116:case 117:case 118:case 144:case 145:case 146:return 1;
     case 126:case 132:case 129:return 2;
     case 134:case 141:return 3;
-    case 110:case 111:case 112:case 121:case 122:case 123:case 124:case 125:return 4;
+    case 110:case 111:case 112:case 121:case 122:case 123:case 124:case 125:case 147:return 4;
     case 127:case 130:case 131:return 5;
     default:return -1;
     }
@@ -57,9 +62,9 @@ struct Settings {
     bool update_requested{};
     HWND window{};int hover{};HHOOK hook{};float scale{1};bool recording{},draining{},error{},acrylic{},material_dark{};
     int shortcut_id{103};
-    int page{};std::wstring tr_name,tr_detail;bool tr_ready{};
-    UINT& EditMods(){return shortcut_id==133?draft.translate_modifiers:shortcut_id==128?draft.clipboard_modifiers:shortcut_id==119?draft.gif_modifiers:shortcut_id==120?draft.video_modifiers:draft.modifiers;}
-    UINT& EditKey(){return shortcut_id==133?draft.translate_key:shortcut_id==128?draft.clipboard_key:shortcut_id==119?draft.gif_key:shortcut_id==120?draft.video_key:draft.key;}
+    int page{};std::wstring tr_name,tr_detail,ocr_hint;bool tr_ready{};
+    UINT& EditMods(){return shortcut_id==142?draft.ocr_modifiers:shortcut_id==143?draft.pin_modifiers:shortcut_id==133?draft.translate_modifiers:shortcut_id==128?draft.clipboard_modifiers:shortcut_id==119?draft.gif_modifiers:shortcut_id==120?draft.video_modifiers:draft.modifiers;}
+    UINT& EditKey(){return shortcut_id==142?draft.ocr_key:shortcut_id==143?draft.pin_key:shortcut_id==133?draft.translate_key:shortcut_id==128?draft.clipboard_key:shortcut_id==119?draft.gif_key:shortcut_id==120?draft.video_key:draft.key;}
     UINT previous_mods{},previous_key{};std::array<bool,256> held{};std::wstring hint;
     ComPtr<ID2D1Factory> factory;ComPtr<ID2D1DCRenderTarget> target;ComPtr<IDWriteFactory> dw;
     ComPtr<ID2D1SolidColorBrush> brush;BrandIcon app_icon;TextRenderer text_renderer;
@@ -114,6 +119,22 @@ struct Settings {
         if(model.empty())model=std::string(preset->model);
         tr_detail=(model.empty()?std::wstring():Widen(model)+L" · ")+L"默认译为 "+std::wstring(translate::LanguageLabel(config.target));
     }
+    void ChooseOcrModel(){
+        ComPtr<IFileOpenDialog> dialog;
+        if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))){ocr_hint=L"无法打开文件夹选择窗口";return;}
+        DWORD options{};dialog->GetOptions(&options);dialog->SetOptions(options|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST);
+        dialog->SetTitle(L"选择兼容的本地 ONNX 模型文件夹");
+        if(FAILED(dialog->Show(window)))return;
+        ComPtr<IShellItem> item;PWSTR raw{};
+        if(FAILED(dialog->GetResult(&item))||FAILED(item->GetDisplayName(SIGDN_FILESYSPATH,&raw)))return;
+        struct FreePath{PWSTR value;~FreePath(){CoTaskMemFree(value);}} path{raw};
+        const std::filesystem::path directory(path.value);
+        SetOcrModel(directory);
+    }
+    bool SetOcrModel(const std::filesystem::path& directory){
+        ocr_hint=ocr::ModelDirectoryError(directory);if(!ocr_hint.empty())return false;
+        draft.ocr_model_directory=directory;ocr_hint.clear();return true;
+    }
     void Begin(){if(recording||draining)return;previous_mods=EditMods();previous_key=EditKey();hint.clear();error=false;
         for(UINT k:{VK_LCONTROL,VK_RCONTROL,VK_LMENU,VK_RMENU,VK_LSHIFT,VK_RSHIFT,VK_LWIN,VK_RWIN})held[k]=(GetAsyncKeyState(static_cast<int>(k))&0x8000)!=0;
         if(recording_changed)recording_changed(true);
@@ -121,7 +142,7 @@ struct Settings {
         if(!hook){if(recording_changed)recording_changed(false);recorder=nullptr;hint=L"无法开始录入，请重试";error=true;}EnableWindow(GetDlgItem(window,IDOK),FALSE);Refresh();
     }
     bool Validate(){error=false;hint.clear();
-        if(!UniqueShortcuts(draft)){error=true;hint=L"快捷键重复，请为截图、GIF、录屏、翻译和剪贴板设置不同组合";return false;}
+        if(!UniqueShortcuts(draft)){error=true;hint=L"快捷键重复，请为各项功能设置不同组合";return false;}
         const auto next=AllShortcuts(draft),old=AllShortcuts(initial);
         for(const auto k:next){if((k.modifiers==MOD_WIN&&k.key=='V')||!k.key||std::find(old.begin(),old.end(),k)!=old.end())continue;
             if(RegisterHotKey(window,77,k.modifiers|MOD_NOREPEAT,k.key)){UnregisterHotKey(window,77);continue;}
@@ -145,10 +166,12 @@ struct Settings {
         for(int i=0;i<6;++i)place(135+i,10,76+i*40.f,SideWidth-20,36);
         place(114,PanelWidth-42,10,30,30);
         // 快捷键
-        {int i=0;for(int id:{103,119,120,128,133})place(id,500,row(i++)+10,ContentRight-16-500,38);}
+        {int i=0;for(int id:ShortcutControls)place(id,500,CardTop+i++*ShortcutRowHeight+7,ContentRight-16-500,36);}
         // 截图
         place(101,ContentRight-68,row(0)+14,52,30);place(115,ContentRight-68,row(1)+14,52,30);
         for(int i=0;i<3;++i)place(116+i,548+i*68.f,row(2)+14,66,30);
+        place(144,ContentRight-68,row(3)+14,52,30);
+        place(145,ContentRight-244,row(4)+12,120,34);place(146,ContentRight-116,row(4)+12,100,34);
         // 剪贴板
         place(126,ContentRight-68,row(0)+14,52,30);place(132,ContentRight-68,row(1)+14,52,30);place(129,ContentRight-68,row(2)+14,52,30);
         // 截图翻译
@@ -156,6 +179,7 @@ struct Settings {
         // 外观
         for(int i=0;i<3;++i)place(110+i,236+i*140.f,130,128,96);
         for(int i=0;i<5;++i)place(121+i,236+i*100.f,310,90,94);
+        place(147,ContentRight-68,426+14,52,30);
         // 通用
         place(127,ContentRight-68,row(0)+14,52,30);place(130,ContentRight-68,row(1)+14,52,30);place(131,ContentRight-126,row(2)+11,110,36);
         place(113,SideWidth+14,FooterTop+12,96,36);place(IDCANCEL,ContentRight-176,FooterTop+12,84,36);place(IDOK,ContentRight-84,FooterTop+12,84,36);
@@ -208,14 +232,15 @@ struct Settings {
         // One settings row inside a card. Child rows are indented and tinted to
         // show they depend on the row above; `narrow` leaves room for wide controls.
         auto row=[&](float card_top,int index,const std::wstring& title,const std::wstring& detail,bool child=false,bool last=false,bool enabled=true,bool narrow=false,UINT32 detail_color=0){
-            const float top=card_top+index*RowHeight,bottom=top+RowHeight;
+            const float height=page==0?ShortcutRowHeight:RowHeight;
+            const float top=card_top+index*height,bottom=top+height;
             if(child){color(dark?0x000000:0xe9eef5,dark?.16f:.6f);
                 if(last){target->FillRoundedRectangle(D2D1::RoundedRect({ContentLeft+1,top,ContentRight-1,bottom-1},8,8),brush.Get());target->FillRectangle({ContentLeft+1,top,ContentRight-1,bottom-10},brush.Get());}
                 else target->FillRectangle({ContentLeft+1,top,ContentRight-1,bottom},brush.Get());}
             if(index){color(border);target->DrawLine({ContentLeft,top},{ContentRight,top},brush.Get());}
             const float x=ContentLeft+(child?34.f:16.f),right=narrow?ContentRight-236:ContentRight-84;
-            text(title,{x,top+9,right,top+32},14,enabled?ink:faint);
-            text(detail,{x,top+31,right,top+50},11.5f,detail_color?detail_color:muted);
+            text(title,{x,top+(page==0?4.f:9.f),right,top+(page==0?27.f:32.f)},14,enabled?ink:faint);
+            text(detail,{x,top+(page==0?26.f:31.f),right,top+(page==0?45.f:50.f)},11.5f,detail_color?detail_color:muted);
         };
         auto nav_icon=[&](int index,float x,float y,UINT32 c){
             color(c);ID2D1Brush* b=brush.Get();constexpr float s=1.5f;
@@ -242,20 +267,26 @@ struct Settings {
             text(L"LumaShot 设置",{58,17,SideWidth-6,37},15,ink,false,true);text(L"截图 · 贴图 · 录屏",{58,37,SideWidth-6,53},11,muted);
             text(L"版本 "+update::VersionText(update::CurrentVersion()),{20,522,SideWidth-10,542},11,faint);
             static constexpr const wchar_t* titles[]{L"快捷键",L"截图",L"剪贴板",L"截图翻译",L"外观",L"通用"};
-            static constexpr const wchar_t* subtitles[]{L"全局生效；点击后按下新组合，Esc 取消，退格清除",L"截取和粘贴时的行为",L"开启后记录复制过的文字和图片，仅保存在本机",L"只发送识别出的文字，不上传截图",L"界面主题与桌面贴图样式，保存后立即生效",L"启动与更新"};
+            static constexpr const wchar_t* subtitles[]{L"全局生效；点击后按下新组合，Esc 取消，退格清除",L"截取和粘贴时的行为",L"开启后记录复制过的文字和图片，仅保存在本机",L"只发送识别出的文字，不上传截图",L"界面主题、贴图样式与晾衣绳，保存后立即生效",L"启动与更新"};
             text(titles[page],{ContentLeft,18,ContentRight-48,48},20,ink,false,true);text(subtitles[page],{ContentLeft,50,ContentRight,70},12,muted);
             switch(page){
             case 0:{
-                card(CardTop,CardTop+5*RowHeight);
+                card(CardTop,CardTop+static_cast<float>(std::size(ShortcutControls))*ShortcutRowHeight);
                 row(CardTop,0,L"截图",L"框选区域，编辑、贴图或复制",false,false,true,true);row(CardTop,1,L"GIF 动图",L"打开选区，点击开始后录制",false,false,true,true);
                 row(CardTop,2,L"屏幕录制",L"打开选区，点击开始后录制",false,false,true,true);row(CardTop,3,L"剪贴板",L"唤出剪贴板历史",false,false,true,true);
                 row(CardTop,4,L"截图翻译",L"框选后识别并翻译",false,false,true,true);
-                const float y=CardTop+5*RowHeight+8;
+                row(CardTop,5,L"OCR 快捷复制",L"框选后识别文字并复制",false,false,true,true);
+                row(CardTop,6,L"置顶贴图",L"框选后直接贴到桌面",false,false,true,true);
+                const float y=CardTop+static_cast<float>(std::size(ShortcutControls))*ShortcutRowHeight+8;
                 text(hint.empty()?(recording?L"Esc 取消录入":L"字母、数字键需配合 Ctrl / Alt / Shift / Win；F1–F11、PrtSc、Pause 可单独使用"):hint,{ContentLeft+2,y,ContentRight,y+22},12,error?error_ink:muted);
                 break;}
             case 1:{
-                card(CardTop,CardTop+3*RowHeight);
+                card(CardTop,CardTop+5*RowHeight);
                 row(CardTop,0,L"包含鼠标指针",L"保留唤起截图时的指针形态");row(CardTop,1,L"截图粘贴为文件",L"粘贴到文件夹或聊天窗口时生成图片文件");
+                row(CardTop,3,L"OCR 去除空白",L"OCR 快捷复制时移除空格、换行和制表符");
+                row(CardTop,4,L"识别模型",draft.ocr_model_directory.empty()?L"内置模型":L"自定义本地模型",false,false,true,true);
+                text(L"支持兼容的本地 ONNX 模型（det.onnx、rec.onnx、dictionary.txt）",{ContentLeft+2,CardTop+5*RowHeight+8,ContentRight,CardTop+5*RowHeight+30},11.5f,muted);
+                text(ocr_hint.empty()?draft.ocr_model_directory.native():ocr_hint,{ContentLeft+2,CardTop+5*RowHeight+32,ContentRight,CardTop+5*RowHeight+56},11.5f,ocr_hint.empty()?muted:error_ink);
                 row(CardTop,2,L"文件格式",L"PNG 无损；JPEG 体积小；BMP 兼容老软件",true,true,draft.paste_as_file,true);
                 const float top=CardTop+2*RowHeight;const auto group=D2D1::RoundedRect({544,top+11,754,top+47},8,8);
                 color(dark?0x000000:0xffffff,dark?.22f:.9f);target->FillRoundedRectangle(group,brush.Get());color(border);target->DrawRoundedRectangle(group,brush.Get());
@@ -282,6 +313,7 @@ struct Settings {
             case 4:{
                 card(CardTop,236);text(L"界面主题",{ContentLeft+16,CardTop+10,ContentRight,CardTop+34},14,ink);
                 card(248,414);text(L"贴图样式",{ContentLeft+16,258,ContentRight,280},14,ink);text(L"只装饰桌面贴图，不影响复制和导出",{ContentLeft+16,280,ContentRight,298},11.5f,muted);
+                card(426,426+RowHeight);row(426,0,L"顶部晾衣绳",L"把贴图拖到屏幕顶部或按 H 晾起；关闭后已晾起的贴图放回原处");
                 break;}
             default:{
                 card(CardTop,CardTop+3*RowHeight);
@@ -292,9 +324,9 @@ struct Settings {
         }else{
             const float w=(area.right-area.left)/scale,h=(area.bottom-area.top)/scale;const D2D1_RECT_F r{1,1,w-1,h-1};
             const bool disabled=(state&ODS_DISABLED)!=0,focus=(state&ODS_FOCUS)!=0,pressed=(state&ODS_SELECTED)!=0,hot=hover==control;
-            if(control==101||control==115||control==126||control==127||control==129||control==130||control==132||control==141){const bool checked=control==141?draft.translate_auto_show:control==132?draft.clipboard_strip_visible:control==130?draft.update_auto_check:control==127?draft.start_with_windows:control==129?draft.clipboard_persist:control==101?draft.include_cursor:control==126?draft.clipboard_enabled:draft.paste_as_file;if(disabled)brush->SetOpacity(.4f);color(checked?accent:border);target->FillRoundedRectangle(D2D1::RoundedRect({3,4,w-3,h-4},11,11),brush.Get());color(0xffffff);target->FillEllipse(D2D1::Ellipse({checked?w-15:15,h/2},8,8),brush.Get());brush->SetOpacity(1);}
-            else if(control==103||control==119||control==120||control==128||control==133){box(r,dark?0x1d2430:0xffffff,error?0xe45b66:recording||focus?accent:border);if(recording&&control==shortcut_id)text(Mods()?ShortcutLabel(Mods(),0)+L" + …":L"请按下快捷键（F1–F11 可单独使用）…",{15,0,w-14,h},16,ink);
-                else {const auto current=AllShortcuts(draft)[control==133?4:control==128?3:control==119?1:control==120?2:0];const auto label=current.key?ShortcutLabel(current.modifiers,current.key):L"未设置";float x=13;size_t begin=0;
+            if(control==101||control==115||control==126||control==127||control==129||control==130||control==132||control==141||control==144||control==147){const bool checked=control==147?draft.clothesline_enabled:control==144?draft.ocr_remove_whitespace:control==141?draft.translate_auto_show:control==132?draft.clipboard_strip_visible:control==130?draft.update_auto_check:control==127?draft.start_with_windows:control==129?draft.clipboard_persist:control==101?draft.include_cursor:control==126?draft.clipboard_enabled:draft.paste_as_file;if(disabled)brush->SetOpacity(.4f);color(checked?accent:border);target->FillRoundedRectangle(D2D1::RoundedRect({3,4,w-3,h-4},11,11),brush.Get());color(0xffffff);target->FillEllipse(D2D1::Ellipse({checked?w-15:15,h/2},8,8),brush.Get());brush->SetOpacity(1);}
+            else if(IsShortcutControl(control)){box(r,dark?0x1d2430:0xffffff,error?0xe45b66:recording||focus?accent:border);if(recording&&control==shortcut_id)text(Mods()?ShortcutLabel(Mods(),0)+L" + …":L"请按下快捷键（F1–F11 可单独使用）…",{15,0,w-14,h},16,ink);
+                else {const auto current=AllShortcuts(draft)[control==143?6:control==142?5:control==133?4:control==128?3:control==119?1:control==120?2:0];const auto label=current.key?ShortcutLabel(current.modifiers,current.key):L"未设置";float x=13;size_t begin=0;
                     while(begin<label.size()){const auto end=label.find(L" + ",begin);const auto part=label.substr(begin,end==std::wstring::npos?end:end-begin);const float width=std::min(105.f,std::max(34.f,18+9.f*static_cast<float>(part.size())));
                         box({x,9,x+width,h-9},dark?0x303b4b:0xf3f6fa,border);text(part,{x+4,9,x+width-4,h-9},14,ink,true);x+=width;
                         if(end==std::wstring::npos)break;text(L"+",{x,9,x+23,h-9},13,muted,true);x+=23;begin=end+3;
@@ -359,7 +391,7 @@ struct Settings {
                 color(focus||hot?accent:border,focus?1.f:hot?.7f:1.f);target->DrawRoundedRectangle(D2D1::RoundedRect(r,7,7),brush.Get());
                 wchar_t label[32]{};GetDlgItemTextW(window,control,label,32);text(label,{0,0,w,h},13.5f,disabled?muted:ink,true);
             }
-            if(focus&&(control==101||control==115||control==126||control==127||control==129||control==130||control==132||control==141)){color(accent);target->DrawRoundedRectangle(D2D1::RoundedRect(r,7,7),brush.Get());}
+            if(focus&&(control==101||control==115||control==126||control==127||control==129||control==130||control==132||control==141||control==144)){color(accent);target->DrawRoundedRectangle(D2D1::RoundedRect(r,7,7),brush.Get());}
         }
         if(composite&&control)target->PopAxisAlignedClip();
         if(!composite)EndFrame();
@@ -420,23 +452,27 @@ struct Settings {
             if(id==IDCANCEL||id==114){p->Stop();EndDialog(w,IDCANCEL);return TRUE;}
             if(p->recording||p->draining){p->EditMods()=p->previous_mods;p->EditKey()=p->previous_key;p->Stop();}
             if(id>=135&&id<=140){p->SetPage(id-135);return TRUE;}
-            if(id==103||id==119||id==120||id==128||id==133){p->shortcut_id=id;p->Begin();}
+            if(IsShortcutControl(id)){p->shortcut_id=id;p->Begin();}
             else if(id==134){if(!LaunchTranslationSettings(p->material_dark)){p->error=true;p->hint=L"无法打开翻译引擎设置";}}
             else if(id==101)p->draft.include_cursor=!p->draft.include_cursor;
             else if(id==127)p->draft.start_with_windows=!p->draft.start_with_windows;
             else if(id==126)p->draft.clipboard_enabled=!p->draft.clipboard_enabled;
             else if(id==129)p->draft.clipboard_persist=!p->draft.clipboard_persist;
             else if(id==132)p->draft.clipboard_strip_visible=!p->draft.clipboard_strip_visible;
+            else if(id==144)p->draft.ocr_remove_whitespace=!p->draft.ocr_remove_whitespace;
+            else if(id==145)p->ChooseOcrModel();
+            else if(id==146){p->draft.ocr_model_directory.clear();p->ocr_hint.clear();}
             else if(id==141)p->draft.translate_auto_show=!p->draft.translate_auto_show;
+            else if(id==147)p->draft.clothesline_enabled=!p->draft.clothesline_enabled;
             else if(id==130)p->draft.update_auto_check=!p->draft.update_auto_check;
             else if(id==131){p->update_requested=true;if(p->check_updates)p->check_updates();}
             else if(id==115)p->draft.paste_as_file=!p->draft.paste_as_file;
             else if(id>=116&&id<=118&&p->draft.paste_as_file)p->draft.paste_file_format=id-116;
             else if(id>=121&&id<=125)p->draft.pin_style=static_cast<PinStyle>(id-121);
             else if(id>=110&&id<=112)p->draft.theme=id-110;
-            else if(id==113){p->draft.start_with_windows=true;p->draft.clipboard_enabled=false;p->draft.clipboard_persist=false;p->draft.clipboard_strip_visible=true;p->draft.pin_style=DefaultPinStyle;p->draft.gif_key='G';p->draft.video_key='R';p->draft.translate_key='Y';p->draft.translate_modifiers=MOD_CONTROL|MOD_ALT;p->draft.gif_modifiers=p->draft.video_modifiers=MOD_CONTROL|MOD_ALT;p->draft.key='A';p->draft.modifiers=MOD_CONTROL|MOD_ALT;p->draft.theme=0;p->draft.include_cursor=true;p->draft.paste_as_file=true;p->draft.paste_file_format=0;p->draft.update_auto_check=true;p->draft.translate_auto_show=true;}
+            else if(id==113){p->draft.clothesline_enabled=true;p->draft.ocr_key='O';p->draft.pin_key='P';p->draft.ocr_modifiers=p->draft.pin_modifiers=MOD_CONTROL|MOD_ALT;p->draft.ocr_remove_whitespace=false;p->draft.ocr_model_directory.clear();p->ocr_hint.clear();p->draft.start_with_windows=true;p->draft.clipboard_enabled=false;p->draft.clipboard_persist=false;p->draft.clipboard_strip_visible=true;p->draft.pin_style=DefaultPinStyle;p->draft.gif_key='G';p->draft.video_key='R';p->draft.translate_key='Y';p->draft.translate_modifiers=MOD_CONTROL|MOD_ALT;p->draft.gif_modifiers=p->draft.video_modifiers=MOD_CONTROL|MOD_ALT;p->draft.key='A';p->draft.modifiers=MOD_CONTROL|MOD_ALT;p->draft.theme=0;p->draft.include_cursor=true;p->draft.paste_as_file=true;p->draft.paste_file_format=0;p->draft.update_auto_check=true;p->draft.translate_auto_show=true;}
             else if(id==IDOK){if(p->Validate()&&(!p->accept||p->accept(p->draft))){EndDialog(w,IDOK);return TRUE;}p->error=true;p->hint=L"该快捷键已被占用或由系统保留，请更换组合键";p->SetPage(0);}
-            if(id!=103&&id!=119&&id!=120&&id!=128&&id!=133){if(id!=IDOK)p->Validate();EnableWindow(GetDlgItem(w,IDOK),!p->error);p->Refresh();}return TRUE;}
+            if(!IsShortcutControl(id)){if(id!=IDOK)p->Validate();EnableWindow(GetDlgItem(w,IDOK),!p->error);p->Refresh();}return TRUE;}
         case WM_CLOSE:p->Stop();EndDialog(w,IDCANCEL);return TRUE;
         case WM_DESTROY:p->Stop();return TRUE;
         }return FALSE;
@@ -449,7 +485,6 @@ bool ShowSettingsDialog(HWND owner,Preferences& value,const std::function<bool(c
     if(result!=IDOK)return false;value=state.draft;return true;
 }
 }
-
 
 
 

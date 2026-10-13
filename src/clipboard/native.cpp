@@ -1,5 +1,6 @@
 ﻿#include "clipboard/native.h"
 #include <shellapi.h>
+#include "model/text_cleanup.h"
 #include <cstring>
 #include <limits>
 namespace lumashot::clipboard {
@@ -49,7 +50,22 @@ std::optional<Entry> Read(HWND owner,bool& busy){
     }else return {};
     if(e.Bytes()>History::MaxItemBytes)return {};return e;
 }
-bool Write(HWND owner,const Entry& entry,bool plain_text){
+bool Write(HWND owner,const Entry& entry,bool plain_text,bool remove_whitespace){
+    if(remove_whitespace){
+        if(entry.kind!=Kind::Text)return false;
+        for(const auto& format:entry.formats)if(format.id==CF_UNICODETEXT){
+            if(format.bytes.empty()||format.bytes.size()%sizeof(wchar_t))return false;
+            std::wstring text(format.bytes.size()/sizeof(wchar_t),L'\0');
+            std::memcpy(text.data(),format.bytes.data(),format.bytes.size());
+            const auto end=text.find(L'\0');if(end==std::wstring::npos)return false;
+            text=RemoveTextWhitespace(std::wstring_view(text).substr(0,end));
+            Entry cleaned;cleaned.kind=Kind::Text;
+            const auto* bytes=reinterpret_cast<const unsigned char*>(text.c_str());
+            cleaned.formats.push_back({CF_UNICODETEXT,{bytes,bytes+(text.size()+1)*sizeof(wchar_t)}});
+            return Write(owner,cleaned,true);
+        }
+        return false;
+    }
     if(plain_text&&entry.kind!=Kind::Text)return false;
     // Allocate before EmptyClipboard so allocation failure cannot clear content.
     std::vector<std::pair<UINT,HGLOBAL>> copies;

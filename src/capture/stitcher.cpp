@@ -257,15 +257,11 @@ StitchResult Stitcher::Add(const Frame& frame, int hint) {
         last_signatures_ = std::move(signatures);
         return {StitchStatus::Unchanged, 0, same, 0};
     }
-    const int top = FixedRows(last_signatures_, signatures, true);
-    const int bottom = std::max(FixedRows(last_signatures_, signatures, false), std::max(footer_, 0));
-    const Estimate estimate = Find(signatures, top, bottom, hint);
+    StitchStatus status = StitchStatus::Appended;
+    const Estimate estimate = Evaluate(signatures, hint, &status);
     pending_.reset();
-    if (estimate.shift <= 0) return {StitchStatus::NoOverlap, 0, 0, 0};
-    const int footer = footer_ >= 0 ? footer_ : estimate.bottom;
-    if (estimate.shift > frame_height_ - footer - estimate.top - options_.min_overlap)
-        return {StitchStatus::NoOverlap, estimate.shift, estimate.match, 0};
-    if (estimate.match < options_.min_match) {
+    if (status == StitchStatus::NoOverlap) return {StitchStatus::NoOverlap, estimate.shift, estimate.shift > 0 ? estimate.match : 0, 0};
+    if (status == StitchStatus::LowMatch) {
         pending_ = Pending{frame, std::move(signatures), estimate.shift, estimate.top, estimate.bottom, estimate.match};
         return {StitchStatus::LowMatch, estimate.shift, estimate.match, 0};
     }
@@ -274,16 +270,47 @@ StitchResult Stitcher::Add(const Frame& frame, int hint) {
     return result;
 }
 
-StitchResult Stitcher::AcceptPending() {
+Stitcher::Estimate Stitcher::Evaluate(const RowSignatures& signatures, int hint, StitchStatus* status) const {
+    const int top = FixedRows(last_signatures_, signatures, true);
+    const int bottom = std::max(FixedRows(last_signatures_, signatures, false), std::max(footer_, 0));
+    const Estimate estimate = Find(signatures, top, bottom, hint);
+    const int footer = footer_ >= 0 ? footer_ : estimate.bottom;
+    if (estimate.shift <= 0 || estimate.shift > frame_height_ - footer - estimate.top - options_.min_overlap)
+        *status = StitchStatus::NoOverlap;
+    else if (estimate.match < options_.min_match)
+        *status = StitchStatus::LowMatch;
+    else
+        *status = StitchStatus::Appended;
+    return estimate;
+}
+
+StitchResult Stitcher::AcceptPending(const Frame* fresh, int hint) {
     if (!pending_) return {};
     Pending p = std::move(*pending_);
     pending_.reset();
-    StitchResult result = Append(std::move(p.frame), std::move(p.signatures), p.shift, p.top, p.bottom);
+    if (fresh && fresh->Width() == width_ && fresh->Height() == frame_height_) {
+        // The held frame was taken right after the scroll settled, often while
+        // an overlay or animation was still on screen. A capture taken when
+        // the user decides is preferred: a clean match appends normally.
+        RowSignatures signatures = SignRows(*fresh, guard_);
+        if (SamePositionRatio(last_signatures_, signatures) < .97) {
+            StitchStatus status = StitchStatus::NoOverlap;
+            const Estimate e = Evaluate(signatures, hint > 0 ? hint : p.shift, &status);
+            if (status == StitchStatus::Appended) {
+                StitchResult result = Append(*fresh, std::move(signatures), e.shift, e.top, e.bottom);
+                result.match = e.match;
+                return result;
+            }
+            if (status == StitchStatus::LowMatch && e.match > p.match)
+                p = Pending{*fresh, std::move(signatures), e.shift, e.top, e.bottom, e.match};
+        }
+    }
+    StitchResult result = Append(std::move(p.frame), std::move(p.signatures), p.shift, p.top, p.bottom, true);
     result.match = p.match;
     return result;
 }
 
-StitchResult Stitcher::Append(Frame frame, RowSignatures signatures, int shift, int top, int bottom) {
+StitchResult Stitcher::Append(Frame frame, RowSignatures signatures, int shift, int top, int bottom, bool forced) {
     const int h = frame_height_;
     const int previous_header = header_;
     header_ = top;
@@ -301,8 +328,36 @@ StitchResult Stitcher::Append(Frame frame, RowSignatures signatures, int shift, 
         rows = available;
         status = StitchStatus::Limit;
     }
-    DetectScrollbar(frame, shift, top, bottom);
+    // A forced frame disagrees with the previous one in many rows; its edge
+    // columns say nothing reliable about a scrollbar.
+    if (!forced) DetectScrollbar(frame, shift, top, bottom);
     history_.push_back(Delta(previous_header));
+    History& entry = history_.back();
+    entry.suspect = suspect_from_;
+    if (!forced && suspect_from_ >= 0) {
+        // The previous segment was accepted despite a poor overlap, so its
+        // rows may carry a transient overlay (a sliding sticky bar, a hover
+        // card, a fading toast). This frame agrees with it well; where its
+        // overlap still shows a row differently, the newer, consistent capture
+        // wins. Scrollbar columns are left alone (the thumb moves).
+        const int band_end = h - footer_;
+        const int base = content_rows_ - band_end + shift; // content row of frame row 0
+        const int cw = std::max(1, width_ - scrollbar_); // DetectScrollbar ran just above
+        for (int y = std::max(top, 0); y < band_end - shift; ++y) {
+            const int c = base + y;
+            if (c < suspect_from_ || c >= content_rows_) continue;
+            const uint32_t* src = frame.pixels.data() + static_cast<size_t>(y) * width_;
+            uint32_t* dst = ContentRow(c);
+            if (std::memcmp(src, dst, static_cast<size_t>(cw) * sizeof(uint32_t)) == 0) continue;
+            entry.repaired.push_back({c, std::vector<uint32_t>(dst, dst + width_)});
+            std::memcpy(dst, src, static_cast<size_t>(cw) * sizeof(uint32_t));
+        }
+        if (!entry.repaired.empty()) {
+            repaired_rows_ += static_cast<int>(entry.repaired.size());
+            ++epoch_;
+        }
+    }
+    suspect_from_ = forced ? content_rows_ : -1;
     if (history_.size() > static_cast<size_t>(std::max(1, options_.history))) history_.pop_front();
     seams_.push_back(content_rows_);
     const int first = h - footer_ - shift;
@@ -321,12 +376,24 @@ void Stitcher::DetectScrollbar(const Frame& frame, int shift, int top, int botto
     const int end = frame_height_ - bottom - shift;
     const int rows = end - top;
     if (zone <= 0 || rows <= 0) return;
-    const int threshold = std::max(2, rows / 50);
+    // Only rows whose content (left of the zone) agrees are evidence: a row
+    // changed by an overlay or animation differs in every column.
+    std::vector<uint8_t> agree(static_cast<size_t>(rows));
+    int agreeing = 0;
+    for (int y = top; y < end; ++y) {
+        const bool same = std::memcmp(frame.pixels.data() + static_cast<size_t>(y) * width_,
+            last_.pixels.data() + static_cast<size_t>(y + shift) * width_, static_cast<size_t>(width_ - zone) * sizeof(uint32_t)) == 0;
+        agree[static_cast<size_t>(y - top)] = same ? 1 : 0;
+        agreeing += same;
+    }
+    if (agreeing <= 0) return;
+    const int threshold = std::max(2, agreeing / 50);
     int leftmost = -1;
     int gap = 0;
     for (int x = width_ - 1; x >= width_ - zone; --x) {
         int mismatches = 0;
         for (int y = top; y < end; ++y) {
+            if (!agree[static_cast<size_t>(y - top)]) continue;
             const uint32_t a = frame.pixels[static_cast<size_t>(y) * width_ + x] & 0xffffff;
             const uint32_t b = last_.pixels[static_cast<size_t>(y + shift) * width_ + x] & 0xffffff;
             mismatches += a != b;
@@ -349,6 +416,15 @@ bool Stitcher::Undo() {
     history_.pop_back();
     content_rows_ = entry.content_rows;
     TruncateContent(content_rows_);
+    // Put back rows this segment repaired in the previous one, so the frame
+    // restored from the delta and the content match exactly again.
+    for (auto it = entry.repaired.rbegin(); it != entry.repaired.rend(); ++it)
+        if (it->row < content_rows_) std::memcpy(ContentRow(it->row), it->pixels.data(), static_cast<size_t>(width_) * sizeof(uint32_t));
+    if (!entry.repaired.empty()) {
+        repaired_rows_ -= static_cast<int>(entry.repaired.size());
+        ++epoch_;
+    }
+    suspect_from_ = entry.suspect;
     last_ = Restore(entry);
     last_signatures_ = SignRows(last_, guard_);
     header_ = entry.header;
@@ -458,7 +534,10 @@ Frame Stitcher::Restore(const History& entry) const {
 
 size_t Stitcher::HistoryBytes() const {
     size_t bytes = 0;
-    for (const History& entry : history_) bytes += entry.lines.capacity() * sizeof(Line) + entry.patch.capacity() * sizeof(uint32_t);
+    for (const History& entry : history_) {
+        bytes += entry.lines.capacity() * sizeof(Line) + entry.patch.capacity() * sizeof(uint32_t);
+        for (const Repair& r : entry.repaired) bytes += r.pixels.capacity() * sizeof(uint32_t);
+    }
     return bytes;
 }
 }

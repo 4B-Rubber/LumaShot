@@ -22,6 +22,7 @@ struct Control {
     int icon{-1};uint32_t color{};float value{};
     bool selected{},enabled{true},primary{},square{},rainbow{};
     bool indicator_backed{}; // The toolbar paints its shared animated backdrop.
+    std::wstring accessible_name; // Semantic name retained for icon-only controls.
     bool Interactive()const;
 };
 struct Theme {

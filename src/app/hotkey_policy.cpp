@@ -8,10 +8,11 @@ void Application::ConfigureHotkeyPolicy(){
 void Application::RefreshHotkeys(){
     const bool suspended=HotkeysSuspended(preferences_,preferences_.disable_hotkeys_in_game&&!preferences_.hotkeys_disabled&&game_active_());
     if(!hotkeys_initialized_||suspended!=hotkeys_suspended_){
-        for(int id=1;id<=4;++id)UnregisterHotKey(main_,id);
+        const auto keys=Shortcuts(preferences_);
+        for(int id=1;id<=static_cast<int>(keys.size());++id)UnregisterHotKey(main_,id);
         hotkeys_initialized_=true;hotkeys_suspended_=suspended;
         bool failed=false;
-        if(!suspended){const auto keys=Shortcuts(preferences_);for(int i=0;i<4;++i)if(keys[i].key&&!RegisterHotKey(main_,i+1,keys[i].modifiers|MOD_NOREPEAT,keys[i].key))failed=true;}
+        if(!suspended){for(int i=0;i<static_cast<int>(keys.size());++i)if(keys[i].key&&!RegisterHotKey(main_,i+1,keys[i].modifiers|MOD_NOREPEAT,keys[i].key))failed=true;}
         if(failed){
             // Never steal focus with a modal dialog during automatic recovery.
             NOTIFYICONDATAW info{sizeof(info)};info.hWnd=main_;info.uID=1;info.uFlags=NIF_INFO;info.dwInfoFlags=NIIF_WARNING;

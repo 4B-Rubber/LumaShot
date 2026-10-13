@@ -1,6 +1,7 @@
 #include "clipboard/native.h"
 #include "export/png.h"
 #include <shellapi.h>
+#include "model/text_cleanup.h"
 #include <shlobj.h>
 #include <fstream>
 #include <iostream>
@@ -47,6 +48,19 @@ int main(){
         expect(Write(owner,rich,true),"explicit plain text publishes original Unicode payload");
         read=Read(owner,busy);expect(read&&read->text.size()>12000&&read->formats.size()==1&&read->formats.front()==rich.formats.front(),"plain text uses full stored payload instead of preview");
         expect(!IsClipboardFormatAvailable(html)&&!IsClipboardFormatAvailable(rtf),"plain text omits HTML and RTF");
+        const std::wstring whitespace=L"\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000";
+        expect(RemoveTextWhitespace(whitespace).empty(),"all Unicode White_Space characters including newlines are removed");
+        const std::wstring meaningful=L"文\U0001f469\u200d\U0001f4bb\u200b\ufeff";
+        expect(RemoveTextWhitespace(meaningful)==meaningful,"Unicode text, emoji joiners and format characters are preserved");
+        auto spaced=text(L" A\r\n B\t中\u3000文\u00a0");spaced.text=L"Truncated display preview";
+        spaced.formats.push_back(rich.formats[1]);
+        expect(Write(owner,spaced,true,true),"whitespace-free publication uses stored Unicode rather than display preview");
+        read=Read(owner,busy);expect(read&&read->text==L"AB中文"&&read->formats.size()==1,"whitespace-free paste strips whitespace and rich formats");
+        expect(Write(owner,spaced,true),"plain-text publication remains available");
+        read=Read(owner,busy);expect(read&&read->text==L" A\r\n B\t中\u3000文\u00a0","ordinary plain text retains whitespace and newlines");
+        auto malformed=spaced;malformed.formats[0].bytes.pop_back();
+        const auto malformed_sequence=GetClipboardSequenceNumber();
+        expect(!Write(owner,malformed,true,true)&&malformed_sequence==GetClipboardSequenceNumber(),"malformed cleanup input cannot erase clipboard");
         for(const auto kind:{Kind::Image,Kind::Files}){auto invalid=rich;invalid.kind=kind;const auto sequence=GetClipboardSequenceNumber();expect(!Write(owner,invalid,true)&&sequence==GetClipboardSequenceNumber(),"plain text rejects nontext without changing clipboard");}
         Entry missing;missing.kind=Kind::Text;missing.formats.push_back(rich.formats[1]);const auto sequence=GetClipboardSequenceNumber();
         expect(!Write(owner,missing,true)&&sequence==GetClipboardSequenceNumber(),"missing Unicode payload cannot erase clipboard");

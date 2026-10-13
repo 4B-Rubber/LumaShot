@@ -10,6 +10,8 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <cmath>
+#include <future>
+#include <system_error>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -28,28 +30,51 @@ int TileLevel(float zoom) {
     return level;
 }
 // Box filter by 2^level; partial blocks at the edges average what exists.
+// Blue+red and green are summed in 16-bit lanes of 32-bit words: a block
+// holds at most 8x8 pixels and 64 x 255 = 16320 fits a lane. Whole blocks
+// divide by shifting; the result is identical to a per-channel division.
+static_assert(kMaxTileLevel <= 3, "a 16-bit lane holds at most 8x8 pixels");
+template <int F>
+void ReduceRows(const uint32_t* pixels, size_t stride, int width, int y0, int y1, uint32_t* rb, uint32_t* g) {
+    const int whole = width / F;
+    for (int sy = y0; sy < y1; ++sy) {
+        const uint32_t* row = pixels + static_cast<size_t>(sy) * stride;
+        for (int x = 0; x < whole; ++x) {
+            const uint32_t* p = row + static_cast<size_t>(x) * F;
+            uint32_t a = 0, b = 0;
+            for (int i = 0; i < F; ++i) { a += p[i] & 0x00ff00ffu; b += (p[i] >> 8) & 0xffu; }
+            rb[x] += a; g[x] += b;
+        }
+        for (int x = whole * F; x < width; ++x) { rb[whole] += row[x] & 0x00ff00ffu; g[whole] += (row[x] >> 8) & 0xffu; }
+    }
+}
 Frame Reduce(const uint32_t* pixels, size_t stride, int width, int height, int level) {
     const int f = 1 << level, w = (width + f - 1) / f, h = (height + f - 1) / f;
     Frame result = MakeFrame({0, 0, w, h});
-    std::vector<uint32_t> sum(static_cast<size_t>(w) * 4);
-    std::vector<uint32_t> count(static_cast<size_t>(w));
+    std::vector<uint32_t> rb(static_cast<size_t>(w)), g(static_cast<size_t>(w));
     for (int y = 0; y < h; ++y) {
-        std::fill(sum.begin(), sum.end(), 0u);
-        std::fill(count.begin(), count.end(), 0u);
-        for (int sy = y * f; sy < std::min(height, y * f + f); ++sy) {
-            const uint32_t* row = pixels + static_cast<size_t>(sy) * stride;
-            for (int x = 0; x < width; ++x) {
-                const uint32_t p = row[x];
-                uint32_t* s = sum.data() + static_cast<size_t>(x >> level) * 4;
-                s[0] += p & 255; s[1] += (p >> 8) & 255; s[2] += (p >> 16) & 255;
-                ++count[static_cast<size_t>(x >> level)];
+        std::fill(rb.begin(), rb.end(), 0u);
+        std::fill(g.begin(), g.end(), 0u);
+        const int y0 = y * f, y1 = std::min(height, y0 + f);
+        switch (level) {
+        case 1: ReduceRows<2>(pixels, stride, width, y0, y1, rb.data(), g.data()); break;
+        case 2: ReduceRows<4>(pixels, stride, width, y0, y1, rb.data(), g.data()); break;
+        default: ReduceRows<8>(pixels, stride, width, y0, y1, rb.data(), g.data()); break;
+        }
+        const uint32_t rows = static_cast<uint32_t>(y1 - y0);
+        uint32_t* out = result.pixels.data() + static_cast<size_t>(y) * w;
+        int x = 0;
+        if (rows == static_cast<uint32_t>(f)) {  // whole blocks: f*f pixels, divide by shifting
+            const int shift = 2 * level;
+            for (; x < width / f; ++x) {
+                const uint32_t s = rb[static_cast<size_t>(x)];
+                out[x] = 0xff000000u | (((s >> 16) >> shift) << 16) | ((g[static_cast<size_t>(x)] >> shift) << 8) | ((s & 0xffffu) >> shift);
             }
         }
-        uint32_t* out = result.pixels.data() + static_cast<size_t>(y) * w;
-        for (int x = 0; x < w; ++x) {
-            const uint32_t n = std::max(1u, count[static_cast<size_t>(x)]);
-            const uint32_t* s = sum.data() + static_cast<size_t>(x) * 4;
-            out[x] = 0xff000000u | ((s[2] / n) << 16) | ((s[1] / n) << 8) | (s[0] / n);
+        for (; x < w; ++x) {
+            const uint32_t n = rows * static_cast<uint32_t>(std::min(f, width - x * f));
+            const uint32_t s = rb[static_cast<size_t>(x)];
+            out[x] = 0xff000000u | (((s >> 16) / n) << 16) | ((g[static_cast<size_t>(x)] / n) << 8) | ((s & 0xffffu) / n);
         }
     }
     return result;
@@ -311,6 +336,21 @@ void Viewer::Paint() {
     EndPaint(window_, &ps);
 }
 
+bool Viewer::TileHasMarks(int index, int level) const {
+    const int span = kTile << level;
+    const RECT band{0, index * span, image_->Width(), index * span + std::min(span, image_->Height() - index * span)};
+    return std::any_of(marks_.marks.begin(), marks_.marks.end(), [&](const Mark& mark) { return Touches(mark, band); });
+}
+
+ComPtr<ID2D1Bitmap> Viewer::UploadTile(const Frame& pixels) {
+    ComPtr<ID2D1Bitmap> bitmap;
+    const auto properties = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    if (FAILED(painter_.Target()->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(pixels.Width()), static_cast<UINT32>(pixels.Height())),
+            pixels.pixels.data(), static_cast<UINT32>(pixels.Width() * 4), properties, &bitmap)))
+        return nullptr;
+    return bitmap;
+}
+
 ComPtr<ID2D1Bitmap> Viewer::CreateTile(int index, int level) {
     const Frame& image = *image_;
     const int span = kTile << level;
@@ -370,6 +410,35 @@ void Viewer::DrawImage(const Layout& l) {
     const int count = (h + span - 1) / span;
     if (static_cast<int>(tiles_.size()) != count) tiles_.assign(static_cast<size_t>(count), nullptr);
     const int first = r0 / span, last = r1 > r0 ? (r1 - 1) / span : first;
+    // A zoom level change rebuilds every visible tile. The box filter of tiles
+    // without marks only reads the image, so several run at once; uploads stay
+    // on this thread. Tiles with marks (and any job that cannot start) are
+    // built one by one below.
+    if (level > 0 && r1 > r0) {
+        std::vector<int> missing;
+        for (int t = first; t <= last; ++t)
+            if (!tiles_[t] && !TileHasMarks(t, level)) missing.push_back(t);
+        if (missing.size() > 1) {
+            std::vector<std::pair<int, std::future<Frame>>> jobs;
+            for (const int t : missing) {
+                const int rows = std::min(span, h - t * span), width = image.Width();
+                const uint32_t* band = image.pixels.data() + static_cast<size_t>(t) * span * width;
+                try {
+                    jobs.emplace_back(t, std::async(std::launch::async, [band, width, rows, level] {
+                        return Reduce(band, static_cast<size_t>(width), width, rows, level);
+                    }));
+                } catch (const std::system_error&) {
+                    break;
+                }
+            }
+            for (auto& [t, job] : jobs) {
+                try {
+                    tiles_[t] = UploadTile(job.get());
+                } catch (const std::exception&) {
+                }
+            }
+        }
+    }
     for (int t = 0; t < count; ++t) {
         // Visible tiles plus one on each side: bounded memory, no rebuild on small scrolls.
         if (t < first - 1 || t > last + 1) { tiles_[t].Reset(); continue; }

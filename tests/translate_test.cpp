@@ -6,6 +6,7 @@
 #include "translate/engine.h"
 #include "translate/json.h"
 #include "translate/service.h"
+#include "translate/result_cache.h"
 #include <winsock2.h>
 #include <windows.h>
 #include <atomic>
@@ -31,13 +32,15 @@ void Expect(bool value, const char* what) {
 std::string U8(const std::wstring& w) { return json::Utf8(w); }
 
 struct Captured { std::string method, path, headers, body; };
+// "slow" chat model: requests in flight right now / at most (parallel runner checks).
+std::atomic<int> slow_in_flight{}, slow_peak{};
 
 // Loopback HTTP/1.1 server capturing full requests. Handler returns {status, body};
 // status 0 hangs until shutdown (for cancellation tests).
 class Server {
 public:
     using Handler = std::function<std::pair<int, std::string>(const Captured&)>;
-    explicit Server(Handler handler) : handler_(std::move(handler)) {
+    explicit Server(Handler handler, bool keep_alive = false) : handler_(std::move(handler)), keep_alive_(keep_alive) {
         WSADATA data{};
         WSAStartup(MAKEWORD(2, 2), &data);
         listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -53,6 +56,7 @@ public:
             for (;;) {
                 SOCKET client = accept(listener_, nullptr, nullptr);
                 if (client == INVALID_SOCKET) break;
+                ++connections_;
                 std::lock_guard lock(mutex_);
                 clients_.emplace_back([this, client] { Serve(client); });
             }
@@ -67,9 +71,13 @@ public:
         WSACleanup();
     }
     std::string Base() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    int Connections() const { return connections_.load(); }
     std::vector<Captured> Requests() { std::lock_guard lock(mutex_); return requests_; }
 private:
     void Serve(SOCKET client) {
+        const DWORD timeout = 2000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        for (int served = 0; served < (keep_alive_ ? 2 : 1); ++served) {
         std::string data;
         char buffer[8192];
         size_t header_end = std::string::npos;
@@ -99,13 +107,16 @@ private:
             while (!stopping_) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         } else {
             const std::string all = "HTTP/1.1 " + std::to_string(status) + " X\r\nContent-Type: application/json\r\nContent-Length: " +
-                std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                std::to_string(body.size()) + (keep_alive_ && served == 0 ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n") + body;
             send(client, all.data(), static_cast<int>(all.size()), 0);
-            shutdown(client, SD_SEND);
+            if (!keep_alive_ || served == 1) shutdown(client, SD_SEND);
+        }
         }
         closesocket(client);
     }
     Handler handler_;
+    bool keep_alive_{};
+    std::atomic<int> connections_{};
     SOCKET listener_{INVALID_SOCKET};
     unsigned short port_{};
     std::atomic_bool stopping_{};
@@ -307,6 +318,18 @@ void ParserTests() {
 }
 
 void EndToEnd() {
+    {
+        Server persistent([](const Captured&) -> std::pair<int, std::string> { return {200, "{}"}; }, true);
+        http::Client client;
+        http::Request request; request.url = persistent.Base();
+        const auto first = client.Send(request, {});
+        const auto second = client.Send(request, {});
+        Expect(first.Success() && second.Success() && persistent.Connections() == 1,
+            "job client reuses one TCP connection for successive requests");
+        std::stop_source canceled; canceled.request_stop();
+        Expect(client.Send(request, canceled.get_token()).status == http::Status::Canceled,
+            "reused client honors cancellation before sending");
+    }
     Server server([](const Captured& r) -> std::pair<int, std::string> {
         if (r.path == "/v1/models") return {200, R"({"data":[{"id":"qwen3:8b"},{"id":"llama3.2"}]})"};
         if (r.path == "/v1/chat/completions") {
@@ -315,6 +338,12 @@ void EndToEnd() {
             const auto model = body->Text("model");
             if (model == "hang") return {0, ""};
             if (model == "bad-key") return {401, R"({"error":{"message":"Incorrect API key provided"}})"};
+            if (model == "slow") {
+                const int now = ++slow_in_flight;
+                for (int peak = slow_peak.load(); now > peak && !slow_peak.compare_exchange_weak(peak, now);) {}
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                --slow_in_flight;
+            }
             const auto& messages = body->Find("messages")->array;
             auto items = json::Parse(messages.back().Text("content"));
             std::string out = "[";
@@ -336,6 +365,40 @@ void EndToEnd() {
     Expect(out.ok && out.texts == std::vector<std::wstring>{L"译Hello", L"译World"}, "e2e local openai-compatible");
     out = Run(Make("custom", base + "/v1", "", "", "sloppy"), job, {});
     Expect(out.ok && out.texts == std::vector<std::wstring>{L"译Hello", L"译World"}, "e2e misaligned batch retried per item");
+    {
+        // Offline runner: balanced plan + concurrent chunks + bisect on misalignment.
+        Job many{{}, Language::English, Language::ChineseSimplified};
+        for (int i = 0; i < 9; ++i) many.texts.push_back(L"Line " + std::to_wstring(i) + L" of the screenshot");
+        const auto plan = PlanChunks(many, 700, 16, 3);
+        bool contiguous = !plan.empty() && plan.front().first == 0 && plan.back().second == many.texts.size();
+        for (size_t i = 1; i < plan.size(); ++i) contiguous = contiguous && plan[i].first == plan[i - 1].second && plan[i].second > plan[i].first;
+        Expect(contiguous && plan.size() >= 3, "plan: ordered, contiguous, at least one chunk per worker");
+        Job large{{}, Language::English, Language::ChineseSimplified};
+        for (int i = 0; i < 60; ++i) large.texts.push_back(std::wstring(100, L'a'));
+        bool bounded = true; size_t covered = 0;
+        for (const auto& [b, e] : PlanChunks(large, 700, 16, 3)) { bounded = bounded && e - b <= 16 && (e - b) * 100 <= 700; covered += e - b; }
+        Expect(bounded && covered == large.texts.size(), "plan: chunks respect char and item limits");
+        Expect(PlanChunks(Job{{std::wstring(5000, L'x')}, Language::English, Language::ChineseSimplified}, 700, 16, 3).size() == 1, "plan: an oversized item is still sent alone");
+        Expect(PlanChunks(Job{}, 700, 16, 3).empty() && PlanChunks(Job{{L"x"}, Language::English, Language::ChineseSimplified}, 700, 16, 3).size() == 1, "plan: empty and single jobs");
+        slow_peak = 0;
+        const auto started = std::chrono::steady_clock::now();
+        out = RunParallel(Make("custom", base + "/v1", "", "", "slow"), many, {}, {}, 3, 700, 16);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        bool ordered = out.ok && out.texts.size() == many.texts.size();
+        for (size_t i = 0; ordered && i < many.texts.size(); ++i) ordered = out.texts[i] == L"译" + many.texts[i];
+        Expect(ordered, "parallel: every chunk translated, original order kept");
+        Expect(slow_peak.load() >= 2 && elapsed < std::chrono::milliseconds(3 * 250), "parallel: chunks are in flight concurrently");
+        const auto before = server.Requests().size();
+        out = RunParallel(Make("custom", base + "/v1", "", "", "sloppy"), many, {}, {}, 1, 700, 16);
+        ordered = out.ok && out.texts.size() == many.texts.size();
+        for (size_t i = 0; ordered && i < many.texts.size(); ++i) ordered = out.texts[i] == L"译" + many.texts[i];
+        Expect(ordered && server.Requests().size() - before <= 2 * many.texts.size(), "parallel: misaligned chunk bisected, order kept");
+        out = RunParallel(Make("custom", base + "/v1", "sk", "", "bad-key"), many, {}, {}, 3, 700, 16);
+        Expect(!out.ok && out.error.find(L"Incorrect API key") != std::wstring::npos && out.texts.empty(), "parallel: provider error surfaces");
+        std::stop_source stop; stop.request_stop();
+        out = RunParallel(Make("custom", base + "/v1", "", "", "slow"), many, stop.get_token(), {}, 3, 700, 16);
+        Expect(!out.ok && out.error == L"已取消", "parallel: canceled job sends nothing and reports cancel");
+    }
     out = Run(Make("custom", base + "/v1", "sk", "", "bad-key"), job, {});
     Expect(!out.ok && out.error.find(L"Incorrect API key") != std::wstring::npos, "e2e auth failure surfaces provider message");
     out = Run(Make("deepl", base, "k:fx"), job, {});
@@ -363,6 +426,10 @@ void EndToEnd() {
     const auto before = server.Requests().size();
     out = Run(Make("custom", base + "/v1", "", "", "m"), big, {});
     Expect(out.ok && out.texts.size() == 95 && out.texts[94] == L"译line94" && server.Requests().size() - before == 3, "chunking by item count keeps order");
+    const auto fallback_before = server.Requests().size();
+    out = Run(Make("custom", base + "/v1", "", "", "sloppy"), big, {});
+    Expect(out.ok && out.texts.size() == 95 && out.texts[94] == L"译line94" && server.Requests().size() - fallback_before == 96,
+        "batch-incompatible model incurs only one failed batch across 95 items");
 
     // Cancellation of a hanging request returns promptly.
     std::stop_source stop;
@@ -432,6 +499,40 @@ void BlockTests() {
 }
 }
 
+void CacheTests() {
+    ResultCache cache;
+    Job job{{L"Menu", L"Save"}, Language::English, Language::ChineseSimplified};
+    Outcome good; good.ok = true; good.texts = {L"菜单", L"保存"};
+    cache.Store("one", job, good);
+    auto hit = cache.Find("one", job);
+    Expect(hit && hit->texts == good.texts, "offline cache returns complete exact job");
+    Expect(!cache.Find("two", job), "offline cache separates models");
+    auto changed = job; changed.target = Language::Japanese;
+    Expect(!cache.Find("one", changed), "offline cache separates targets");
+    changed = job; changed.source = Language::Auto;
+    Expect(!cache.Find("one", changed), "offline cache separates source modes");
+    changed = job; std::reverse(changed.texts.begin(), changed.texts.end());
+    Expect(!cache.Find("one", changed), "offline cache preserves order and paragraph context");
+    Outcome failed; failed.error = L"failed";
+    cache.Store("failed", job, failed);
+    Expect(!cache.Find("failed", job), "failed translations are not cached");
+    auto incomplete = good; incomplete.texts.pop_back();
+    cache.Store("incomplete", job, incomplete);
+    Expect(!cache.Find("incomplete", job), "incomplete translations are not cached");
+    Job large{{std::wstring(ResultCache::MaxBytes, L'x')}, job.source, job.target};
+    Outcome large_result; large_result.ok = true; large_result.texts = large.texts;
+    cache.Store("large", large, large_result);
+    Expect(!cache.Find("large", large) && cache.Find("one", job).has_value(), "oversized results bypass cache without flushing useful entries");
+    for (size_t i = 0; i < ResultCache::MaxEntries; ++i) cache.Store(std::to_string(i), job, good);
+    Expect(!cache.Find("one", job), "entry limit evicts least recently used result");
+    cache.Find("0", job); cache.Store("new", job, good);
+    Expect(cache.Find("0", job).has_value() && !cache.Find("1", job), "cache hits refresh recency");
+    Job medium{{std::wstring(20000, L'x')}, job.source, job.target};
+    Outcome medium_result; medium_result.ok = true; medium_result.texts = medium.texts;
+    for (int i = 0; i < 8; ++i) cache.Store("medium" + std::to_string(i), medium, medium_result);
+    Expect(!cache.Find("medium0", medium) && cache.Find("medium7", medium).has_value(), "byte limit evicts before entry limit");
+}
+
 int main() {
     const auto dir = std::filesystem::current_path();
     JsonTests();
@@ -443,6 +544,7 @@ int main() {
     ParserTests();
     EndToEnd();
     BlockTests();
+    CacheTests();
     std::cout << "translate: " << checks << " checks, " << failures << " failures\n";
     return failures ? 1 : 0;
 }

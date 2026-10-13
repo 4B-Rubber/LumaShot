@@ -30,9 +30,10 @@ int main(int argc,char** argv) {
             const auto controls=t.Controls(tool);
             const auto pin=t.Button(13),ocr=t.Button(15),record=t.Button(16),cancel=t.Button(11);
             const auto longshot=t.Button(17);
-            valid=valid&&pin.right<ocr.left&&ocr.right<longshot.left&&longshot.right<record.left&&std::abs((longshot.right-longshot.left)-(record.right-record.left))<.01f&&record.right<cancel.left&&record.right-record.left>=18*t.scale&&std::abs((record.right-record.left)-(cancel.right-cancel.left))<.01f&&ocr.right-ocr.left>=38*t.scale;
+            valid=valid&&pin.right<ocr.left&&ocr.right<longshot.left&&longshot.right<record.left&&std::abs((longshot.right-longshot.left)-(record.right-record.left))<.01f&&record.right<cancel.left&&record.right-record.left>=18*t.scale&&std::abs((record.right-record.left)-(cancel.right-cancel.left))<.01f&&ocr.right-ocr.left>=18*t.scale;
             const auto entry=std::find_if(controls.begin(),controls.end(),[](const ui::Control& c){return c.id==15;});
-            valid=valid&&entry!=controls.end()&&entry->text==L"OCR"&&entry->icon==-1;
+            valid=valid&&entry!=controls.end()&&entry->text.empty()&&entry->icon==15&&!entry->accessible_name.empty();
+            for(const auto& c:controls)if(c.id>=0&&c.id<=18)valid=valid&&c.icon==c.id&&c.text.empty()&&!c.accessible_name.empty();
             for(const auto& c:controls){const auto p=c.bounds;valid=valid&&Contains(t.bounds,{p.left,p.top})&&Contains(t.bounds,{p.right,p.bottom});if(c.Interactive())valid=valid&&t.Hit({(p.left+p.right)/2,(p.top+p.bottom)/2},tool)==c.id;}
             for(size_t a=0;a<controls.size();++a)for(size_t b=a+1;b<controls.size();++b)if(controls[a].Interactive()&&controls[b].Interactive()){
                 const auto x=controls[a].bounds,y=controls[b].bounds;valid=valid&&!(std::min(x.right,y.right)>std::max(x.left,y.left)&&std::min(x.bottom,y.bottom)>std::max(x.top,y.top));
@@ -45,6 +46,14 @@ int main(int argc,char** argv) {
             const auto controls=layout.Controls(tool);float top=-1,max_offset=0;bool aligned=true;
             for(const auto& c:controls)if(c.Interactive()&&c.id>=20){if(top<0)top=c.bounds.top;const float offset=c.bounds.top-top;max_offset=std::max(max_offset,offset);aligned=aligned&&(std::abs(offset)<.01f||std::abs(offset-last_row)<.01f)&&std::abs(c.bounds.bottom-c.bounds.top-28)<.01f;}
             expect(aligned&&std::abs(max_offset-last_row)<.01f&&layout.bounds.bottom-layout.bounds.top<=122+last_row,"wide properties use one aligned row, or two for a number note with custom label");
+        }
+        for(float scale:{1.f,1.5f,2.f}){
+            const auto compact=PlaceToolbar({100,100,1100,500},{-1280,0,1280,1080},scale,0,Tool::Select);
+            expect(std::abs((compact.bounds.right-compact.bounds.left)/compact.scale-640)<.01f&&compact.columns==7,"selection toolbar is 640 DIP with seven icon tools in one row");
+            const auto tool=compact.Button(1),action=compact.Button(12);
+            expect(tool.right-tool.left>=32*compact.scale&&action.right-action.left>=26*compact.scale&&std::abs(tool.top-action.top)<4*compact.scale,"compact row preserves usable tool and action hit targets");
+            const auto narrow=PlaceToolbar({-300,100,-20,500},{-480,0,0,1080},scale,0,Tool::Select);
+            expect((narrow.bounds.right-narrow.bounds.left)/narrow.scale<=640&&narrow.Button(0).top>=narrow.tools.bottom,"narrow selection toolbar wraps actions below icon tools");
         }
         {
             ViewState record;record.selected=true;record.selection={-400,200,-100,400};
@@ -160,7 +169,7 @@ int main(int argc,char** argv) {
                 const auto panel=Crop(frame,{LONG(panel_bounds.left)-2,LONG(panel_bounds.top)-2,LONG(panel_bounds.right)+2,LONG(panel_bounds.bottom)+2});
                 const int gx=dark?1012:4,gy=static_cast<int>(tool)*134+4;
                 for(int y=0;y<panel.Height();++y)for(int x=0;x<panel.Width();++x)panel_gallery.pixels[static_cast<size_t>(gy+y)*2016+gx+x]=panel.pixels[static_cast<size_t>(y)*panel.Width()+x];
-                if(tool==Tool::Rectangle||tool==Tool::Select){const auto b=PlaceToolbar({180,90,1110,600},frame.bounds,1,tool==Tool::Select?0.f:1.f).bounds;SavePng(Crop(frame,{LONG(b.left)-2,LONG(b.top)-2,LONG(b.right)+2,LONG(b.bottom)+2}),folder/(tool==Tool::Select?(dark?"dark-compact.png":"light-compact.png"):(dark?"dark-panel.png":"light-panel.png")));}
+                if(tool==Tool::Rectangle||tool==Tool::Select){const auto b=PlaceToolbar({180,90,1110,600},frame.bounds,1,tool==Tool::Select?0.f:1.f,tool).bounds;SavePng(Crop(frame,{LONG(b.left)-2,LONG(b.top)-2,LONG(b.right)+2,LONG(b.bottom)+2}),folder/(tool==Tool::Select?(dark?"dark-compact.png":"light-compact.png"):(dark?"dark-panel.png":"light-panel.png")));}
             }
             SavePng(panel_gallery,folder/"all-toolbars.png");
         }

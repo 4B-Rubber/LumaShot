@@ -40,3 +40,6 @@ __pycache__/
 .env.*
 *.pfx
 *.p12
+
+# Personal screenshot-translation settings (provider keys, DPAPI-encrypted).
+/translation.ini

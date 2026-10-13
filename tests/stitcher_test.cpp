@@ -370,6 +370,76 @@ static void CheckDeltaUndo() {
     Expect(consumed.pixels == copy.pixels && consumed.Width() == copy.Width(), "consuming compose equals the copying compose");
 }
 
+// A translucent overlay (a sticky bar sliding in, a hover card, a fading
+// toast) is on screen when one frame is captured: the overlap matches poorly
+// and the bar's edges sit in the newly revealed rows. Neither may end up in
+// the composed image.
+static Frame WithOverlay(Frame frame, const View& view) {
+    auto at = [&](int x, int y) -> uint32_t& { return frame.pixels[static_cast<size_t>(view.header + y) * view.width + x]; };
+    const int content = view.width - view.scrollbar;
+    for (int y = 0; y < 250; ++y) // washed-out veil over most of the overlap
+        for (int x = 0; x < content; ++x) {
+            const uint32_t p = at(x, y);
+            const uint32_t r = (((p >> 16) & 255) + 255) / 2, g = (((p >> 8) & 255) + 255) / 2, b = ((p & 255) + 255) / 2;
+            at(x, y) = 0xff000000 | (r << 16) | (g << 8) | b;
+        }
+    for (int edge : {320, 420}) // the bar's 1px dark + 3px grey edges in the new rows
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < content; ++x) at(x, edge + y) = y == 0 ? 0xff979b9c : 0xffbabbbb + static_cast<uint32_t>(y);
+    return frame;
+}
+
+static void CheckTransientOverlay() {
+    const View view;
+    const Page page = MakePage(view.width, 2400, 61);
+    const int max_offset = page.height - view.viewport;
+    auto finish = [&](Stitcher& s, int from) {
+        bool ok = true;
+        for (int offset = from; offset < max_offset;) {
+            const int next = std::min(max_offset, offset + 200);
+            ok = ok && s.Add(Shot(page, view, next)).status == StitchStatus::Appended;
+            offset = next;
+        }
+        return ok;
+    };
+    {
+        Stitcher stitcher;
+        stitcher.Add(Shot(page, view, 0));
+        const auto low = stitcher.Add(WithOverlay(Shot(page, view, 200), view));
+        Expect(low.status == StitchStatus::LowMatch && low.shift == 200, "overlay: a frame with a transient overlay asks for confirmation");
+        // "仍然拼接" a moment later: the overlay has gone, the fresh frame wins.
+        const Frame fresh = Shot(page, view, 200);
+        const auto accepted = stitcher.AcceptPending(&fresh, 200);
+        Expect(accepted.status == StitchStatus::Appended && accepted.shift == 200 && accepted.match >= .99,
+            "overlay: accepting re-checks a fresh capture and appends it cleanly");
+        Expect(finish(stitcher, 200), "overlay: stitching continues normally");
+        Expect(MatchesPage(stitcher.Compose(true), page, view, max_offset), "overlay: fresh capture leaves no trace of the overlay");
+        Expect(stitcher.RepairedRows() == 0, "overlay: nothing to repair after a clean accept");
+    }
+    {
+        Stitcher stitcher;
+        stitcher.Add(Shot(page, view, 0));
+        stitcher.Add(WithOverlay(Shot(page, view, 200), view));
+        // Overlay still there when the user accepts: the edges are baked in...
+        const Frame still = WithOverlay(Shot(page, view, 200), view);
+        const auto forced = stitcher.AcceptPending(&still, 200);
+        Expect(forced.status == StitchStatus::Appended && forced.shift == 200, "overlay: forced accept appends the best shift");
+        const uint64_t baked = Hash(stitcher.Compose(false));
+        Expect(!MatchesPage(stitcher.Compose(true), page, view, 200), "overlay: forced segment carries the overlay edges");
+        // ...until the next clean frame, which overlaps them, repairs the rows.
+        const auto next = stitcher.Add(Shot(page, view, 400));
+        Expect(next.status == StitchStatus::Appended && next.shift == 200, "overlay: the next clean frame matches the forced one");
+        Expect(stitcher.RepairedRows() == 8, "overlay: exactly the 8 overlay edge rows are repaired");
+        Expect(MatchesPage(stitcher.Compose(true), page, view, 400), "overlay: repaired image equals the page");
+        Expect(stitcher.Undo() && Hash(stitcher.Compose(false)) == baked && stitcher.RepairedRows() == 0,
+            "overlay: undo restores the repaired rows exactly");
+        Expect(stitcher.Add(Shot(page, view, 400)).status == StitchStatus::Appended && stitcher.RepairedRows() == 8,
+            "overlay: redo repairs again");
+        Expect(finish(stitcher, 400), "overlay: stitching continues after the repair");
+        Expect(MatchesPage(stitcher.Compose(true), page, view, max_offset), "overlay: final image equals the page");
+    }
+}
+
 int main() {
     CheckSteadyScroll();
     CheckRepetitiveContent();
@@ -381,6 +451,7 @@ int main() {
     CheckBlankTail();
     CheckMismatchedFrame();
     CheckDeltaUndo();
+    CheckTransientOverlay();
     std::cout << (failures ? "FAILED " : "OK ") << failures << '\n';
     return failures ? 1 : 0;
 }

@@ -101,10 +101,6 @@ Frame Render(const Frame& image, const std::vector<translate::Block>& blocks, co
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     const auto font = FontFor(target);
     TextRenderer renderer;
-    // Sample every palette from the untouched image before any block is covered.
-    std::vector<Palette> palettes;
-    palettes.reserve(blocks.size());
-    for (const auto& block : blocks) palettes.push_back(SamplePalette(image, block.box));
     rt->BeginDraw();
     for (size_t i = 0; i < blocks.size() && i < texts.size(); ++i) {
         const auto& block = blocks[i];
@@ -115,21 +111,22 @@ Frame Render(const Frame& image, const std::vector<translate::Block>& blocks, co
         const float width = std::max(8.f, rect.right - rect.left);
         float size = std::max(8.f, lh * 0.8f);
         ComPtr<IDWriteTextLayout> layout;
+        ComPtr<IDWriteTextFormat> format;
+        if (FAILED(dw->CreateTextFormat(font.family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, font.locale, format.GetAddressOf()))) continue;
+        format->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        if (FAILED(dw->CreateTextLayout(texts[i].data(), UINT32(texts[i].size()), format.Get(), width, 100000.f, layout.GetAddressOf()))) continue;
         DWRITE_TEXT_METRICS metrics{};
         for (;;) {
-            ComPtr<IDWriteTextFormat> format;
-            if (FAILED(dw->CreateTextFormat(font.family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, font.locale, format.GetAddressOf()))) break;
-            format->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-            layout.Reset();
-            if (FAILED(dw->CreateTextLayout(texts[i].data(), UINT32(texts[i].size()), format.Get(), width, 100000.f, layout.GetAddressOf()))) break;
             layout->GetMetrics(&metrics);
             if (metrics.height <= rect.bottom - rect.top + 0.5f || size <= 8.f) break;
             size = std::max(8.f, size * 0.9f);
+            if (FAILED(layout->SetFontSize(size, {0, UINT32(texts[i].size())}))) break;
         }
         if (!layout) continue;
         // Text that cannot fit even at the minimum size extends the patch downward.
         if (metrics.height > rect.bottom - rect.top) rect.bottom = std::min(float(h), rect.top + metrics.height + pad);
-        const auto& palette = palettes[i];
+        // image stays untouched; only sample blocks that will actually render.
+        const auto palette = SamplePalette(image, block.box);
         brush->SetColor(Color(palette.background));
         const float radius = std::min(4.f, lh * 0.2f);
         rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());

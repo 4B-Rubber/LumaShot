@@ -7,6 +7,17 @@
 #include <cstdlib>
 namespace lumashot::clipboard {
 inline constexpr LONG PanelMinWidthDip=280,PanelMinHeightDip=480,PanelMaxSizeDip=4096;
+inline RECT PanelNearCursor(POINT cursor,RECT work,SIZE size,float scale){
+    const LONG gap=static_cast<LONG>(12*scale),margin=4;
+    const LONG width=std::min(size.cx,std::max(1L,work.right-work.left-2*margin));
+    const LONG height=std::min(size.cy,std::max(1L,work.bottom-work.top-2*margin));
+    LONG x=cursor.x+gap,y=cursor.y+gap;
+    if(x+width>work.right-margin)x=cursor.x-gap-width;
+    if(y+height>work.bottom-margin)y=cursor.y-gap-height;
+    x=std::clamp(x,work.left+margin,std::max(work.left+margin,work.right-margin-width));
+    y=std::clamp(y,work.top+margin,std::max(work.top+margin,work.bottom-margin-height));
+    return {x,y,x+width,y+height};
+}
 // Work-area coordinates are physical pixels; magnet distances scale with DPI.
 inline LONG SnapAxis(LONG value,LONG low,LONG high,float scale,int& edge){
     const LONG enter=static_cast<LONG>(24*scale),leave=static_cast<LONG>(36*scale);

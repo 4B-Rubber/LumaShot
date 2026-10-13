@@ -3,6 +3,7 @@
 #include <objbase.h>
 #include <cmath>
 #include <iostream>
+#include <chrono>
 
 using namespace lumashot;
 
@@ -102,6 +103,24 @@ int main() {
         Expect(pin_translation::JoinTranslation(sources, results, false) == L"你好\r\n世界", "translation-only copy is one block per line");
         Expect(pin_translation::JoinTranslation(sources, results, true) == L"Hello\r\n你好\r\n\r\nWorld\r\n世界", "bilingual copy pairs source and translation");
         Expect(pin_translation::JoinTranslation(sources, {L"你好"}, false) == L"你好", "join stops at the shorter list");
+    }
+    // Dense synthetic screenshot: exercise repeated font fitting without personal data.
+    {
+        const auto image = Solid(1920, 1080, 0xffeeeeee);
+        std::vector<translate::Block> blocks;
+        std::vector<std::wstring> texts;
+        for (int y = 0; y < 12; ++y) for (int x = 0; x < 8; ++x) {
+            blocks.push_back(MakeBlock(float(x * 235 + 8), float(y * 86 + 8), float(x * 235 + 225), float(y * 86 + 50), 48));
+            texts.push_back(L"A longer translated sentence fitting into a small screenshot text region.");
+        }
+        const auto start = std::chrono::steady_clock::now();
+        uint64_t hash = 14695981039346656037ull;
+        for (int run = 0; run < 5; ++run) {
+            const auto out = pin_translation::Render(image, blocks, texts, translate::Language::English);
+            for (const auto pixel : out.pixels) { hash ^= pixel; hash *= 1099511628211ull; }
+        }
+        std::cout << "dense_render_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()
+                  << " pixel_hash=" << hash << '\n';
     }
     CoUninitialize();
     std::cout << (failures ? "FAILED " : "OK ") << failures << '\n';

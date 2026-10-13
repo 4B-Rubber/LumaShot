@@ -18,18 +18,27 @@ static int Run(){
         expect(((GetMenuState(menu,GameHotkeyMenu,MF_BYCOMMAND)&MF_CHECKED)!=0)==automatic&&((GetMenuState(menu,DisableHotkeyMenu,MF_BYCOMMAND)&MF_CHECKED)!=0)==manual,"real tray items reflect independent checked states");
         wchar_t label[80]{};GetMenuStringW(menu,GameHotkeyMenu,label,80,MF_BYCOMMAND);expect(std::wstring(label)==L"全屏游戏时禁用快捷键","game-only tray label");DestroyMenu(menu);
     }
+    for(const auto shortcut:Shortcuts(EffectiveHotkeys(defaults,true)))expect(!shortcut.key,"all six host shortcuts suspend");
+    expect(Shortcuts(defaults).size()==6&&AllShortcuts(defaults).size()==7,"host and complete shortcut arrays include OCR and pin");
     expect(!AllowLaunch(WM_HOTKEY,true)&&AllowLaunch(LaunchCommandMessage,true)&&AllowLaunch(WM_HOTKEY,false),"manual tray/timer/startup launches bypass only the hotkey suspension gate");
     Application app;bool game=false;app.game_active_=[&]{return game;};
     WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"LumaShot.HotkeyPolicyTest";wc.lpfnWndProc=Application::MainProc;RegisterClassW(&wc);
     app.main_=CreateWindowExW(0,wc.lpszClassName,L"Synthetic hotkey host",0,0,0,0,0,HWND_MESSAGE,nullptr,wc.hInstance,&app);
     HWND probe=CreateWindowExW(0,L"STATIC",L"Synthetic key ownership probe",0,0,0,0,0,HWND_MESSAGE,nullptr,wc.hInstance,nullptr);
     expect(app.main_&&probe,"isolated message-only test windows created");
-    auto& pref=app.preferences_;pref.modifiers=pref.gif_modifiers=pref.video_modifiers=MOD_CONTROL|MOD_ALT|MOD_SHIFT;pref.key=VK_F20;pref.gif_key=VK_F21;pref.video_key=VK_F22;pref.translate_modifiers=MOD_CONTROL|MOD_ALT|MOD_SHIFT;pref.translate_key=VK_F19;
+    auto& pref=app.preferences_;pref.modifiers=pref.gif_modifiers=pref.video_modifiers=MOD_CONTROL|MOD_ALT|MOD_SHIFT;pref.key=VK_F20;pref.gif_key=VK_F21;pref.video_key=VK_F22;pref.translate_modifiers=MOD_CONTROL|MOD_ALT|MOD_SHIFT;pref.translate_key=VK_F19;pref.ocr_modifiers=pref.pin_modifiers=MOD_CONTROL|MOD_ALT|MOD_SHIFT;pref.ocr_key=VK_F18;pref.pin_key=VK_F17;
     const auto available=[&](Shortcut key){const bool free=RegisterHotKey(probe,77,key.modifiers|MOD_NOREPEAT,key.key)!=FALSE;if(free)UnregisterHotKey(probe,77);return free;};
     const auto owns=[&](bool registered){bool ok=true;for(auto key:Shortcuts(pref))if(key.key)ok&=available(key)!=registered;return ok;};
     expect(owns(false),"synthetic shortcut combinations initially free");
-    pref.disable_hotkeys_in_game=true;app.ConfigureHotkeyPolicy();expect(owns(true)&&!app.hotkeys_suspended_,"normal mode registers screenshot GIF and video keys");
+    pref.disable_hotkeys_in_game=true;app.ConfigureHotkeyPolicy();expect(owns(true)&&!app.hotkeys_suspended_,"normal mode registers all six host shortcut keys");
+    for(int id:{5,6}){
+        const auto key=Shortcuts(pref)[id-1];
+        expect(!available(key),"OCR and pin chords are owned by host");
+        expect(UnregisterHotKey(app.main_,id)!=FALSE&&available(key),"OCR and pin are registered under IDs 5 and 6");
+        expect(RegisterHotKey(app.main_,id,key.modifiers|MOD_NOREPEAT,key.key)!=FALSE,"restore verified OCR and pin registration");
+    }
     game=true;Application::MainProc(app.main_,WM_TIMER,20,0);expect(owns(false)&&app.hotkeys_suspended_,"game transition unregisters all keys rather than merely ignoring them");
+    expect(available(Shortcuts(pref)[4])&&available(Shortcuts(pref)[5]),"game suspension releases OCR and pin chords");
     Application::MainProc(app.main_,WM_HOTKEY,1,0);expect(!app.pending_&&!app.active_,"queued screenshot hotkey cannot launch while suspended");
     pref.hotkeys_disabled=true;app.ConfigureHotkeyPolicy();game=false;app.RefreshHotkeys();expect(owns(false)&&app.hotkeys_suspended_,"game exit does not override manual disable");
     // Settings may change keys while suspended without claiming them early.

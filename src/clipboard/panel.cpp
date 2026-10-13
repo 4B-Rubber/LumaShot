@@ -42,7 +42,7 @@ struct ClipboardPanel::Impl {
     std::unique_ptr<clipboard::SessionStore> disk;bool persist_history{};
     uint64_t copy_token{},image_token{1},search_token{},preview_token{},last_read_id{};bool copy_pending{},copy_paste{},paste_inflight{};
     HWND copy_target{},paste_target{},previous_focus{},copy_focus{},paste_focus{};DWORD copy_process{},paste_process{},paste_sequence{};
-    bool copy_plain{},copy_keyboard{},paste_keyboard{},paste_activated{},paste_returning{};ULONGLONG paste_return_at{};
+    bool copy_remove_whitespace{},copy_plain{},copy_keyboard{},paste_keyboard{},paste_activated{},paste_returning{};ULONGLONG paste_return_at{};
     std::unique_ptr<clipboard::QuickWindow> quick;clipboard::QuickInput quick_input;
     std::vector<uint64_t> quick_ids;size_t quick_selection{};int quick_tab{};
     HWND quick_target{},quick_focus{};DWORD quick_process{};
@@ -87,7 +87,7 @@ struct ClipboardPanel::Impl {
     int tab{},scroll{},retry{},paste_wait{};uint64_t selected{};DWORD sequence{};
     std::filesystem::path layout_path;
     int snap_x{},snap_y{};HMONITOR drag_monitor{};
-    POINT anchor{},drag_start{};RECT drag_rect{};bool placed{},drag_pending{},dragged{};
+    std::optional<POINT> summon_cursor;POINT anchor{},drag_start{};RECT drag_rect{};bool placed{},drag_pending{},dragged{};
     float scale{1};std::wstring query,status;int hover{-1};
     TextRenderer text_renderer;uint64_t text_glyphs{};
     ComPtr<ID2D1Factory> factory;ComPtr<IDWriteFactory> writer;ComPtr<ID2D1RenderTarget> target;ComPtr<ID2D1SolidColorBrush> brush;
@@ -447,7 +447,7 @@ struct ClipboardPanel::Impl {
         if(font){DeleteObject(font);font=nullptr;}if(edit_brush){DeleteObject(edit_brush);edit_brush=nullptr;}
         history=clipboard::History{};std::vector<uint64_t>().swap(visible);std::vector<uint64_t>().swap(search_matches);std::vector<Hit>().swap(hits);
         std::wstring().swap(completed_query);std::wstring().swap(query);std::wstring().swap(status);selected=last_read_id=0;copy_target=previous=paste_target=previous_focus=copy_focus=paste_focus=nullptr;copy_process=paste_process=paste_sequence=0;
-        copy_plain=copy_keyboard=paste_keyboard=paste_activated=paste_returning=copy_quick=paste_quick=false;paste_return_at=0;
+        copy_remove_whitespace=copy_plain=copy_keyboard=paste_keyboard=paste_activated=paste_returning=copy_quick=paste_quick=false;paste_return_at=0;
         suppress_search_space=false;search_complete=false;tab=scroll=retry=paste_wait=0;hover=-1;width=height=0;
         // Keep only small user placement/policy fields; recreate resources on demand.
         // The history and decoded images just freed leave tens of MB of free pages that
@@ -614,14 +614,16 @@ struct ClipboardPanel::Impl {
         if(animate)reveal_window=false;
         MONITORINFO monitor{sizeof(monitor)};
         if(!placed){POINT cursor{};GetCursorPos(&cursor);GetMonitorInfoW(MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST),&monitor);anchor={monitor.rcWork.right-6,monitor.rcWork.top+70};placed=true;}
-        GetMonitorInfoW(MonitorFromPoint({anchor.x-1,anchor.y},MONITOR_DEFAULTTONEAREST),&monitor);
+        const POINT location=expanded&&!pinned&&summon_cursor?*summon_cursor:POINT{anchor.x-1,anchor.y};
+        GetMonitorInfoW(MonitorFromPoint(location,MONITOR_DEFAULTTONEAREST),&monitor);
         const auto r=monitor.rcWork;scale=GetDpiForWindow(window)/96.f;
         if(expanded)scale=std::min({scale,(r.right-r.left-16)/W,(r.bottom-r.top-16)/H});scale=std::max(.25f,scale);
         const int w=static_cast<int>((expanded?W:CW)*scale),h=static_cast<int>((expanded?H:CH)*scale);
         const LONG margin=expanded?4:0;
         const LONG x=std::clamp(anchor.x-w,r.left+margin,std::max(r.left+margin,r.right-w-margin)),y=std::clamp(anchor.y,r.top+margin,std::max(r.top+margin,r.bottom-h-margin));
-        PresentAt({x,y,x+w,y+h},enabled&&(!test_mode||reveal_window));
-        if(animate&&StartOpening(from,{x,y,x+w,y+h},GetTickCount64()))return;
+        const RECT placement=expanded&&!pinned&&summon_cursor?clipboard::PanelNearCursor(*summon_cursor,r,{w,h},scale):RECT{x,y,x+w,y+h};
+        PresentAt(placement,enabled&&(!test_mode||reveal_window));
+        if(animate&&StartOpening(from,placement,GetTickCount64()))return;
         if(enabled&&!test_mode)ShowWindow(window,SW_SHOWNOACTIVATE);
     }
     void LayoutSearch(){
@@ -648,7 +650,7 @@ struct ClipboardPanel::Impl {
         const float thumb=ScrollThumb(),top=ListTop+(ListBottom-ListTop-thumb)*scroll/static_cast<float>(visible.size()-static_cast<size_t>(PageRows()));
         scroll_grab=y>=top&&y<=top+thumb?y-top:thumb/2;scroll_drag=true;SetCapture(window);ScrollAt(y);
     }
-    void BeginDrag(POINT point){StopLiquidDrag(false);drag_anchor=anchor;if(expanded)dismiss_tracker.Reset();else dismiss_tracker.Begin(point);snap_x=snap_y=0;drag_monitor=nullptr;drag_start=point;drag_rect=VisualBodyBounds();drag_pending=true;dragged=false;SetCapture(window);}
+    void BeginDrag(POINT point){if(expanded&&summon_cursor){const RECT body=VisualBodyBounds();anchor={body.right,body.top};summon_cursor.reset();}StopLiquidDrag(false);drag_anchor=anchor;if(expanded)dismiss_tracker.Reset();else dismiss_tracker.Begin(point);snap_x=snap_y=0;drag_monitor=nullptr;drag_start=point;drag_rect=VisualBodyBounds();drag_pending=true;dragged=false;SetCapture(window);}
     void Drag(POINT point){
         if(!drag_pending)return;const LONG dx=point.x-drag_start.x,dy=point.y-drag_start.y;
         if(!dragged&&std::abs(dx)<GetSystemMetrics(SM_CXDRAG)&&std::abs(dy)<GetSystemMetrics(SM_CYDRAG))return;
@@ -669,7 +671,7 @@ struct ClipboardPanel::Impl {
         if(!expanded&&!test_mode&&!liquid_failed&&MotionEnabled()){MoveLiquidDrag({x,y,x+w,y+h},point,r,GetTickCount64());return;}
         compact_positioned=false;SetWindowPos(window,nullptr,x,y,w,h,SWP_NOZORDER|SWP_NOACTIVATE);Invalidate();
     }
-    void EndDrag(){const bool click=drag_pending&&!dragged&&!expanded;const bool save=drag_pending&&dragged;const bool dismiss=save&&!expanded&&dismiss_tracker.Armed();drag_pending=false;if(dismiss)dismiss_tracker.Reset();ReleaseCapture();if(dismiss){DismissStrip();return;}ReleaseLiquidDrag();CancelDismiss();if(save&&!SaveLayout()){status=L"位置保存失败，下次启动可能无法恢复";Invalidate();}if(click)Show();}
+    void EndDrag(){const bool click=drag_pending&&!dragged&&!expanded;const bool save=drag_pending&&dragged;const bool dismiss=save&&!expanded&&dismiss_tracker.Armed();drag_pending=false;if(dismiss)dismiss_tracker.Reset();ReleaseCapture();if(dismiss){DismissStrip();return;}ReleaseLiquidDrag();CancelDismiss();if(save&&!SaveLayout()){status=L"位置保存失败，下次启动可能无法恢复";Invalidate();}if(click)Show(false);}
     void RememberTarget(HWND candidate){
         if(!IsWindow(candidate)||candidate==window||candidate==native_window||candidate==folded_window||(idle_strip&&candidate==idle_strip)||candidate==owner||(quick&&candidate==quick->Window())||IsChild(native_window?native_window:window,candidate)||preview.OwnsWindow(candidate)||candidate==GetDesktopWindow()||candidate==GetShellWindow())return;
         if(owner&&GetAncestor(candidate,GA_ROOTOWNER)==owner)return;
@@ -723,7 +725,7 @@ struct ClipboardPanel::Impl {
         if(copy_pending||paste_inflight||quick_selection>=quick_ids.size())return;
         const auto* entry=history.Find(quick_ids[quick_selection]);if(!entry)return;
         if(plain&&entry->kind!=clipboard::Kind::Text){status=L"纯文本仅支持文本记录";UpdateQuick();return;}
-        copy_quick=true;copy_plain=plain;copy_keyboard=false;copy_paste=true;
+        copy_quick=true;copy_remove_whitespace=false;copy_plain=plain;copy_keyboard=false;copy_paste=true;
         copy_target=quick_target;copy_focus=quick_focus;copy_process=quick_process;
         if(entry->payload&&disk){
             copy_pending=true;const auto token=++copy_token;
@@ -811,8 +813,8 @@ struct ClipboardPanel::Impl {
         }
         SetTimer(EventWindow(),7,100,nullptr);
     }
-    void Show(){CloseQuick();if(!enabled)return;KillTimer(EventWindow(),4);KillTimer(EventWindow(),11);ClosePreview();const HWND foreground=GetForegroundWindow();RememberTarget(foreground);expanded=true;SetWindowTextW(search,L"");query.clear();scroll=0;Filter();selected=visible.empty()?0:visible.front();Place(true);if(opening){SetForegroundWindow(folded_window);SetFocus(folded_window);}else{SetForegroundWindow(window);SetFocus(window);}}
-    void Fold(){StopOpening(false);paste_click.reset();paste_inflight=false;scroll_drag=false;if(GetCapture()==window)ReleaseCapture();CloseMore();ClosePopup();CancelNaming();CancelReads();ClearFileIcons();app_icon.Reset();brush.Reset();target.Reset();surface.reset();search_text_glyphs=0;ime_active=false;ime_original.clear();ime_text.clear();expanded=false;KillTimer(EventWindow(),2);KillTimer(EventWindow(),3);Place();SetTimer(EventWindow(),4,10000,nullptr);}
+    void Show(bool near_cursor=true){CloseQuick();if(!enabled)return;if(near_cursor&&!pinned){POINT cursor{};if(GetCursorPos(&cursor))summon_cursor=cursor;}KillTimer(EventWindow(),4);KillTimer(EventWindow(),11);ClosePreview();const HWND foreground=GetForegroundWindow();RememberTarget(foreground);expanded=true;SetWindowTextW(search,L"");query.clear();scroll=0;Filter();selected=visible.empty()?0:visible.front();Place(true);if(opening){SetForegroundWindow(folded_window);SetFocus(folded_window);}else{SetForegroundWindow(window);SetFocus(window);}}
+    void Fold(){summon_cursor.reset();StopOpening(false);paste_click.reset();paste_inflight=false;scroll_drag=false;if(GetCapture()==window)ReleaseCapture();CloseMore();ClosePopup();CancelNaming();CancelReads();ClearFileIcons();app_icon.Reset();brush.Reset();target.Reset();surface.reset();search_text_glyphs=0;ime_active=false;ime_original.clear();ime_text.clear();expanded=false;KillTimer(EventWindow(),2);KillTimer(EventWindow(),3);Place();SetTimer(EventWindow(),4,10000,nullptr);}
     // ---- Custom groups ----------------------------------------------------
     int TabCount()const{return clipboard::History::GroupTabBase+static_cast<int>(history.groups.size());}
     uint32_t TabGroup()const{return tab>=clipboard::History::GroupTabBase&&tab<TabCount()?history.groups[static_cast<size_t>(tab-clipboard::History::GroupTabBase)].id:0;}
@@ -1281,7 +1283,7 @@ struct ClipboardPanel::Impl {
             if(visible.empty()){Center(query.empty()?(TabGroup()?L"这个分组还是空的":tab==4?L"还没有收藏":L"还没有剪贴记录"):L"没有匹配的内容",{24,330+(H-744)/2,W-24,366+(H-744)/2},19,ink);Center(TabGroup()?(tab-4<=9?L"在其他标签选中记录按 Ctrl+"+std::to_wstring(tab-4)+L" 移入":std::wstring(L"右键记录，选择“移到分组”")):std::wstring(tab==4?L"点击记录上的星标，或按 Ctrl+D 收藏":L"复制文本、图片或文件后将在这里显示"),{24,373+(H-744)/2,W-24,417+(H-744)/2},14,muted);}
             target->PopAxisAlignedClip();
             if(visible.size()>static_cast<size_t>(PageRows())){const float track=ListBottom-ListTop;const float thumb=track*PageRows()/static_cast<float>(visible.size());const float top=ListTop+(track-thumb)*scroll/static_cast<float>(visible.size()-static_cast<size_t>(PageRows()));Box({W-8,top,W-5,top+thumb},0xb7c8df,0xb7c8df,2);}
-            Color(dark?0x3a4a60:0xe2e9f2);target->DrawLine({22,H-44},{W-22,H-44},brush.Get());Color(0x73b69b);target->FillEllipse(D2D1::Ellipse({27,H-24},2.5f,2.5f),brush.Get());TextLine(status.empty()?(history.groups.empty()?L"↑↓ 选择 · Enter 粘贴 · Shift+Enter 纯文本":L"↑↓ 选择 · Enter 粘贴 · Ctrl+1–9 移入分组 · Alt+←→ 切换"):status,{39,H-41,W-51,H-9},10,muted);Icon(L'\xE76C',W-48,H-42,14);
+            Color(dark?0x3a4a60:0xe2e9f2);target->DrawLine({22,H-44},{W-22,H-44},brush.Get());Color(0x73b69b);target->FillEllipse(D2D1::Ellipse({27,H-24},2.5f,2.5f),brush.Get());TextLine(status.empty()?(history.groups.empty()?L"↑↓ 选择 · Enter 粘贴 · Shift+Enter 纯文本":L"↑↓ 选择 · Enter 粘贴 · Ctrl+1–9 移入分组 · Alt+←→ 切换"):status,{39,H-43,W-51,H-25},10,muted);TextLine(L"Ctrl+Shift+Enter 去除全部空白（含换行）",{39,H-25,W-22,H-8},10,muted);Icon(L'\xE76C',W-48,H-42,14);
         }
         if(menu_open&&expanded)DrawMore();if(popup_open&&expanded)DrawPopup();
         PaintSearch();
@@ -1293,7 +1295,7 @@ struct ClipboardPanel::Impl {
         const HWND foreground=GetForegroundWindow();
         if(foreground!=window&&!IsChild(window,foreground)&&!((pinned||copy_quick)&&foreground==destination)){status=L"已取消：输入焦点已改变";Invalidate();return;}
         DWORD current_process{};if(paste&&(!IsWindow(destination)||destination==window||!GetWindowThreadProcessId(destination,&current_process)||current_process!=process)){status=L"原输入窗口已失效，请重新选择目标窗口";Invalidate();return;}
-        if(!clipboard::Write(window,entry,copy_plain)){status=L"剪贴板正忙或内容不可用，请重试";Invalidate();return;}
+        if(!clipboard::Write(window,entry,copy_plain,copy_remove_whitespace)){status=L"剪贴板正忙或内容不可用，请重试";Invalidate();return;}
         sequence=GetClipboardSequenceNumber();status=L"已复制";Invalidate();
         if(paste){ClosePreview();previous=destination;paste_target=destination;paste_focus=copy_focus;paste_process=process;paste_sequence=sequence;paste_wait=0;paste_keyboard=copy_keyboard;paste_quick=copy_quick;paste_activated=paste_returning=false;paste_inflight=true;SetTimer(EventWindow(),2,40,nullptr);}
     }
@@ -1363,11 +1365,11 @@ struct ClipboardPanel::Impl {
         else if(pinned&&paste_keyboard){paste_returning=true;paste_return_at=GetTickCount64()+200;status=L"已发送粘贴请求…";Invalidate();}
         else StopPaste(pinned?L"已发送粘贴，可继续点击下一条":L"已发送粘贴请求");
     }
-    void Copy(uint64_t id,bool paste,bool plain=false,bool keyboard=false){
+    void Copy(uint64_t id,bool paste,bool plain=false,bool keyboard=false,bool remove_whitespace=false){
         const auto* e=history.Find(id);if(!e||copy_pending||paste_inflight)return;
         if(plain&&e->kind!=clipboard::Kind::Text){status=L"纯文本粘贴仅支持文本记录";Invalidate();return;}
         if(pinned)RememberTarget(GetForegroundWindow());
-        copy_target=previous;copy_process=previous_process;copy_focus=previous_focus;copy_plain=plain;copy_keyboard=keyboard;copy_quick=false;
+        copy_target=previous;copy_process=previous_process;copy_focus=previous_focus;copy_remove_whitespace=remove_whitespace;copy_plain=plain;copy_keyboard=keyboard;copy_quick=false;
         if(e->payload&&disk){copy_paste=paste;copy_pending=true;const auto token=++copy_token;
             if(!disk->Load(*e,token)){copy_pending=false;status=L"读取队列已满，请重试";}else status=paste?L"正在准备粘贴…（Esc 取消）":L"正在准备复制…（Esc 取消）";Invalidate();return;}
         FinishCopy(*e,paste,copy_target,copy_process);
@@ -1377,7 +1379,7 @@ struct ClipboardPanel::Impl {
         if(action==40){const int index=history.GroupIndex(static_cast<uint32_t>(id));if(index>=0)SelectTab(clipboard::History::GroupTabBase+index);return;}
         if(action==41){BeginNaming(1,0,0);return;}
         if(action==35){OpenEntryPopupAtButton(id,false);return;}
-        if(action==10){RememberTarget(GetForegroundWindow());pinned=!pinned;UpdateActivationPolicy();
+        if(action==10){RememberTarget(GetForegroundWindow());pinned=!pinned;if(pinned&&summon_cursor){const RECT body=VisualBodyBounds();anchor={body.right,body.top};summon_cursor.reset();}UpdateActivationPolicy();
             DWORD process{};if(pinned&&!keep_focus&&IsWindow(previous)&&GetWindowThreadProcessId(previous,&process)&&process==previous_process)SetForegroundWindow(previous);
             status=pinned?L"已固定：↑↓ 选择，Enter 连续粘贴":L"已取消固定：失焦时折叠";
             // Unpinning resumes normal focus handling; fold on the next deactivation.
@@ -1484,7 +1486,7 @@ struct ClipboardPanel::Impl {
             AssignGroup(selected,history.groups[index].id);return;
         }
         if(ctrl&&key=='G'){if(history.Find(selected))OpenEntryPopupAtButton(selected,true);else{status=L"请先选择一条记录";Invalidate();}return;}
-        if(ctrl&&key=='C'){Copy(selected,false);return;}if(key==VK_RETURN){Copy(selected,true,(GetKeyState(VK_SHIFT)&0x8000)!=0,true);return;}
+        if(ctrl&&key=='C'){Copy(selected,false);return;}if(key==VK_RETURN){Copy(selected,true,(GetKeyState(VK_SHIFT)&0x8000)!=0,true,ctrl&&(GetKeyState(VK_SHIFT)&0x8000)!=0);return;}
         if(key==VK_DELETE){Action(34,selected);return;}
         if(key==VK_SPACE){SetFocus(window);TogglePreview();return;}
         if(key==VK_LEFT||key==VK_RIGHT){const int n=TabCount();SelectTab((tab+(key==VK_RIGHT?1:n-1))%n);return;}
@@ -1564,7 +1566,7 @@ struct ClipboardPanel::Impl {
             limits->ptMaxTrackSize={max_w,max_h};return 0;}
         case WM_ENTERSIZEMOVE:p->resizing=p->expanded;p->CloseMore();return 0;
         case WM_SIZE:p->ResizeClient(LOWORD(lp),HIWORD(lp));return 0;
-        case WM_EXITSIZEMOVE:if(p->resizing){p->resizing=false;RECT bounds{};GetWindowRect(w,&bounds);p->anchor={bounds.right,bounds.top};p->placed=true;
+        case WM_EXITSIZEMOVE:if(p->resizing){p->resizing=false;p->summon_cursor.reset();RECT bounds{};GetWindowRect(w,&bounds);p->anchor={bounds.right,bounds.top};p->placed=true;
             if(!p->SaveLayout()){p->status=L"窗口尺寸保存失败";p->Invalidate();}}return 0;
         case WM_ERASEBKGND:return 1;
         case WM_PAINT:{PAINTSTRUCT ps{};BeginPaint(w,&ps);try{p->Present();}catch(...){EndPaint(w,&ps);throw;}EndPaint(w,&ps);return 0;}

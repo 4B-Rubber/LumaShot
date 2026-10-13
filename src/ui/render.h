@@ -67,6 +67,7 @@ bool SetToolbarSlider(ViewState& state,int id,Point point);
 bool OpenToolbarDropdown(ViewState& state,int id,RECT monitor);
 void ChooseToolbarDropdown(ViewState& state,int index);
 std::vector<ui::Control> ToolbarControls(const ViewState& state,const Document& document);
+const wchar_t* ToolbarActionName(int id);
 std::optional<uint32_t> ToolbarColor(int id);
 std::optional<uint32_t> PenToolbarColor(int id,const ViewState& state);
 

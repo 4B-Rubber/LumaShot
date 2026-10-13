@@ -1,20 +1,27 @@
 #include "ocr/service.h"
+#include "ocr/config.h"
 #include <filesystem>
 #include <chrono>
 namespace lumashot::ocr {
 Service::Service(HWND notify,UINT message):notify_(notify),message_(message),thread_([this]{Run();}){}
 Service::~Service(){stopping_=true;cv_.notify_one();if(thread_.joinable())thread_.join();}
 void Service::Submit(uint64_t id,uint64_t version,std::shared_ptr<const Frame> image) {
-    Cancel(id);{std::lock_guard lock(mutex_);jobs_.push_back({id,version,std::move(image),std::make_shared<std::atomic_bool>(false)});}cv_.notify_one();
+    Cancel(id);{std::lock_guard lock(mutex_);jobs_.push_back({id,version,std::move(image),std::make_shared<std::atomic_bool>(false),model_directory_});}cv_.notify_one();
+}
+void Service::SetModelDirectory(const std::filesystem::path& directory) {
+    std::lock_guard lock(mutex_);model_directory_=directory.empty()?directory:std::filesystem::absolute(directory);
 }
 void Service::Cancel(uint64_t id) {
     std::lock_guard lock(mutex_);
     if(active_&&active_->id==id)*active_->canceled=true;
     std::erase_if(jobs_,[&](const Job& j){return j.id==id;});std::erase_if(completed_,[&](const Completion& c){return c.id==id;});
 }
+void Service::Prewarm(){{std::lock_guard lock(mutex_);prewarm_=true;}cv_.notify_one();}
 std::vector<Completion> Service::Take(){std::lock_guard lock(mutex_);return std::exchange(completed_,{});}
-void Service::StartChild() {
+void Service::StartChild(const std::filesystem::path& directory) {
+    if(process_.Get()&&child_model_directory_!=directory)StopChild();
     if(process_.Get())return;
+    child_model_directory_=directory;
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE a{},b{};
     CheckWin32(CreatePipe(&a,&b,&sa,65536)!=FALSE,"Create OCR input pipe");Handle child_input(a);input_.Reset(b);
     CheckWin32(CreatePipe(&a,&b,&sa,65536)!=FALSE,"Create OCR output pipe");output_.Reset(a);Handle child_output(b);
@@ -29,7 +36,8 @@ void Service::StartChild() {
     CheckWin32(UpdateProcThreadAttribute(attributes,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,const_cast<HANDLE*>(inherited),sizeof(inherited),nullptr,nullptr)!=FALSE,"Set OCR inherited handles");
     wchar_t module[32768]{};GetModuleFileNameW(nullptr,module,32768);
     const auto exe=std::filesystem::path(module).parent_path()/L"lumashot_ocr_worker.exe";
-    std::wstring command=L"\""+exe.native()+L"\"";
+    std::wstring command=QuoteModelArgument(exe.native());
+    if(!directory.empty())command+=L" --model-directory "+QuoteModelArgument(directory.native());
     STARTUPINFOEXW si{};si.StartupInfo.cb=sizeof(si);si.StartupInfo.dwFlags=STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW;
     si.StartupInfo.wShowWindow=SW_HIDE;si.StartupInfo.hStdInput=child_input.Get();si.StartupInfo.hStdOutput=child_output.Get();si.StartupInfo.hStdError=null_error.Get();si.lpAttributeList=attributes;
     PROCESS_INFORMATION pi{};
@@ -56,12 +64,18 @@ void Service::Run() {
     while(!stopping_) {
         Job job;
         {std::unique_lock lock(mutex_);
-            if(!cv_.wait_for(lock,std::chrono::seconds(30),[&]{return stopping_||!jobs_.empty();})){lock.unlock();StopChild();continue;}
-            if(stopping_)break;job=std::move(jobs_.front());jobs_.pop_front();active_=job;
+            if(!cv_.wait_for(lock,std::chrono::seconds(30),[&]{return stopping_||prewarm_||!jobs_.empty();})){lock.unlock();StopChild();continue;}
+            if(stopping_)break;
+            if(jobs_.empty()) {
+                prewarm_=false;const auto directory=model_directory_;lock.unlock();
+                try{StartChild(directory);}catch(const std::exception&){StopChild();}
+                continue;
+            }
+            prewarm_=false;job=std::move(jobs_.front());jobs_.pop_front();active_=job;
         }
         Completion completion;completion.id=job.id;completion.version=job.version;
         try {
-            StartChild();const auto& f=*job.image;const uint64_t size=f.pixels.size()*4;
+            StartChild(job.model_directory);const auto& f=*job.image;const uint64_t size=f.pixels.size()*4;
             Handle mapping(CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,static_cast<DWORD>(size>>32),static_cast<DWORD>(size),nullptr));
             CheckWin32(mapping.Get()!=nullptr,"Create OCR image mapping");
             {MappingView view(mapping.Get(),FILE_MAP_WRITE);std::memcpy(view.data,f.pixels.data(),static_cast<size_t>(size));}

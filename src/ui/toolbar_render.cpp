@@ -8,14 +8,24 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
     paint.brush=[this](uint32_t color){Brush(color);return brush_.Get();};
     paint.text=[this](const std::wstring& text,Box b,float size,uint32_t color){Text(text,b,size,color,false);};
     paint.measure_text=[this](const std::wstring& text,float size){return MeasureText(text,size);};
-    paint.icon=[this,&state](int id,Box b,uint32_t color){
+    paint.icon=[this,&state,&paint](int id,Box b,uint32_t color){
+        if(id>=0&&id<=18){
+            const float size=std::min({b.right-b.left,b.bottom-b.top,28*state.toolbar.scale});
+            const float cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
+            b={cx-size/2,cy-size/2,cx+size/2,cy+size/2};
+        }
         const auto& motion=state.toolbar_visual;
         if(motion.ready&&motion.effects&&id>=0&&id<int(ui::ToolbarSlots)){
             const float hot=motion.hover[size_t(id)],down=motion.press[size_t(id)],zoom=1+.06f*hot-.1f*down;
             const float cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2+(-1.5f*hot+.8f*down)*state.toolbar.scale;
             const float w=(b.right-b.left)*zoom/2,h=(b.bottom-b.top)*zoom/2;b={cx-w,cy-h,cx+w,cy+h};
         }
-        Icon(id,b,color);
+        if(id==15){
+            const float u=std::min(b.right-b.left,b.bottom-b.top)/32,cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
+            const auto line=[&](float x,float y,float x2,float y2){target_->DrawLine({cx+x*u,cy+y*u},{cx+x2*u,cy+y2*u},paint.brush(color),1.65f*u);};
+            for(float side:{-1.f,1.f}){line(side*9,-4,side*9,-9);line(side*9,-9,side*4,-9);line(side*9,4,side*9,9);line(side*9,9,side*4,9);}
+            line(-4,-3,4,-3);line(-4,1,4,1);line(-4,5,1,5);
+        }else Icon(id,b,color);
     };
     paint.surface=[this,&frame,&state](Box b,float radius){Panel(b,acrylic_bitmap_.Get(),frame,state.dark,radius);};
     paint.color_wheel=[this](Box b){
@@ -78,11 +88,10 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
         }
         return;
     }
-    if(state.property_drag<0&&(state.hover==0||(state.hover>=7&&state.hover<14)||state.hover==15||state.hover==16||state.hover==17||state.hover==18||state.hover==28||state.hover==70)) {
-        constexpr std::array<LPCWSTR,ui::ToolbarSlots> names{L"选择 / 移动 V",L"",L"",L"",L"",L"",L"",L"撤销 Ctrl+Z",L"重做 Ctrl+Y",L"保存 Ctrl+S",L"复制 Ctrl+C",L"取消 Esc",L"完成 Enter",L"置顶贴图",L"",L"识别文字 / 表格",L"录制",L"长截图 L",L"截图翻译"};
+    if(state.property_drag<0&&((state.hover>=0&&state.hover<=18)||state.hover==28||state.hover==70)) {
         const float s=state.toolbar.scale;const Box anchor=(state.hover==28||state.hover==70)?state.toolbar.Property(state.hover):state.toolbar.Button(state.hover);
         const RECT monitor=monitor_.right>monitor_.left?monitor_:frame.bounds;
-        ui::DrawTooltip(paint,{s,state.dark},(state.hover==28||state.hover==70)?L"自定义颜色":names[state.hover],anchor,
+        ui::DrawTooltip(paint,{s,state.dark},(state.hover==28||state.hover==70)?L"自定义颜色":ToolbarActionName(state.hover),anchor,
             {float(monitor.left),float(monitor.top),float(monitor.right),float(monitor.bottom)});
     }
 }

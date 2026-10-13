@@ -43,7 +43,7 @@ int main(int argc,char** argv) {
             std::sort(latency.begin(),latency.end());std::cout<<"Synthetic drag event-to-present p95 ms: "<<latency[std::min(size_t(113),latency.size()-1)]<<"; paints completed: "<<painted<<'\n';
             if(!painted){PostMessageW(OwnWindow(L"LumaShot.Host"),WM_CLOSE,0,0);return;}
             const float scale=float(GetDpiForWindow(overlay))/96;
-            auto layout=PlaceToolbar({0,0,1279,719},{0,0,1280,800},scale,0);
+            auto layout=PlaceToolbar({0,0,1279,719},{0,0,1280,800},scale,0,Tool::Select);
             const auto click=[&](Box b){auto point=MAKELPARAM(static_cast<short>((b.left+b.right)/2),static_cast<short>((b.top+b.bottom)/2));SendMessageW(overlay,WM_LBUTTONDOWN,MK_LBUTTON,point);SendMessageW(overlay,WM_LBUTTONUP,0,point);};
             click(layout.Button(1));Sleep(220);
             // Reverse an in-flight collapse, then allow the final expansion to finish.

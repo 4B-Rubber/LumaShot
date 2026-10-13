@@ -1,6 +1,7 @@
 #include "pin/pin.h"
 #include "export/clipboard.h"
 #include "export/png.h"
+#include "export/drag_out.h"
 #include "pin/selection_tools.h"
 #include "pin/paper.h"
 #include "pin/zoom.h"
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 namespace lumashot {
+// Posted after a card is pulled off the rope: the OLE drag starts once the rope's mouse handler has returned.
+constexpr UINT kDragOutMessage=WM_APP+0x48;
 struct PinManager::Pin {
     PinManager* manager{};HWND window{};uint64_t id{},version{},revision{1};
     std::shared_ptr<const Frame> image,ocr_image,annotation_base;Document annotations;
@@ -43,11 +46,44 @@ struct PinManager::Pin {
     std::shared_ptr<const Frame> Shown()const{return tr.show&&tr.image?tr.image:image;}
     PaperLayout paper,shadow_layout;Frame shadow_image;ComPtr<ID2D1Bitmap> shadow_bitmap;unsigned shadow_builds{};
     Point offset{};POINT destination{};bool relocating{},presenting{};
+    // Clothesline: the window is hidden while hung; hang_origin is where it flies back to.
+    bool hung{},from_line{};POINT hang_origin{};BYTE alpha{255};
+    // A system drag into another program is running (DoDragDrop loop).
+    bool out_drag{};
+    // Hover buttons at the image's top-right corner: 0 hangs on the rope, 1 closes.
+    // hang_tool is false while the clothesline is switched off in settings.
+    bool hang_tool{true};
+    bool hovered{},tracking{},closing{};int tool_hover{-1},tool_down{-1};float tool_alpha{};ULONGLONG tool_tick{};
+    ComPtr<ID2D1StrokeStyle> round_stroke;
+    bool ToolsWanted()const{return hovered&&!editing&&!locked&&!hung&&!closing&&!out_drag&&!flight.active&&!(moving&&dragged);}
+    bool ToolRects(D2D1_RECT_F (&out)[2])const{
+        if(!image)return false;
+        const float s=dpi/96,size=28*s,gap=4*s,m=6*s;
+        const float left=float(Inset())+offset.x,top=float(Inset())+offset.y;
+        const float right=left+float(image->Width())*zoom,bottom=top+float(image->Height())*zoom;
+        if(right-left<2*size+gap+2*m||bottom-top<size+2*m)return false;
+        out[1]=D2D1::RectF(right-m-size,top+m,right-m,top+m+size);
+        out[0]=hang_tool?D2D1::RectF(out[1].left-gap-size,top+m,out[1].left-gap,top+m+size):D2D1::RectF(0,0,0,0);return true;
+    }
+    int ToolAt(LPARAM lp,float min_alpha=.5f)const{
+        D2D1_RECT_F r[2];if(tool_alpha<min_alpha||!ToolRects(r))return -1;
+        const float x=float(GET_X_LPARAM(lp)),y=float(GET_Y_LPARAM(lp));
+        for(int i=0;i<2;++i)if(x>=r[i].left&&x<r[i].right&&y>=r[i].top&&y<r[i].bottom)return i;
+        return -1;
+    }
+    struct Flight{bool active{};ULONGLONG start{};float from_zoom{1},to_zoom{1};Point from{},to{};} flight;
     int Inset()const{return paper.inset+paper.shadow;}
-    int CanvasWidth()const{return paper.width+2*paper.shadow+2;}
-    int CanvasHeight()const{return paper.height+2*paper.shadow+2;}
+    // Rounded up to even sizes: Direct2D's software target over the window's DIB
+    // copies the whole surface on every draw when either side is odd (measured:
+    // a clipped clear of 3389x1927 takes 15-30 ms, of 3388x1928 0.1 ms).
+    int CanvasWidth()const{return (paper.width+2*paper.shadow+3)&~1;}
+    int CanvasHeight()const{return (paper.height+2*paper.shadow+3)&~1;}
     Point WindowPoint(Point q)const{return {q.x*zoom+Inset()+offset.x,q.y*zoom+Inset()+offset.y};}
     ComPtr<ID2D1Factory> factory;ComPtr<ID2D1RenderTarget> target;ComPtr<ID2D1Bitmap> bitmap;int bitmap_uploads{};TextRenderer text_renderer;
+    // While the window is hidden on the clothesline its canvas, renderer and the
+    // software copy of the image are dropped (about two frames of memory for a
+    // full-screen pin); the next Paint rebuilds them from `image`.
+    void ReleaseSurface(){target.Reset();bitmap.Reset();surface.reset();surface_width=surface_height=0;}
     Point ImagePoint(LPARAM lp) const{return {(GET_X_LPARAM(lp)-Inset()-offset.x)/zoom,(GET_Y_LPARAM(lp)-Inset()-offset.y)/zoom};}
     SelectionHandles Handles()const{
         auto handles=TextHandles(text,selection,dpi/96/zoom);if(!handles.visible)return handles;
@@ -76,6 +112,11 @@ PinManager::PinManager(HWND host):host_(host),service_(host,kOcrReady) {
     if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)CheckWin32(false,"Register pin window");
     wc.lpfnWndProc=ToolsProc;wc.lpszClassName=L"LumaShot.SelectionTools";wc.style=CS_DROPSHADOW;
     if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)CheckWin32(false,"Register selection tools");
+    // The rope window itself is created when the first pin opens (Arm) or on the first hang.
+    line_=std::make_unique<Clothesline>(Clothesline::Callbacks{
+        [this](uint64_t id,RECT from){RetrievePin(id,from);},
+        [this](uint64_t id,POINT cursor){DetachPin(id,cursor);},
+        [this]{for(const auto& [id,pin]:pins_)if(pin->window&&!pin->hung&&IsWindowVisible(pin->window))return true;return false;}});
 }
 PinManager::~PinManager(){try{PreserveSession();}catch(...){}session_writer_.reset();for(auto& [id,pin]:pins_){service_.Cancel(id);if(pin->window)DestroyWindow(pin->window);}pins_.clear();}
 void PinManager::Create(Frame image,Frame ocr_image,POINT position,std::optional<Frame> base,Document annotations,bool recognize,const PinSessionRecord* restored) {
@@ -91,6 +132,7 @@ void PinManager::Create(Frame image,Frame ocr_image,POINT position,std::optional
     if(restored){pin->annotation_base=restored->base;pin->annotations.marks=restored->annotations;pin->marks=restored->decorations;pin->locked=restored->locked;}
     pin->style=restored?restored->style:sticker_style?NormalizePinStyle(static_cast<int>(sticker_style())):DefaultPinStyle;
     pin->paper=MakePaperLayout(pin->image->Width(),pin->image->Height(),96,pin->style);
+    pin->hang_tool=LineOn();
     const uint64_t id=pin->id;auto* p=pin.get();pins_.emplace(id,std::move(pin));last_created_=id;
     p->window=CreateWindowExW(WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"LumaShot.Pin",L"LumaShot 贴图",WS_POPUP,
         position.x-p->Inset(),position.y-p->Inset(),p->CanvasWidth(),p->CanvasHeight(),nullptr,nullptr,GetModuleHandleW(nullptr),p);
@@ -111,13 +153,20 @@ void PinManager::Create(Frame image,Frame ocr_image,POINT position,std::optional
         const float top=std::clamp(restored->origin.y-p->Inset(),float(monitor.rcWork.top),float(std::max(monitor.rcWork.top,monitor.rcWork.bottom-p->CanvasHeight())));
         ApplyPaper(*p,{left,top});
     }
-    ShowWindow(p->window,SW_SHOWNOACTIVATE);
+    if(restored&&restored->hung&&LineOn()){
+        // It was on the clothesline when the session was saved (reboot,
+        // reinstall, restart): back on the rope, hidden, home kept for retrieval.
+        RECT r{};GetWindowRect(p->window,&r);
+        p->hang_origin={r.left,r.top};p->hung=true;p->alpha=255;p->ReleaseSurface();
+        line_->Restore(p->id,p->Shown());
+    }else ShowWindow(p->window,SW_SHOWNOACTIVATE);
+    if(LineOn())line_->Arm();
     if(!restoring_session_)SetForegroundWindow(p->window);if(recognize)Recognize(*p);SessionChanged();
 }
 std::vector<PinSessionRecord> PinManager::SessionSnapshot()const{
     std::vector<PinSessionRecord> result;
     for(const auto& [id,p]:pins_){if(!p->window||!p->image)continue;RECT rect{};GetWindowRect(p->window,&rect);
-        PinSessionRecord record;record.id=id;record.revision=p->revision;record.origin={rect.left+p->Inset()+p->offset.x,rect.top+p->Inset()+p->offset.y};record.zoom=p->zoom;record.style=p->style;record.locked=p->locked;record.recognize=p->ocr_enabled;
+        PinSessionRecord record;record.id=id;record.revision=p->revision;record.origin={rect.left+p->Inset()+p->offset.x,rect.top+p->Inset()+p->offset.y};record.zoom=p->zoom;record.style=p->style;record.locked=p->locked;record.recognize=p->ocr_enabled;record.hung=p->hung;
         record.image=p->image;record.ocr_image=p->ocr_image;record.base=p->annotation_base;record.annotations=p->annotations.marks;record.decorations=p->marks;result.push_back(std::move(record));
     }return result;
 }
@@ -187,9 +236,10 @@ void PinManager::Paint(Pin& p) {
         const auto bmp=D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_IGNORE),96,96);
         const auto shown=p.Shown();CheckWin32(SUCCEEDED(p.target->CreateBitmap(D2D1::SizeU(shown->Width(),shown->Height()),shown->pixels.data(),shown->Width()*4,bmp,&p.bitmap)),"Create pin image");++p.bitmap_uploads;
     }
-    Draw(p,p.target.Get());RECT rect{};GetWindowRect(p.window,&rect);POINT origin=p.relocating?p.destination:POINT{rect.left,rect.top},source{};SIZE size{p.CanvasWidth(),p.CanvasHeight()};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+    Draw(p,p.target.Get());RECT rect{};GetWindowRect(p.window,&rect);POINT origin=p.relocating?p.destination:POINT{rect.left,rect.top},source{};SIZE size{p.CanvasWidth(),p.CanvasHeight()};BLENDFUNCTION blend{AC_SRC_OVER,0,p.alpha,AC_SRC_ALPHA};
     p.presenting=true;const BOOL ok=UpdateLayeredWindow(p.window,nullptr,&origin,&size,p.surface->Dc(),&source,0,&blend,ULW_ALPHA);p.presenting=false;p.relocating=false;
     CheckWin32(ok!=FALSE,"Present paper and shadow atomically");ValidateRect(p.window,nullptr);
+    if(p.hung&&!IsWindowVisible(p.window))p.ReleaseSurface();
 }
 void PinManager::Zoom(Pin& p,int delta,POINT anchor){
     if(!delta||p.moving||p.selecting||p.locked||p.editing)return;
@@ -205,9 +255,11 @@ void PinManager::Zoom(Pin& p,int delta,POINT anchor){
     if(!p.zoom_animating)p.zoom_animating=SetTimer(p.window,101,16,nullptr)!=0;
     SetTimer(p.window,102,1100,nullptr);
 }
-void PinManager::Draw(Pin& p,ID2D1RenderTarget* target) {
+void PinManager::Draw(Pin& p,ID2D1RenderTarget* target,const D2D1_RECT_F* clip) {
     ComPtr<ID2D1SolidColorBrush> brush;target->CreateSolidColorBrush(D2D1::ColorF(0x202733),brush.GetAddressOf());
-    target->BeginDraw();target->SetTransform(D2D1::Matrix3x2F::Identity());target->Clear(D2D1::ColorF(0,0.f));
+    target->BeginDraw();target->SetTransform(D2D1::Matrix3x2F::Identity());
+    if(clip)target->PushAxisAlignedClip(*clip,D2D1_ANTIALIAS_MODE_ALIASED);
+    target->Clear(D2D1::ColorF(0,0.f));
     ComPtr<ID2D1Bitmap> shadow;
     if(target==p.target.Get())shadow=p.shadow_bitmap;
     if(!shadow&&!p.shadow_image.pixels.empty()){
@@ -234,7 +286,69 @@ void PinManager::Draw(Pin& p,ID2D1RenderTarget* target) {
         format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         const auto label=std::to_wstring(int(std::lround(p.zoom*100)))+L"%";p.text_renderer.Draw(target,dw.Get(),label,format.Get(),D2D1::RectF(x,y,x+w,y+h),D2D1::ColorF(0xffffff),false);
     }
+    // Hover buttons: only on the window's own target, never in exports.
+    D2D1_RECT_F tools[2];
+    if(target==p.target.Get()&&p.tool_alpha>.01f&&p.ToolRects(tools)){
+        const float s=p.dpi/96,a=p.tool_alpha,lift=(1-a)*-3*s;
+        if(!p.round_stroke)p.factory->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,p.round_stroke.GetAddressOf());
+        for(int i=0;i<2;++i){
+            if(i==0&&!p.hang_tool)continue;
+            auto r=tools[i];r.top+=lift;r.bottom+=lift;
+            const auto box=D2D1::RoundedRect(r,8*s,8*s);
+            brush->SetColor(p.tool_hover==i?D2D1::ColorF(i==1?0xe5484d:0x5b9cff,a*(p.tool_down==i?.82f:1.f)):D2D1::ColorF(0x101420,.72f*a));target->FillRoundedRectangle(box,brush.Get());
+            brush->SetColor(D2D1::ColorF(0xffffff,.14f*a));target->DrawRoundedRectangle(box,brush.Get(),s);
+            brush->SetColor(D2D1::ColorF(0xffffff,a));
+            const float cx=(r.left+r.right)/2,cy=(r.top+r.bottom)/2;
+            if(i==1){
+                const float d=4.5f*s;
+                target->DrawLine(D2D1::Point2F(cx-d,cy-d),D2D1::Point2F(cx+d,cy+d),brush.Get(),1.8f*s,p.round_stroke.Get());
+                target->DrawLine(D2D1::Point2F(cx+d,cy-d),D2D1::Point2F(cx-d,cy+d),brush.Get(),1.8f*s,p.round_stroke.Get());
+            }else if(const auto hanger=CreateHangerIcon(p.factory.Get())){
+                const float k=16*s/24;
+                target->SetTransform(D2D1::Matrix3x2F::Scale(k,k)*D2D1::Matrix3x2F::Translation(cx-12*k,cy-12*k));
+                target->DrawGeometry(hanger.Get(),brush.Get(),1.9f,p.round_stroke.Get());
+                target->SetTransform(D2D1::Matrix3x2F::Identity());
+            }
+        }
+        // Label under the buttons for the one under the cursor.
+        if(p.tool_hover>=0&&p.tool_down<0&&a>.9f){
+            ComPtr<IDWriteFactory> dw;ComPtr<IDWriteTextFormat> format;ComPtr<IDWriteTextLayout> layout;DWRITE_TEXT_METRICS metrics{};
+            const std::wstring label=p.tool_hover==0?L"晾到绳上 (H)":L"关闭";
+            if(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(dw.GetAddressOf())))&&
+                SUCCEEDED(dw->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,12*s,L"zh-CN",&format))&&
+                SUCCEEDED(dw->CreateTextLayout(label.c_str(),UINT32(label.size()),format.Get(),4096,256,&layout))&&SUCCEEDED(layout->GetMetrics(&metrics))){
+                const float w=metrics.widthIncludingTrailingWhitespace+18*s,h=24*s,x=tools[1].right-w,y=tools[1].bottom+6*s;
+                const float image_bottom=float(p.Inset())+p.offset.y+float(p.image->Height())*p.zoom;
+                if(y+h<=image_bottom&&x>=float(p.Inset())+p.offset.x){
+                    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    brush->SetColor(D2D1::ColorF(0x141826,.86f));target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x,y,x+w,y+h),8*s,8*s),brush.Get());
+                    p.text_renderer.Draw(target,dw.Get(),label,format.Get(),D2D1::RectF(x,y,x+w,y+h),D2D1::ColorF(0xffffff),false);
+                }
+            }
+        }
+    }
+    if(clip)target->PopAxisAlignedClip();
     if(target->EndDraw()==D2DERR_RECREATE_TARGET){p.bitmap.Reset();p.shadow_bitmap.Reset();p.target.Reset();InvalidateRect(p.window,nullptr,FALSE);}
+}
+// Only the hover buttons changed (fade step, hover or press): redraw and present
+// just their corner instead of the whole canvas (a full-screen pin is ~6.5 MP).
+void PinManager::PaintTools(Pin& p){
+    D2D1_RECT_F tools[2];
+    if(!p.window||!p.target||!p.surface||!p.bitmap||p.relocating||p.surface_width!=p.CanvasWidth()||p.surface_height!=p.CanvasHeight()||!p.ToolRects(tools)){Paint(p);return;}
+    // Buttons (lifted up to 3 DIP while fading) and the label right-aligned under
+    // them, which is narrower than 160 DIP.
+    const float s=p.dpi/96;
+    RECT dirty{LONG(std::floor(std::min(p.hang_tool?tools[0].left:tools[1].left,tools[1].right-160*s)-3*s)),LONG(std::floor(tools[1].top-6*s)),
+        LONG(std::ceil(tools[1].right+3*s)),LONG(std::ceil(tools[1].bottom+33*s))};
+    dirty.left=std::max(dirty.left,0L);dirty.top=std::max(dirty.top,0L);dirty.right=std::min(dirty.right,LONG(p.surface_width));dirty.bottom=std::min(dirty.bottom,LONG(p.surface_height));
+    if(dirty.right<=dirty.left||dirty.bottom<=dirty.top)return;
+    const auto clip=D2D1::RectF(float(dirty.left),float(dirty.top),float(dirty.right),float(dirty.bottom));
+    Draw(p,p.target.Get(),&clip);
+    if(!p.target)return;  // device loss: a full repaint is already queued
+    RECT rect{};GetWindowRect(p.window,&rect);POINT origin{rect.left,rect.top},source{};SIZE size{p.surface_width,p.surface_height};BLENDFUNCTION blend{AC_SRC_OVER,0,p.alpha,AC_SRC_ALPHA};
+    UPDATELAYEREDWINDOWINFO info{sizeof(info),nullptr,&origin,&size,p.surface->Dc(),&source,0,&blend,ULW_ALPHA,&dirty};
+    p.presenting=true;const BOOL ok=UpdateLayeredWindowIndirect(p.window,&info);p.presenting=false;
+    if(!ok)Paint(p);
 }
 
 void PinManager::Save(Pin& p) {
@@ -328,7 +442,7 @@ void PinManager::CompleteAnnotation(uint64_t id,std::optional<Frame> image,Docum
         if(p.ocr_enabled||recognize)Recognize(p);}
     UpdateTools(p);InvalidateRect(p.window,nullptr,FALSE);SetForegroundWindow(p.window);SessionChanged();
 }
-void PinManager::UpdateTools(Pin& p){
+void PinManager::UpdateTools(Pin& p){UpdateHoverTools(p);
     const auto boxes=SelectionBoxes(p.text,p.selection);
     if(boxes.empty()||p.selecting||p.moving||p.editing){if(p.tools)ShowWindow(p.tools,SW_HIDE);return;}
     Box selected=boxes.front();for(auto b:boxes){selected.left=std::min(selected.left,b.left);selected.right=std::max(selected.right,b.right);selected.top=std::min(selected.top,b.top);selected.bottom=std::max(selected.bottom,b.bottom);}
@@ -388,6 +502,7 @@ LRESULT CALLBACK PinManager::Proc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
         case WM_ERASEBKGND:return 1;
         case WM_SIZE:if(!p->presenting)InvalidateRect(window,nullptr,FALSE);return 0;
         case WM_NCHITTEST:{POINT local{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(window,&local);HRGN region=PaperRegion(p->paper);const bool inside=PtInRegion(region,int(local.x-p->paper.shadow-p->offset.x),int(local.y-p->paper.shadow-p->offset.y))!=0;DeleteObject(region);return inside?HTCLIENT:HTTRANSPARENT;}
+        case kDragOutMessage:if(p->moving&&p->from_line&&!p->hung&&!p->out_drag)p->manager->DragOut(*p);return 0;
         case WM_MOUSEWHEEL:p->manager->Zoom(*p,GET_WHEEL_DELTA_WPARAM(wp),{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});return 0;
         case WM_TIMER:
             if(wp==101){
@@ -399,13 +514,17 @@ LRESULT CALLBACK PinManager::Proc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
                 p->manager->ApplyPaper(*p,{p->zoom_anchor.x-layout.inset-layout.shadow-p->zoom_image.x*p->zoom,p->zoom_anchor.y-layout.inset-layout.shadow-p->zoom_image.y*p->zoom});
                 if(t>=1){KillTimer(window,101);p->zoom_animating=false;p->manager->SessionChanged();}return 0;
             }
+            if(wp==104){p->manager->FlyStep(*p);return 0;}
+            if(wp==105){p->manager->HoverToolsStep(*p);return 0;}
+            if(wp==106){const int a=int(p->alpha)-28;if(a<=0){KillTimer(window,106);DestroyWindow(window);return 0;}p->alpha=BYTE(a);p->manager->Paint(*p);return 0;}
             if(wp==103){KillTimer(window,103);p->manager->SessionChanged();return 0;}
             if(wp==102){KillTimer(window,102);p->zoom_badge_until=0;InvalidateRect(window,nullptr,FALSE);return 0;}break;
         case WM_DPICHANGED:{p->dpi=float(HIWORD(wp));const auto* r=reinterpret_cast<RECT*>(lp);p->manager->ApplyPaper(*p,{float(r->left),float(r->top)});return 0;}
         case WM_MOVE:if(!p->presenting)p->manager->PlacePanel(*p);if(!p->presenting&&!p->moving){p->manager->UpdateTools(*p);if(p->manager->session_writer_&&!p->manager->restoring_session_)SetTimer(window,103,180,nullptr);}return 0;
-        case WM_SETCURSOR:if(LOWORD(lp)==HTCLIENT){POINT pt{};GetCursorPos(&pt);ScreenToClient(window,&pt);SetCursor(LoadCursorW(nullptr,ocr::OnText(p->text,p->ImagePoint(MAKELPARAM(pt.x,pt.y)))&&!(GetKeyState(VK_SPACE)&0x8000)?IDC_IBEAM:IDC_ARROW));return TRUE;}break;
+        case WM_SETCURSOR:if(LOWORD(lp)==HTCLIENT){POINT pt{};GetCursorPos(&pt);ScreenToClient(window,&pt);if(p->ToolAt(MAKELPARAM(pt.x,pt.y))>=0){SetCursor(LoadCursorW(nullptr,IDC_HAND));return TRUE;}SetCursor(LoadCursorW(nullptr,ocr::OnText(p->text,p->ImagePoint(MAKELPARAM(pt.x,pt.y)))&&!(GetKeyState(VK_SPACE)&0x8000)?IDC_IBEAM:IDC_ARROW));return TRUE;}break;
         case WM_LBUTTONDOWN:case WM_LBUTTONDBLCLK:{
-            if(p->editing)return 0;KillTimer(window,101);p->zoom_animating=false;p->zoom_goal=p->zoom;SetFocus(window);
+            if(p->editing||p->flight.active||p->closing)return 0;KillTimer(window,101);p->zoom_animating=false;p->zoom_goal=p->zoom;SetFocus(window);
+            if(const int tool=p->ToolAt(lp);tool>=0){p->tool_down=tool;SetCapture(window);p->manager->PaintTools(*p);return 0;}
             const auto point=p->ImagePoint(lp);
             const bool space=false;
             p->handle=space?-1:HitTextHandle(p->Handles(),point,p->dpi/96/p->zoom);
@@ -432,10 +551,26 @@ LRESULT CALLBACK PinManager::Proc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
                 else {const auto hit=ocr::Hit(p->text,point);p->selection={hit,hit};p->selecting=true;}
             }SetCapture(window);p->manager->UpdateTools(*p);InvalidateRect(window,nullptr,FALSE);return 0;}
         case WM_MOUSEMOVE:
-            if(p->moving){POINT pt{};GetCursorPos(&pt);if(std::abs(pt.x-p->drag.x)>=GetSystemMetrics(SM_CXDRAG)||std::abs(pt.y-p->drag.y)>=GetSystemMetrics(SM_CYDRAG))p->dragged=true;SetWindowPos(window,nullptr,p->origin.x+pt.x-p->drag.x,p->origin.y+pt.y-p->drag.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);}
+            if(!p->tracking){TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,window,0};p->tracking=TrackMouseEvent(&track)!=FALSE;}
+            p->hovered=true;
+            {const int hot=p->ToolsWanted()&&!p->selecting?p->ToolAt(lp,0.f):-1;if(hot!=p->tool_hover){p->tool_hover=hot;p->manager->PaintTools(*p);}}p->manager->UpdateHoverTools(*p);
+            if(p->tool_down>=0)return 0;
+            if(p->moving){POINT pt{};GetCursorPos(&pt);const bool was_dragged=p->dragged;if(std::abs(pt.x-p->drag.x)>=GetSystemMetrics(SM_CXDRAG)||std::abs(pt.y-p->drag.y)>=GetSystemMetrics(SM_CYDRAG))p->dragged=true;SetWindowPos(window,nullptr,p->origin.x+pt.x-p->drag.x,p->origin.y+pt.y-p->drag.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+                // Ctrl+drag: drop the picture into another program instead of only moving the pin.
+                if(!was_dragged&&p->dragged&&!p->from_line&&(GetKeyState(VK_CONTROL)&0x8000)){p->manager->DragOut(*p);return 0;}
+                // Near the top edge the clothesline drops down; the pin turns translucent to reveal the slot.
+                if(p->dragged&&p->manager->LineOn()){const BYTE alpha=p->manager->line_->DragUpdate(pt,{p->image->Width(),p->image->Height()})?BYTE(150):BYTE(255);if(alpha!=p->alpha){p->alpha=alpha;p->manager->Paint(*p);}}}
             if(p->selecting){auto point=p->ImagePoint(lp);if(p->handle>=0){point.x+=p->handle_offset.x;point.y+=p->handle_offset.y;}p->selection.caret=ocr::Hit(p->text,point,true);InvalidateRect(window,nullptr,FALSE);}return 0;
-        case WM_LBUTTONUP:if(p->selecting)SendMessageW(window,WM_MOUSEMOVE,wp,lp);p->moving=p->selecting=false;p->handle=-1;if(GetCapture()==window)ReleaseCapture();p->manager->UpdateTools(*p);p->manager->SessionChanged();InvalidateRect(window,nullptr,FALSE);return 0;
-        case WM_CAPTURECHANGED:p->moving=p->selecting=false;p->handle=-1;p->manager->UpdateTools(*p);return 0;
+        case WM_MOUSELEAVE:p->tracking=false;p->hovered=false;if(p->tool_hover>=0){p->tool_hover=-1;p->manager->PaintTools(*p);}p->manager->UpdateHoverTools(*p);return 0;
+        case WM_LBUTTONUP:
+            if(p->tool_down>=0){
+                const int tool=p->tool_down;const bool hit=p->ToolAt(lp)==tool;p->tool_down=-1;
+                if(GetCapture()==window)ReleaseCapture();p->manager->PaintTools(*p);
+                if(hit){if(tool==0)p->manager->HangPin(*p);else p->manager->FadeClose(*p);}
+                return 0;
+            }
+            if(p->moving&&p->dragged&&p->manager->DropOnLine(*p))return 0;if(p->moving)p->manager->EndLineDrag(*p);if(p->selecting)SendMessageW(window,WM_MOUSEMOVE,wp,lp);p->moving=p->selecting=false;p->handle=-1;if(GetCapture()==window)ReleaseCapture();p->manager->UpdateTools(*p);p->manager->SessionChanged();InvalidateRect(window,nullptr,FALSE);return 0;
+        case WM_CAPTURECHANGED:if(p->moving)p->manager->EndLineDrag(*p);p->moving=p->selecting=false;p->handle=-1;p->tool_down=-1;p->manager->UpdateTools(*p);p->manager->UpdateHoverTools(*p);return 0;
         case WM_CONTEXTMENU:p->manager->Menu(*p,{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});return 0;
         case WM_KEYDOWN:
             if(!(GetKeyState(VK_CONTROL)&0x8000)&&!(GetKeyState(VK_MENU)&0x8000)&&!(lp&(1LL<<30))){
@@ -444,14 +579,15 @@ LRESULT CALLBACK PinManager::Proc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
                 if(wp==VK_ESCAPE){SendMessageW(window,WM_CLOSE,0,0);return 0;}
                 if(wp==VK_SPACE){p->manager->Annotate(*p);return 0;}
                 if(wp=='L'){p->manager->ToggleLock(*p);return 0;}
+                if(wp=='H'&&!p->editing){p->manager->HangPin(*p);return 0;}
                 if(wp=='T'&&ocr::Available()&&!p->editing){p->manager->TranslateKey(*p);return 0;}
             }
             if(GetKeyState(VK_CONTROL)&0x8000){if(wp=='A'){p->selection=ocr::All(p->text);p->manager->UpdateTools(*p);InvalidateRect(window,nullptr,FALSE);}if(wp=='C')CopyText(window,ocr::Selected(p->text,p->selection));if(wp=='Z'&&!p->undo.empty()){p->marks=std::move(p->undo.back());p->undo.pop_back();++p->revision;p->manager->SessionChanged();InvalidateRect(window,nullptr,FALSE);}}return 0;
         case WM_QUERYENDSESSION:p->manager->FlushSession();return TRUE;
         case WM_ENDSESSION:if(wp)p->manager->PreserveSession();return 0;
         case WM_CLOSE:DestroyWindow(window);return 0;
-        case WM_DESTROY:KillTimer(window,103);KillTimer(window,101);KillTimer(window,102);p->zoom_animating=false;p->moving=p->selecting=false;p->selection={};return 0;
-        case WM_NCDESTROY:if(p->tools)DestroyWindow(p->tools);if(p->tr.job&&p->manager->translator_)p->manager->translator_->Cancel(p->tr.job);p->tr.job=0;p->tr.image.reset();p->manager->service_.Cancel(p->id);p->window=nullptr;if(!p->manager->preserving_session_&&!p->manager->restoring_session_){p->manager->SessionChanged();p->manager->FlushSession();}p->image.reset();p->ocr_image.reset();p->text={};p->target.Reset();p->bitmap.Reset();SetWindowLongPtrW(window,GWLP_USERDATA,0);PostMessageW(p->manager->host_,kOcrReady,0,0);break;
+        case WM_DESTROY:KillTimer(window,104);p->flight.active=false;KillTimer(window,103);KillTimer(window,101);KillTimer(window,102);p->zoom_animating=false;p->moving=p->selecting=false;p->selection={};return 0;
+        case WM_NCDESTROY:if(p->hung&&p->manager->line_)p->manager->line_->Remove(p->id);p->hung=false;if(p->tools)DestroyWindow(p->tools);if(p->tr.job&&p->manager->translator_)p->manager->translator_->Cancel(p->tr.job);p->tr.job=0;p->tr.image.reset();p->manager->service_.Cancel(p->id);p->window=nullptr;if(!p->manager->preserving_session_&&!p->manager->restoring_session_){p->manager->SessionChanged();p->manager->FlushSession();}p->image.reset();p->ocr_image.reset();p->text={};p->target.Reset();p->bitmap.Reset();SetWindowLongPtrW(window,GWLP_USERDATA,0);PostMessageW(p->manager->host_,kOcrReady,0,0);break;
         }
     }catch(const std::exception& e){ui::ShowThemedMessage(window,p->manager->dark_theme&&p->manager->dark_theme(),L"LumaShot",ocr::ErrorMessage(e));}
     return DefWindowProcW(window,message,wp,lp);
@@ -479,7 +615,8 @@ void PinManager::StartOrWait(Pin& p){
         return;
     }
     if(!ocr::Available()){p.tr.state=State::Failed;p.tr.error=L"文字识别组件不可用，无法翻译";UpdatePanel(p);return;}
-    if(!p.ocr_enabled||p.recognizing){if(!p.ocr_enabled)Recognize(p);p.tr.state=State::WaitingOcr;UpdatePanel(p);return;}
+    // Offline engine: load the model while OCR runs instead of after it.
+    if(!p.ocr_enabled||p.recognizing){translate::Prewarm(config);if(!p.ocr_enabled)Recognize(p);p.tr.state=State::WaitingOcr;UpdatePanel(p);return;}
     StartTranslation(p);
 }
 void PinManager::StartTranslation(Pin& p){
@@ -513,6 +650,25 @@ void PinManager::TranslationReady(uint64_t job){
     try{p.tr.image=std::make_shared<Frame>(pin_translation::Render(*p.image,p.tr.blocks,p.tr.results,p.tr.target));}
     catch(const std::exception& e){p.tr.image.reset();p.tr.state=State::Failed;p.tr.error=L"译文渲染失败："+ocr::ErrorMessage(e);UpdatePanel(p);return;}
     p.tr.state=State::Done;ShowTranslation(p,!translate_auto_show||translate_auto_show());
+}
+void PinManager::ClotheslineConfigChanged(){
+    if(!line_)return;
+    const bool on=LineOn();
+    // Off: the rope sends every hung pin home through RetrievePin (one flight
+    // each) and folds away; drags near the top edge and H no longer hang.
+    line_->SetEnabled(on);
+    for(auto& [id,pin]:pins_){
+        auto& p=*pin;
+        if(!on&&p.hung&&!line_->Contains(id)&&p.window){
+            // Not on the rope any more (should not happen): show it at home.
+            p.hung=false;p.from_line=false;p.alpha=255;
+            SetWindowPos(p.window,HWND_TOPMOST,p.hang_origin.x,p.hang_origin.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        }
+        if(p.hang_tool==on)continue;
+        p.hang_tool=on;if(!on&&p.tool_hover==0)p.tool_hover=-1;if(!on&&p.tool_down==0)p.tool_down=-1;
+        if(p.window&&!p.hung)Paint(p);
+    }
+    if(on&&!pins_.empty())line_->Arm();
 }
 void PinManager::TranslationConfigChanged(){
     using State=TranslationView::State;
@@ -568,6 +724,165 @@ void PinManager::PlacePanel(Pin& p){
     const LONG left=origin.x+p.paper.shadow+LONG(p.offset.x),top=origin.y+p.paper.shadow+LONG(p.offset.y);
     p.tr.panel->Place({left,top,left+p.paper.width,top+p.paper.height});
 }
+void PinManager::HangPin(Pin& p,bool keep_home){
+    if(!LineOn()||p.hung||p.editing||!p.window||!IsWindowVisible(p.window))return;
+    KillTimer(p.window,101);p.zoom_animating=false;p.zoom_goal=p.zoom;p.moving=p.selecting=false;p.flight.active=false;
+    if(GetCapture()==p.window)ReleaseCapture();
+    RECT r{};GetWindowRect(p.window,&r);
+    const float left=float(r.left)+float(p.Inset())+p.offset.x,top=float(r.top)+float(p.Inset())+p.offset.y;
+    const RECT from{LONG(std::lround(left)),LONG(std::lround(top)),LONG(std::lround(left+float(p.image->Width())*p.zoom)),LONG(std::lround(top+float(p.image->Height())*p.zoom))};
+    if(!keep_home)p.hang_origin={r.left,r.top};
+    p.hung=true;p.from_line=false;p.alpha=255;p.selection={};
+    KillTimer(p.window,105);p.hovered=p.tracking=false;p.tool_hover=p.tool_down=-1;p.tool_alpha=0;p.tool_tick=0;
+    if(p.tools)ShowWindow(p.tools,SW_HIDE);
+    if(p.tr.panel)p.tr.panel->Hide();
+    ShowWindow(p.window,SW_HIDE);p.ReleaseSurface();
+    line_->Hang(p.id,p.Shown(),from);
+    SessionChanged();
 }
-
-
+void PinManager::UpdateHoverTools(Pin& p){
+    if(!p.window)return;
+    const float goal=p.ToolsWanted()?1.f:0.f;
+    if(goal==p.tool_alpha){if(p.tool_tick){KillTimer(p.window,105);p.tool_tick=0;}return;}
+    if(!p.tool_tick){p.tool_tick=GetTickCount64();SetTimer(p.window,105,15,nullptr);}
+}
+// 160 ms fade (prototype: .16s), redrawn through the layered window.
+void PinManager::HoverToolsStep(Pin& p){
+    const auto now=GetTickCount64();const float step=float(now-p.tool_tick)/160.f;p.tool_tick=now;
+    const float goal=p.ToolsWanted()?1.f:0.f;
+    p.tool_alpha=goal>p.tool_alpha?std::min(goal,p.tool_alpha+step):std::max(goal,p.tool_alpha-step);
+    if(p.tool_alpha==goal){KillTimer(p.window,105);p.tool_tick=0;}
+    PaintTools(p);
+}
+// Close button: fade the pin out over about 140 ms, then destroy it.
+void PinManager::FadeClose(Pin& p){
+    if(p.closing||!p.window)return;
+    p.closing=true;p.tool_hover=-1;KillTimer(p.window,105);p.tool_tick=0;
+    if(p.tools)ShowWindow(p.tools,SW_HIDE);
+    if(p.tr.panel)p.tr.panel->Hide();
+    SetTimer(p.window,106,15,nullptr);
+}
+bool PinManager::DropOnLine(Pin& p){
+    if(!LineOn())return false;
+    POINT cursor{};GetCursorPos(&cursor);
+    if(!line_->DragDrop(p.id,p.Shown(),cursor)){EndLineDrag(p);return false;}
+    // A pin pulled off the rope keeps its original home; otherwise home is where this drag began.
+    if(!p.from_line)p.hang_origin=p.origin;
+    p.from_line=false;p.moving=p.selecting=false;p.hung=true;p.alpha=255;p.selection={};
+    if(GetCapture()==p.window)ReleaseCapture();
+    if(p.tools)ShowWindow(p.tools,SW_HIDE);
+    if(p.tr.panel)p.tr.panel->Hide();
+    // Park the hidden window at home: the session keeps that position.
+    SetWindowPos(p.window,nullptr,p.hang_origin.x,p.hang_origin.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_HIDEWINDOW);p.ReleaseSurface();
+    SessionChanged();
+    return true;
+}
+void PinManager::EndLineDrag(Pin& p){
+    if(line_)line_->DragEnd();
+    p.from_line=false;
+    if(p.alpha!=255){p.alpha=255;if(p.window&&!p.hung)Paint(p);}
+}
+void PinManager::RetrievePin(uint64_t id,RECT from){
+    auto* p=FindPin(id);if(!p||!p->hung)return;
+    p->hung=false;p->from_line=false;p->alpha=255;
+    const float goal=p->zoom;
+    const float start=std::clamp(float(from.right-from.left)/float(std::max(1,p->image->Width())),0.02f,std::max(0.02f,goal));
+    const auto layout=MakePaperLayout(std::max(1,int(std::lround(float(p->image->Width())*goal))),std::max(1,int(std::lround(float(p->image->Height())*goal))),p->dpi,p->style);
+    p->flight={true,GetTickCount64(),start,goal,{float(from.left),float(from.top)},
+        {float(p->hang_origin.x+layout.inset+layout.shadow),float(p->hang_origin.y+layout.inset+layout.shadow)}};
+    FlyStep(*p);
+    ShowWindow(p->window,SW_SHOWNOACTIVATE);
+    SetWindowPos(p->window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    if(p->flight.active&&!SetTimer(p->window,104,15,nullptr)){p->flight.start=0;FlyStep(*p);}
+}
+void PinManager::FlyStep(Pin& p){
+    auto& f=p.flight;
+    if(!f.active||!p.window){KillTimer(p.window,104);return;}
+    const float t=std::clamp(float(GetTickCount64()-f.start)/320.f,0.f,1.f),e=1-std::pow(1-t,3.f);
+    // Slight overshoot on position so the pin lands instead of stopping dead.
+    const float c=1.4f,back=1+(c+1)*std::pow(t-1,3.f)+c*std::pow(t-1,2.f);
+    p.zoom=p.zoom_from=p.zoom_goal=f.from_zoom+(f.to_zoom-f.from_zoom)*e;
+    if(t>=1){
+        f.active=false;KillTimer(p.window,104);p.zoom=p.zoom_from=p.zoom_goal=f.to_zoom;
+        ApplyPaper(p,{float(p.hang_origin.x),float(p.hang_origin.y)});SessionChanged();return;
+    }
+    const auto layout=MakePaperLayout(std::max(1,int(std::lround(float(p.image->Width())*p.zoom))),std::max(1,int(std::lround(float(p.image->Height())*p.zoom))),p.dpi,p.style);
+    ApplyPaper(p,{f.from.x+(f.to.x-f.from.x)*back-float(layout.inset+layout.shadow),f.from.y+(f.to.y-f.from.y)*back-float(layout.inset+layout.shadow)});
+}
+void PinManager::DetachPin(uint64_t id,POINT cursor){
+    auto* p=FindPin(id);if(!p||!p->hung)return;
+    p->hung=false;p->from_line=true;p->flight.active=false;p->alpha=150;
+    const float w=float(p->image->Width())*p->zoom,h=float(p->image->Height())*p->zoom;
+    const auto layout=MakePaperLayout(std::max(1,int(std::lround(w))),std::max(1,int(std::lround(h))),p->dpi,p->style);
+    // Held near the top edge, as if by the clothespin.
+    ApplyPaper(*p,{float(cursor.x)-w*.5f-float(layout.inset+layout.shadow),float(cursor.y)-std::min(h*.06f,24.f*p->dpi/96)-float(layout.inset+layout.shadow)});
+    ShowWindow(p->window,SW_SHOWNOACTIVATE);
+    SetWindowPos(p->window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    RECT r{};GetWindowRect(p->window,&r);
+    p->moving=p->dragged=true;p->selecting=false;p->drag=cursor;p->origin={r.left,r.top};
+    SetCapture(p->window);
+    if(line_)line_->DragUpdate(cursor,{p->image->Width(),p->image->Height()});
+    // Without Shift the card is dragged into other programs (Shift: place it as a pin, as before).
+    const int button=GetSystemMetrics(SM_SWAPBUTTON)?VK_RBUTTON:VK_LBUTTON;
+    if(!(GetKeyState(VK_SHIFT)&0x8000)&&(GetAsyncKeyState(button)&0x8000))PostMessageW(p->window,kDragOutMessage,0,0);
+}
+void PinManager::DragOut(Pin& p){
+    if(!p.window||!p.image||p.out_drag)return;
+    const uint64_t id=p.id;const bool from_line=p.from_line;const POINT home=p.origin;
+    POINT cursor{};GetCursorPos(&cursor);RECT r{};GetWindowRect(p.window,&r);
+    const POINT grab{cursor.x-r.left,cursor.y-r.top};
+    // The window keeps following the cursor but must not hide the program
+    // under it from the drop: a layered + transparent window is skipped by hit testing.
+    p.out_drag=true;p.moving=false;
+    if(GetCapture()==p.window)ReleaseCapture();
+    const LONG_PTR style=GetWindowLongPtrW(p.window,GWL_EXSTYLE);
+    SetWindowLongPtrW(p.window,GWL_EXSTYLE,style|WS_EX_TRANSPARENT);
+    UpdateHoverTools(p);
+    DragOutOptions options;
+    options.image=[image=p.Shown(),marks=p.marks]()->std::shared_ptr<const Frame>{
+        if(marks.empty())return image;
+        return std::make_shared<const Frame>(FlattenTextMarks(*image,marks));
+    };
+    options.file_format=clipboard_format?clipboard_format():-1;
+    options.moved=[this,id,grab](POINT pt,bool over_target){
+        auto* q=FindPin(id);if(!q||!q->window)return;
+        SetWindowPos(q->window,nullptr,pt.x-grab.x,pt.y-grab.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+        // Over a program that takes the picture the pin turns into a faint
+        // ghost so the input box stays visible; near the top it previews the rope slot.
+        const bool slot=LineOn()&&line_->DragUpdate(pt,{q->image->Width(),q->image->Height()});
+        const BYTE alpha=over_target?BYTE(110):slot?BYTE(150):BYTE(255);
+        if(alpha!=q->alpha){q->alpha=alpha;Paint(*q);}
+    };
+    const auto result=DragImageOut(std::move(options));
+    auto* q=FindPin(id);if(!q||!q->window)return;  // closed during the drag
+    SetWindowLongPtrW(q->window,GWL_EXSTYLE,style);
+    q->out_drag=false;
+    const auto restore=[&]{  // back to where the drag started, fully opaque
+        if(line_)line_->DragEnd();
+        q->from_line=false;q->alpha=255;
+        SetWindowPos(q->window,nullptr,home.x,home.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+        Paint(*q);UpdateTools(*q);SessionChanged();
+    };
+    switch(result){
+    case DragOutResult::Dropped:
+    case DragOutResult::Canceled:
+        // A card from the rope goes back up (its home is unchanged); a pin returns to where it was.
+        if(from_line&&LineOn()){if(line_)line_->DragEnd();q->alpha=255;HangPin(*q,true);}
+        else restore();
+        return;
+    case DragOutResult::Failed:
+        // No OLE drag possible: continue as an ordinary move while the button is held.
+        if(GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON)?VK_RBUTTON:VK_LBUTTON)&0x8000){
+            GetCursorPos(&cursor);GetWindowRect(q->window,&r);
+            q->moving=q->dragged=true;q->drag=cursor;q->origin={r.left,r.top};SetCapture(q->window);return;
+        }
+        [[fallthrough]];
+    case DragOutResult::NoTarget:
+        // Released where nothing takes the picture: the usual drop (rope slot, or the pin stays here).
+        q->moving=q->dragged=true;
+        if(DropOnLine(*q))return;
+        EndLineDrag(*q);q->moving=false;UpdateTools(*q);SessionChanged();InvalidateRect(q->window,nullptr,FALSE);
+        return;
+    }
+}
+}

@@ -3,6 +3,7 @@
 #include "ui/shortcut_label.h"
 #include "clipboard/composition.h"
 #include "clipboard/native.h"
+#include "model/text_cleanup.h"
 #include "clipboard/file_icons.h"
 #include "clipboard/session_store.h"
 #include "clipboard/layout.h"
@@ -38,9 +39,10 @@ static unsigned fixture_writes{};
 static DWORD fixture_activation_error{};
 static HWND fixture_target{};
 namespace lumashot::clipboard {
-static bool FixtureWrite(HWND owner,const Entry& entry,bool plain=false){
-    fixture_plain=plain;++fixture_writes;
-    COPYDATASTRUCT data{};data.cbData=static_cast<DWORD>((entry.text.size()+1)*sizeof(wchar_t));data.lpData=const_cast<wchar_t*>(entry.text.c_str());DWORD_PTR result{};
+static bool FixtureWrite(HWND owner,const Entry& entry,bool plain=false,bool remove_whitespace=false){
+    fixture_plain=plain||remove_whitespace;++fixture_writes;
+    const auto text=remove_whitespace?RemoveTextWhitespace(entry.text):entry.text;
+    COPYDATASTRUCT data{};data.cbData=static_cast<DWORD>((text.size()+1)*sizeof(wchar_t));data.lpData=const_cast<wchar_t*>(text.c_str());DWORD_PTR result{};
     return SendMessageTimeoutW(fixture_target,WM_COPYDATA,reinterpret_cast<WPARAM>(owner),reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG,500,&result)&&result;
 }
 }

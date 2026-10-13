@@ -19,4 +19,9 @@ Microsoft::WRL::ComPtr<ID2D1RenderTarget> CreateMemoryRenderTarget(
 // `target` without uploading pixels again. On failure the bitmap is released
 // (callers re-create it from their source) and false is returned.
 bool ShareBitmap(ID2D1RenderTarget* target, Microsoft::WRL::ComPtr<ID2D1Bitmap>& bitmap);
+// A memory target whose width or height is odd pays a cost that scales with
+// the whole surface on every draw, clipped or not (3840x2160: full frame
+// 4.3 ms, at 3839 or 2159 px 20-28 ms; a clipped clear 0.4 ms vs 16-18 ms).
+// Size the buffer and target with this and present only the real size.
+constexpr int EvenSurfaceSize(int size) { return size + (size & 1); }
 }

@@ -40,13 +40,18 @@ private:
     friend struct CapturePinTest;
     friend struct LongAnnotateTest;
     friend struct ToolbarMotionTest;
+    friend struct QuickCaptureTest;
     struct View { Application* app{}; RECT bounds{}; HWND window{}; std::unique_ptr<Renderer> renderer; bool needs_paint{}; };
-    struct Result { std::unique_ptr<ClipboardImage> clipboard_image; Frame frame, acrylic, cursor_patch, ocr_frame;std::optional<Frame> annotation_base;Document annotations; std::wstring error; bool capture{}, saved{}, pinned{}, recognize{}; uint64_t generation{},editing{};bool edit_copy{}; };
+    struct Result { std::unique_ptr<ClipboardImage> clipboard_image; Frame frame, acrylic, cursor_patch, ocr_frame;std::optional<Frame> annotation_base;Document annotations; std::wstring error; bool capture{}, saved{}, pinned{}, recognize{},quick_text{}; uint64_t generation{},editing{};bool edit_copy{}; };
     static LRESULT CALLBACK MainProc(HWND,UINT,WPARAM,LPARAM);
     static LRESULT CALLBACK OverlayProc(HWND,UINT,WPARAM,LPARAM);
     static LRESULT CALLBACK EditProc(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
     static LRESULT CALLBACK TextHostProc(HWND,UINT,WPARAM,LPARAM);
     void Start();
+    bool FinishQuickSelection();
+    void QuickOcrReady();
+    void ApplyOcrCompletion(ocr::Completion);
+    void Wheel(Point,int);
     DWORD WaitForWork(std::span<const HANDLE> extra = {});
     bool AnnotatePin(uint64_t,std::shared_ptr<const Frame>,Document,RECT);
     bool AnnotateImage(std::shared_ptr<const Frame>,Document,RECT,longshot::Host::AnnotateDone);
@@ -187,6 +192,11 @@ private:
     std::shared_ptr<const Frame> pin_edit_source_;RECT pin_edit_bounds_{};bool pin_edit_copy_{};
     // Screenshot translation: request (hotkey) → capture session flag → pin to translate.
     bool translate_request_{},translate_capture_{},translate_next_{};
+    enum class QuickCapture { None, Text, Pin };
+    QuickCapture quick_request_{},quick_capture_{};
+    std::unique_ptr<ocr::Service> quick_ocr_;
+    bool quick_ocr_pending_{},quick_remove_whitespace_{};
+    std::function<void(HWND,const std::wstring&)> publish_ocr_text_{CopyText};
     // Reserved pin_edit_id_ for a long-image annotation session (pin ids count up from 1).
     static constexpr uint64_t kImageEditId=~uint64_t{};
     longshot::Host::AnnotateDone image_edit_done_;int image_edit_follow_{};
@@ -203,7 +213,5 @@ private:
     UINT taskbar_created_{};
 };
 }
-
-
 
 

@@ -7,7 +7,8 @@
 #include <map>
 namespace lumashot {
 struct PinSessionRecord {
-    uint64_t id{},revision{1},storage_nonce{};Point origin{};float zoom{1};PinStyle style{DefaultPinStyle};bool locked{},recognize{};
+    // hung: on the clothesline (window hidden); origin is where it flies back to.
+    uint64_t id{},revision{1},storage_nonce{};Point origin{};float zoom{1};PinStyle style{DefaultPinStyle};bool locked{},recognize{},hung{};
     std::shared_ptr<const Frame> image,ocr_image,base;
     std::vector<Mark> annotations;std::vector<SelectionMark> decorations;
 };

@@ -1,6 +1,7 @@
 #pragma once
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -37,5 +38,18 @@ struct Limits {
 
 // Hosts that may use plain http: localhost, 127/8, ::1, 10/8, 172.16/12, 192.168/16, 169.254/16.
 bool PrivateHost(std::wstring_view host);
+// Serial, job-scoped client. Reuses the WinHTTP connection pool across chunks;
+// releases all network resources when the job ends. Do not share across threads.
+class Client {
+public:
+    Client();
+    ~Client();
+    Client(const Client&) = delete;
+    Client& operator=(const Client&) = delete;
+    Response Send(const Request& request, std::stop_token stop, const Limits& limits = {});
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 Response Send(const Request& request, std::stop_token stop, const Limits& limits = {});
 }
