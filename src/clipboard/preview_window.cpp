@@ -5,6 +5,7 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <utility>
 
 namespace lumashot::clipboard {
@@ -116,11 +117,12 @@ LRESULT CALLBACK PreviewWindow::Proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             if(x>=width-200&&x<=width-48&&y>=40&&y<400){p->language_=static_cast<CodeLanguage>(static_cast<int>((y-40)/30));p->RequestHighlight();}
             p->language_menu_=false;p->Invalidate();return 0;
         }
-        if(p->kind_==Kind::Text&&y<40&&x>=width-200&&x<width-48){p->language_menu_=true;p->Invalidate();return 0;}
-        if(y<40&&x>width-44){p->Hide();return 0;}
+        if(p->kind_==Kind::Text&&p->flavor_!=Flavor::Link&&p->flavor_!=Flavor::Color&&y<HeaderHeight&&x>=width-206&&x<width-80){p->language_menu_=true;p->Invalidate();return 0;}
+        if(y<HeaderHeight&&x>width-80){p->Hide();return 0;}   // 空格 关闭
+        if(p->kind_==Kind::Image&&p->ocr_action_&&p->ocr_available_&&!p->ocr_pending_&&x>=p->ocr_link_.left&&x<p->ocr_link_.right&&y>=p->ocr_link_.top&&y<p->ocr_link_.bottom){p->ocr_action_();return 0;}
         if(y>height-36&&x>width-100){p->CopyText();return 0;}
         if(p->text_layout_&&y>=p->text_box_.top&&y<p->text_box_.bottom){SetFocus(w);p->selection_end_=p->HitText(x,y);if(!(GetKeyState(VK_SHIFT)&0x8000))p->selection_anchor_=p->selection_end_;p->selecting_=true;SetCapture(w);p->Invalidate();return 0;}
-        if(y<40){SendMessageW(w,WM_NCLBUTTONDOWN,HTCAPTION,lp);return 0;}return 0;
+        if(y<HeaderHeight){SendMessageW(w,WM_NCLBUTTONDOWN,HTCAPTION,lp);return 0;}return 0;
     }
     case WM_MOUSEMOVE:if(p->selecting_){const float y=GET_Y_LPARAM(lp)/p->scale_;if(y<p->text_box_.top)p->text_scroll_=std::max(0.f,p->text_scroll_-18);if(y>p->text_box_.bottom)p->text_scroll_=std::min(p->text_scroll_max_,p->text_scroll_+18);p->selection_end_=p->HitText(GET_X_LPARAM(lp)/p->scale_,std::clamp(y,p->text_box_.top,p->text_box_.bottom));p->Invalidate();}return 0;
     case WM_LBUTTONUP:p->selecting_=false;if(GetCapture()==w)ReleaseCapture();return 0;
@@ -141,14 +143,20 @@ void PreviewWindow::Layout(RECT panel_rect, float scale) {
     MONITORINFO monitor{sizeof(monitor)};
     GetMonitorInfoW(MonitorFromRect(&panel_rect, MONITOR_DEFAULTTONEAREST), &monitor);
     const RECT work = monitor.rcWork;
-    int preview_w = std::max(1, std::min(static_cast<int>(540 * scale_), static_cast<int>(work.right - work.left - 8)));
-    int preview_h = std::max(1, std::min(static_cast<int>(460 * scale_), static_cast<int>(work.bottom - work.top - 8)));
-    if(content_.image){
+    const float natural_h=flavor_==Flavor::Link?190.f:flavor_==Flavor::Color?300.f:460.f;
+    int preview_w = std::max(1, std::min(static_cast<int>(440 * scale_), static_cast<int>(work.right - work.left - 8)));
+    int preview_h = std::max(1, std::min(static_cast<int>(natural_h * scale_), static_cast<int>(work.bottom - work.top - 8)));
+    // Switching images keeps the open window's size until the new decode lands: no shrink /
+    // grow flash and no render-target rebuild for the interim thumbnail or loading state.
+    if(kind_==Kind::Image&&(loading_||content_.interim)&&window_&&IsWindowVisible(window_)){
+        RECT now{};GetWindowRect(window_,&now);
+        if(now.right>now.left&&now.bottom>now.top){preview_w=now.right-now.left;preview_h=now.bottom-now.top;}
+    }else if(content_.image){
         const float max_w=std::max(1.f,std::min(800.f*scale_,float(work.right-work.left-40))-32*scale_);
-        const float max_h=std::max(1.f,std::min(720.f*scale_,float(work.bottom-work.top-40))-84*scale_);
+        const float max_h=std::max(1.f,std::min(720.f*scale_,float(work.bottom-work.top-40))-132*scale_);
         const float factor=std::min({scale_,max_w/content_.image->Width(),max_h/content_.image->Height()});
-        preview_w=static_cast<int>(std::min(float(work.right-work.left-8),std::max(240*scale_,content_.image->Width()*factor+32*scale_)));
-        preview_h=static_cast<int>(std::min(float(work.bottom-work.top-8),std::max(160*scale_,content_.image->Height()*factor+84*scale_)));
+        preview_w=static_cast<int>(std::min(float(work.right-work.left-8),std::max(440*scale_,content_.image->Width()*factor+32*scale_)));
+        preview_h=static_cast<int>(std::min(float(work.bottom-work.top-8),std::max(160*scale_,content_.image->Height()*factor+132*scale_)));
     }
 
     int x = panel_rect.left - preview_w - static_cast<int>(14 * scale_);
@@ -168,7 +176,8 @@ void PreviewWindow::Show(HWND owner, const Entry& entry, RECT panel_rect, bool d
     idle_release_pending_=false;
     if(window_)KillTimer(window_,IdleTimer);
     const bool update_backdrop=!window_||dark_!=dark;
-    if(current_id_!=entry.id)language_=CodeLanguage::Auto;language_menu_=false;
+    if(current_id_!=entry.id){language_=CodeLanguage::Auto;ocr_text_.clear();ocr_available_=ocr_pending_=false;natural_={};}language_menu_=false;
+    flavor_=FlavorOf(entry);time_=entry.time;
     owner_ = owner;panel_rect_=panel_rect;selection_anchor_=selection_end_=0;selecting_=false;
     dark_ = dark;
     scale_ = scale;
@@ -209,6 +218,15 @@ void PreviewWindow::Show(HWND owner, const Entry& entry, RECT panel_rect, bool d
     ShowWindow(window_, SW_SHOWNOACTIVATE);
 }
 
+void PreviewWindow::SetImageDetails(uint64_t id,SIZE natural,std::wstring ocr_text,bool ocr_available,bool ocr_pending){
+    if(current_id_!=id)return;
+    natural_=natural;ocr_text_=std::move(ocr_text);ocr_available_=ocr_available;ocr_pending_=ocr_pending;Invalidate();
+}
+float PreviewWindow::TextWidth(const std::wstring& text,IDWriteTextFormat* format){
+    ComPtr<IDWriteTextLayout> layout;DWRITE_TEXT_METRICS metrics{};
+    if(!writer_||!format||FAILED(writer_->CreateTextLayout(text.data(),static_cast<UINT32>(text.size()),format,4096.f,64.f,&layout))||FAILED(layout->GetMetrics(&metrics)))return 0.f;
+    return metrics.widthIncludingTrailingWhitespace;
+}
 void PreviewWindow::SetContent(uint64_t id, PreviewData data) {
     if (!IsOpen() || current_id_ != id) return;
     content_ = std::move(data);text_scroll_=text_scroll_max_=0;
@@ -331,13 +349,41 @@ void PreviewWindow::Render() {
                                   DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.5f, L"en-US", &body_font_);
     }
 
-    std::wstring title=kind_==Kind::Image?L"图片预览":kind_==Kind::Files?L"文件列表":highlight_.language!=CodeLanguage::Plain?L"代码预览":L"文本预览";
-    brush_->SetColor(D2D1::ColorF(ink));
-    DrawText(title.data(),static_cast<UINT32>(title.size()),title_font_.Get(),{20,8,W-50,36},brush_.Get());
-    brush_->SetColor(D2D1::ColorF(sub));
-    target_->DrawLine({W-29,16},{W-19,26},brush_.Get(),1.2f);target_->DrawLine({W-19,16},{W-29,26},brush_.Get(),1.2f);
-    if(kind_==Kind::Text){const std::wstring label=language_==CodeLanguage::Auto?std::wstring(L"自动 · ")+LanguageName(highlight_.language):LanguageName(language_);DrawText(label.data(),static_cast<UINT32>(label.size()),meta_font_.Get(),{W-194,8,W-58,36},brush_.Get());target_->DrawLine({W-64,19},{W-60,23},brush_.Get());target_->DrawLine({W-60,23},{W-56,19},brush_.Get());}
-    const D2D1_RECT_F body_rect{16,44,W-16,H-40};
+    if(!icon_font_){writer_->CreateTextFormat(L"Segoe MDL2 Assets",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,15.f,L"en-US",&icon_font_);
+        if(icon_font_){icon_font_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);icon_font_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);}}
+    if(!kbd_font_){writer_->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,10.5f,L"zh-CN",&kbd_font_);
+        if(kbd_font_){kbd_font_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);kbd_font_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);}}
+    if(!line_font_){writer_->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,11.5f,L"zh-CN",&line_font_);
+        if(line_font_){line_font_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);line_font_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            ComPtr<IDWriteInlineObject> ellipsis;const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};
+            if(SUCCEEDED(writer_->CreateEllipsisTrimmingSign(line_font_.Get(),&ellipsis)))line_font_->SetTrimming(&trimming,ellipsis.Get());}}
+    if(!prose_font_){writer_->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,14.f,L"zh-CN",&prose_font_);
+        if(prose_font_)prose_font_->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,14.f*1.7f,14.f*1.7f*.78f);   // #ql .qt: 14px / 1.7
+        if(body_font_)body_font_->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,12.5f*1.6f,12.5f*1.6f*.78f);}   // #ql pre: 12.5px / 1.6
+    const UINT32 accent=0x1a7cff,edge=dark_?0xffffff:0x0a192e;const float edge_a=dark_?.10f:.09f;
+    // .qh (full.html #ql): type icon, type name, time · detail, 空格 关闭.
+    {
+        static constexpr wchar_t glyphs[]{L'\xE8D2',L'\xE943',L'\xE71B',L'\xE790',L'\xE8B9',L'\xE8A5'};
+        const wchar_t glyph[2]{glyphs[std::min<size_t>(static_cast<size_t>(flavor_),5)],0};
+        brush_->SetColor(D2D1::ColorF(accent));DrawText(glyph,1,icon_font_.Get(),{12,HeaderHeight/2-10,32,HeaderHeight/2+10},brush_.Get());
+        const std::wstring name=FlavorName(flavor_);brush_->SetColor(D2D1::ColorF(ink));
+        const float name_w=TextWidth(name,title_font_.Get());DrawText(name.data(),static_cast<UINT32>(name.size()),title_font_.Get(),{40,0,40+name_w+2,HeaderHeight},brush_.Get());
+        wchar_t clock[16]{};swprintf_s(clock,L"%02u:%02u",time_.wHour,time_.wMinute);
+        std::wstring meta=L"· ";meta+=clock;
+        if(kind_==Kind::Image&&natural_.cx>0)meta+=L" · "+std::to_wstring(natural_.cx)+L" × "+std::to_wstring(natural_.cy);
+        else if(kind_==Kind::Files&&content_.file_count)meta+=L" · "+std::to_wstring(content_.file_count)+L" 个文件";
+        else if(kind_==Kind::Text&&!content_.text.empty())meta+=L" · "+std::to_wstring(content_.text.size())+L" 字";
+        const bool language=kind_==Kind::Text&&flavor_!=Flavor::Link&&flavor_!=Flavor::Color;
+        brush_->SetColor(D2D1::ColorF(sub));DrawText(meta.data(),static_cast<UINT32>(meta.size()),line_font_.Get(),{46+name_w,0,language?W-210:W-84,HeaderHeight},brush_.Get());
+        const std::wstring kbd=L"空格 关闭";const float kw=TextWidth(kbd,kbd_font_.Get())+14;const D2D1_RECT_F kr{W-12-kw,HeaderHeight/2-10,W-12,HeaderHeight/2+10};
+        brush_->SetColor(D2D1::ColorF(edge,edge_a*1.6f));target_->DrawRoundedRectangle(D2D1::RoundedRect({kr.left+.5f,kr.top+.5f,kr.right-.5f,kr.bottom-.5f},5,5),brush_.Get(),1.f);
+        brush_->SetColor(D2D1::ColorF(sub));DrawText(kbd.data(),static_cast<UINT32>(kbd.size()),kbd_font_.Get(),kr,brush_.Get());
+        if(language){const std::wstring label=language_==CodeLanguage::Auto?std::wstring(L"自动 · ")+LanguageName(highlight_.language):LanguageName(language_);
+            const float lw=std::min(110.f,TextWidth(label,meta_font_.Get())+2);DrawText(label.data(),static_cast<UINT32>(label.size()),meta_font_.Get(),{kr.left-22-lw,0,kr.left-22,HeaderHeight},brush_.Get());
+            target_->DrawLine({kr.left-17,HeaderHeight/2-2},{kr.left-13,HeaderHeight/2+2},brush_.Get());target_->DrawLine({kr.left-13,HeaderHeight/2+2},{kr.left-9,HeaderHeight/2-2},brush_.Get());}
+        brush_->SetColor(D2D1::ColorF(edge,edge_a));target_->DrawLine({0,HeaderHeight-.5f},{W,HeaderHeight-.5f},brush_.Get(),1.f);
+    }
+    const D2D1_RECT_F body_rect{12,HeaderHeight+12,W-12,H-FooterHeight};
 
     if (loading_ || !content_.error.empty()) {
         const std::wstring message = loading_ ? L"正在加载预览…" : content_.error;
@@ -353,28 +399,59 @@ void PreviewWindow::Render() {
                 frame.Width() * 4, props, &image_bitmap_);
         }
         if (image_bitmap_) {
+            // #ql .qb img: centred, radius 8, soft shadow; the OCR area sits below it.
+            const bool has_ocr=!ocr_text_.empty();const float info_h=has_ocr?4*19.2f+6:(ocr_available_||ocr_pending_)?24.f:0.f;
+            const D2D1_RECT_F box{body_rect.left,body_rect.top,body_rect.right,std::max(body_rect.top+40,body_rect.bottom-info_h-(info_h>0?10.f:0.f))};
             const auto size = image_bitmap_->GetSize();
-            const float max_w = body_rect.right - body_rect.left;
-            const float max_h = body_rect.bottom - body_rect.top;
-            const float factor = std::min(max_w / size.width, max_h / size.height);
+            const float factor = std::min({1.f,(box.right-box.left) / size.width, (box.bottom-box.top) / size.height});   // max-width:100%, never enlarged
             const float draw_w = size.width * factor;
             const float draw_h = size.height * factor;
-            const float cx = (body_rect.left + body_rect.right) / 2.f;
-            const float cy = (body_rect.top + body_rect.bottom) / 2.f;
+            const float cx = (box.left + box.right) / 2.f;
+            const float cy = (box.top + box.bottom) / 2.f;
             const D2D1_RECT_F img_rect{cx - draw_w / 2.f, cy - draw_h / 2.f, cx + draw_w / 2.f, cy + draw_h / 2.f};
+            for(int k=3;k>=1;--k){const float g=static_cast<float>(k)*1.5f;brush_->SetColor(D2D1::ColorF(0x0a192e,dark_?.10f:.035f));target_->FillRoundedRectangle(D2D1::RoundedRect({img_rect.left-g,img_rect.top-g+2,img_rect.right+g,img_rect.bottom+g+2},8+g,8+g),brush_.Get());}
+            ComPtr<ID2D1RoundedRectangleGeometry> clip;ComPtr<ID2D1Layer> layer;
+            const bool rounded=SUCCEEDED(factory_->CreateRoundedRectangleGeometry(D2D1::RoundedRect(img_rect,8,8),&clip))&&SUCCEEDED(target_->CreateLayer(&layer));
+            if(rounded)target_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),clip.Get()),layer.Get());
             target_->DrawBitmap(image_bitmap_.Get(), img_rect, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            if(rounded)target_->PopLayer();
+            ocr_link_={};
+            if(info_h>0){
+                const D2D1_RECT_F info{body_rect.left+2,box.bottom+10,body_rect.right-2,body_rect.bottom};
+                if(has_ocr){const std::wstring text=L"OCR：" + ocr_text_;brush_->SetColor(D2D1::ColorF(sub));DrawText(text.data(),static_cast<UINT32>(text.size()),meta_font_.Get(),info,brush_.Get());}
+                else if(ocr_pending_){const std::wstring text=L"正在识别文字…";brush_->SetColor(D2D1::ColorF(sub));DrawText(text.data(),static_cast<UINT32>(text.size()),meta_font_.Get(),{info.left,info.top,info.right,info.top+20},brush_.Get());}
+                else{const std::wstring text=L"按 O 识别图中文字";const float tw=TextWidth(text,meta_font_.Get())+4;ocr_link_={info.left,info.top,info.left+tw,info.top+20};
+                    brush_->SetColor(D2D1::ColorF(accent));DrawText(text.data(),static_cast<UINT32>(text.size()),meta_font_.Get(),ocr_link_,brush_.Get());}
+            }
         } else {
             brush_->SetColor(D2D1::ColorF(sub));
             std::wstring loading = L"图片显示失败，请关闭后重试";
             DrawText(loading.data(), static_cast<UINT32>(loading.size()), title_font_.Get(), body_rect, brush_.Get());
         }
+    } else if (flavor_==Flavor::Color&&ParseHexColor(content_.text)) {
+        // #ql colour: 160 px swatch, radius 10, value below.
+        const uint32_t rgb=*ParseHexColor(content_.text);const D2D1_RECT_F swatch{body_rect.left,body_rect.top,body_rect.right,std::min(body_rect.bottom-34,body_rect.top+160)};
+        brush_->SetColor(D2D1::ColorF(rgb));target_->FillRoundedRectangle(D2D1::RoundedRect(swatch,10,10),brush_.Get());
+        brush_->SetColor(D2D1::ColorF(edge,edge_a));target_->DrawRoundedRectangle(D2D1::RoundedRect(swatch,10,10),brush_.Get(),1.f);
+        wchar_t hex[8]{};swprintf_s(hex,L"#%06X",rgb&0xffffffu);brush_->SetColor(D2D1::ColorF(ink));DrawText(hex,7,body_font_.Get(),{swatch.left+2,swatch.bottom+10,body_rect.right,swatch.bottom+32},brush_.Get());
+    } else if (flavor_==Flavor::Link) {
+        // #ql link: 54 px initial tile, host as the title, URL below.
+        const std::wstring url=Trimmed(content_.text),host=LinkHost(url);
+        static constexpr UINT32 tiles[]{0x2f6fde,0x7c4dff,0x0f9d58,0xe8710a,0xd93025,0x00838f};
+        uint32_t hash=2166136261u;for(const wchar_t ch:host)hash=(hash^static_cast<uint32_t>(ch))*16777619u;
+        const D2D1_RECT_F tile{body_rect.left,body_rect.top,body_rect.left+54,body_rect.top+54};
+        brush_->SetColor(D2D1::ColorF(tiles[hash%6]));target_->FillRoundedRectangle(D2D1::RoundedRect(tile,12,12),brush_.Get());
+        const wchar_t initial[2]{host.empty()?L'?':static_cast<wchar_t>(std::towupper(host.front())),0};
+        brush_->SetColor(D2D1::ColorF(0xffffff));title_font_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);DrawText(initial,1,title_font_.Get(),tile,brush_.Get());title_font_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        brush_->SetColor(D2D1::ColorF(ink));DrawText(host.data(),static_cast<UINT32>(host.size()),title_font_.Get(),{tile.right+12,tile.top+4,body_rect.right,tile.top+26},brush_.Get());
+        brush_->SetColor(D2D1::ColorF(accent));DrawText(url.data(),static_cast<UINT32>(std::min<size_t>(url.size(),2048)),meta_font_.Get(),{tile.right+12,tile.top+28,body_rect.right,body_rect.bottom},brush_.Get());
     } else {
         const auto& full_text = content_.text;
         brush_->SetColor(D2D1::ColorF(ink));
         const D2D1_RECT_F text_box{body_rect.left + 4, body_rect.top + 4, body_rect.right - 4, body_rect.bottom - 4};text_box_=text_box;
         if (!text_layout_ && writer_ && body_font_) {
             writer_->CreateTextLayout(full_text.data(), static_cast<UINT32>(std::min(full_text.size(), (kind_==Kind::Files?PreviewData::MaxFileChars:PreviewData::MaxTextChars + 1))),
-                                      body_font_.Get(), text_box.right - text_box.left, 2000000.f, &text_layout_);
+                                      (flavor_==Flavor::Code||!prose_font_?body_font_:prose_font_).Get(), text_box.right - text_box.left, 2000000.f, &text_layout_);
         }
         if (text_layout_) {
             DWRITE_TEXT_METRICS metrics{};text_layout_->GetMetrics(&metrics);text_scroll_max_=std::max(0.f,metrics.height-(text_box.bottom-text_box.top));text_scroll_=std::min(text_scroll_,text_scroll_max_);
@@ -389,8 +466,8 @@ void PreviewWindow::Render() {
     }
 
     brush_->SetColor(D2D1::ColorF(sub));
-    const std::wstring hint=content_.truncated?L"空格 / Esc 关闭 · 内容过长，显示前 65536 字符":L"空格 / Esc 关闭";
-    DrawText(hint.data(),static_cast<UINT32>(hint.size()),meta_font_.Get(),{20,H-32,W-120,H-8},brush_.Get());
+    const std::wstring hint=content_.truncated?L"内容过长，显示前 65536 字符":kind_==Kind::Image?L"Esc 关闭 · Ctrl+C 复制":L"Ctrl+A 全选 · Ctrl+C 复制";
+    DrawText(hint.data(),static_cast<UINT32>(hint.size()),meta_font_.Get(),{14,H-30,W-100,H-8},brush_.Get());
     if(copy_action_||!content_.text.empty()){
         const std::wstring copy=selection_anchor_!=selection_end_?L"复制选中":L"复制";
         brush_->SetColor(D2D1::ColorF(0x267aff));DrawText(copy.data(),static_cast<UINT32>(copy.size()),meta_font_.Get(),{W-90,H-32,W-16,H-8},brush_.Get());

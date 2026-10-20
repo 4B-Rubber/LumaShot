@@ -58,7 +58,7 @@ static int Appearance(){
     for(bool dark:{false,true})for(float scale:{1.f,1.5f,2.f}){
         p.Enable(true,dark);p.expanded=true;p.scale=scale;p.Filter();SetWindowPos(p.window,nullptr,0,0,int(p.W*scale),int(p.H*scale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);p.LayoutSearch();p.Render();expect(p.file_icons->WaitIdle(10000),"all sample file icons finish");p.Render();
         const auto pixel=[&](float x,float y){return p.surface->Pixels()[size_t(y*scale)*p.width+size_t(x*scale)];};
-        expect(p.width==int(400*scale),"compact width follows DPI");expect(pixel(18,p.ListTop+30)==0xff689af0&&p.app_icon,"selected card has accent rail and compiled SVG vector branding");
+        expect(p.width==int(400*scale),"compact width follows DPI");expect(pixel(clipboard::cards::ListInset+clipboard::cards::IndexX+2,p.ListTop+clipboard::cards::GroupHeaderHeight+clipboard::cards::IndexY+8)==0xff1a7cff&&p.app_icon,"first card shows its Alt+1 badge and compiled SVG vector branding");
         expect(p.custom_outline?p.surface->Pixels()[0]==p.surface->Pixels()[size_t(690*scale)*p.width+size_t(200*scale)]:p.surface->Pixels()[0]==0,"one outline owner: compositor clips acrylic, opaque fallback clips pixels");
         const auto alpha=pixel(200,690)>>24;expect(p.acrylic?(alpha>0&&alpha<255):alpha==255,"expanded backdrop retains translucency with opaque fallback");
         expect((GetWindowLongPtrW(p.window,GWL_EXSTYLE)&WS_EX_LAYERED)==0,"normal HWND allows system antialiased corners");
@@ -172,7 +172,7 @@ static int Features(){
     p.Fold();expect(!p.summon_cursor&&p.anchor.x==strip_anchor.x&&p.anchor.y==strip_anchor.y,"fold restores unchanged strip anchor");
     p.Show(false);p.StopOpening(true);expect(!p.summon_cursor,"edge strip expansion retains its remembered position");p.Fold();
     p.pinned=true;p.Show();p.StopOpening(true);expect(!p.summon_cursor&&p.anchor.x==strip_anchor.x&&p.anchor.y==strip_anchor.y,"pinned summon keeps original position");p.pinned=false;p.Fold();
-    p.expanded=true;p.Filter();p.Place();p.Render();p.Key(VK_END);const auto old=p.selected;expect(p.scroll==7,"End reveals oldest item");
+    p.expanded=true;p.Filter();p.Place();p.Render();p.Key(VK_END);const auto old=p.selected;expect(p.MaxScroll()>0&&p.scroll==p.MaxScroll(),"End reveals oldest item");
     BYTE cleanup_original[256]{},cleanup_keys[256]{};GetKeyboardState(cleanup_original);
     cleanup_keys[VK_CONTROL]=cleanup_keys[VK_SHIFT]=0x80;SetKeyboardState(cleanup_keys);p.Key(VK_RETURN);
     expect(p.copy_plain&&p.copy_remove_whitespace&&p.last_read_id==old,"Ctrl+Shift+Enter requests whitespace-free plain text from selected record");
@@ -180,7 +180,7 @@ static int Features(){
     expect(p.copy_plain&&!p.copy_remove_whitespace,"Shift+Enter retains plain text without cleanup");
     cleanup_keys[VK_SHIFT]=0;SetKeyboardState(cleanup_keys);p.Key(VK_RETURN);
     expect(!p.copy_plain&&!p.copy_remove_whitespace,"Enter retains rich paste semantics");SetKeyboardState(cleanup_original);
-    const auto click=[&](int action,uint64_t id){p.Render();for(const auto& hit:p.hits)if(hit.action==action&&hit.id==id){const int x=static_cast<int>((hit.rect.left+hit.rect.right)*p.scale/2),y=static_cast<int>((hit.rect.top+hit.rect.bottom)*p.scale/2);SendMessageW(p.window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));SendMessageW(p.window,WM_LBUTTONUP,0,MAKELPARAM(x,y));return;}expect(false,"action has a rendered hit target");};
+    const auto click=[&](int action,uint64_t id){/* S3: .acts render only on the hovered or current card. */if(action>=31&&action<=35&&id!=p.selected){p.Render();for(const auto& row:p.hits)if(row.action==30&&row.id==id){SendMessageW(p.window,WM_MOUSEMOVE,0,MAKELPARAM(static_cast<int>((row.rect.left+row.rect.right)*p.scale/2),static_cast<int>((row.rect.top+row.rect.bottom)*p.scale/2)));break;}}p.Render();for(const auto& hit:p.hits)if(hit.action==action&&hit.id==id){const int x=static_cast<int>((hit.rect.left+hit.rect.right)*p.scale/2),y=static_cast<int>((hit.rect.top+hit.rect.bottom)*p.scale/2);SendMessageW(p.window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));SendMessageW(p.window,WM_LBUTTONUP,0,MAKELPARAM(x,y));return;}expect(false,"action has a rendered hit target");};
     click(31,old);expect(p.history.Find(old)->favorite&&p.visible.front()==old&&p.selected==old&&p.scroll==0,"actual row pin click moves entry to visible top and preserves selection");
     p.history.Add(text(L"新复制的合成内容"));p.Filter();expect(p.visible.front()==old,"new content cannot push pin down");
     p.Action(13,0);expect(p.visible.front()==old,"reverse sorting keeps pin at top");p.Action(13,0);
@@ -193,18 +193,18 @@ static int Features(){
     expect(!p.history.Find(old)->favorite&&p.query==query_before,"search Ctrl+D toggles favorite without entering control text");
     SendMessageW(p.search,WM_KEYDOWN,'D',1);SetKeyboardState(original_keys);p.status.clear();
     for(bool dark:{false,true}){p.dark=dark;p.scale=dark?1.5f:1.f;SetWindowPos(p.window,nullptr,0,0,static_cast<int>(p.W*p.scale),static_cast<int>(p.H*p.scale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);p.Render();auto frame=MakeFrame({0,0,p.width,p.height});std::copy_n(p.surface->Pixels(),frame.pixels.size(),frame.pixels.begin());for(auto& pixel:frame.pixels){const UINT inverse=255-(pixel>>24);const UINT background=dark?0x151b23:0xf5f8fc;UINT out=0xff000000;for(int shift:{0,8,16})out|=std::min(255u,((pixel>>shift)&255)+((((background>>shift)&255)*inverse+127)/255))<<shift;pixel=out;}SavePng(frame,dark?L"build/clipboard-items-pinned-dark.png":L"build/clipboard-items-pinned-light.png");}
-    click(31,old);expect(!p.history.Find(old)->favorite&&p.visible.back()==old&&p.selected==old&&p.scroll==8,"unpin restores age order and keeps acted-on row visible");
-    p.Key(VK_HOME);expect(p.selected==p.visible.front()&&p.scroll==0,"Home reaches first row");p.Key(VK_NEXT);expect(p.selected==p.visible[5],"PageDown advances five rows");p.Key(VK_PRIOR);expect(p.selected==p.visible.front(),"PageUp returns five rows");
+    click(31,old);expect(!p.history.Find(old)->favorite&&p.visible.back()==old&&p.selected==old&&p.scroll==p.MaxScroll(),"unpin restores age order and keeps acted-on row visible");
+    p.Key(VK_HOME);expect(p.selected==p.visible.front()&&p.scroll==0,"Home reaches first row");{const int page=p.PageRows();p.Key(VK_NEXT);expect(page>0&&p.selected==p.visible[static_cast<size_t>(page)],"PageDown advances one fitted page");}p.Key(VK_PRIOR);expect(p.selected==p.visible.front(),"PageUp returns one page");
     SendMessageW(p.window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(static_cast<int>((p.W-8)*p.scale),static_cast<int>((p.ListTop+8)*p.scale)));
     SendMessageW(p.window,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(static_cast<int>((p.W-8)*p.scale),static_cast<int>(682*p.scale)));
     SendMessageW(p.window,WM_LBUTTONUP,0,MAKELPARAM(static_cast<int>((p.W-8)*p.scale),static_cast<int>(682*p.scale)));
-    expect(p.scroll==8&&!p.scroll_drag&&GetCapture()!=p.window,"native scrollbar drag reaches final row and releases capture");
+    expect(p.scroll==p.MaxScroll()&&!p.scroll_drag&&GetCapture()!=p.window,"native scrollbar drag reaches final row and releases capture");
     p.Key(VK_HOME);p.Key(VK_DOWN);const auto deleting=p.selected,next=p.visible[2];p.Action(34,deleting);expect(!p.history.Find(deleting)&&p.selected==next,"delete selects adjacent surviving row");
     p.selected=p.visible.front();p.scroll=4;const auto viewport_top=p.visible[4];const auto offscreen_selected=p.selected;
     click(34,p.visible[6]);expect(p.scroll==4&&p.visible[4]==viewport_top&&p.selected==offscreen_selected,"delete visible unselected row preserves scrolled viewport instead of revealing top selection");
     p.Action(34,offscreen_selected);expect(p.scroll==3&&p.visible[3]==viewport_top,"delete above viewport preserves first visible record");
-    p.scroll=static_cast<int>(p.visible.size())-5;p.selected=p.visible.back();const int old_end=p.scroll;const auto last=p.selected;
-    click(34,last);expect(!p.history.Find(last)&&p.scroll==old_end-1&&p.selected==p.visible.back(),"delete last row only backs up enough to fill viewport");
+    p.scroll=p.MaxScroll();p.selected=p.visible.back();const int old_end=p.scroll;const auto last=p.selected;
+    click(34,last);expect(!p.history.Find(last)&&p.scroll==p.MaxScroll()&&p.scroll<=old_end&&p.selected==p.visible.back(),"delete last row only backs up enough to fill viewport");
     while(!p.visible.empty())p.Action(34,p.visible.back());expect(p.scroll==0&&p.selected==0,"deleting final record leaves valid empty viewport");
     p.paste_target=nullptr;p.paste_inflight=true;p.PasteTick();expect(p.status.find(L"自动粘贴已取消")!=std::wstring::npos,"invalid paste destination cancels before sending input");
     p.CancelReads();p.history.Clear(false);
@@ -226,7 +226,7 @@ static int Groups(){
     auto text=[](const std::wstring& value){clipboard::Entry e;e.text=value;e.kind=clipboard::Kind::Text;const auto* b=reinterpret_cast<const unsigned char*>(value.c_str());e.formats.push_back({CF_UNICODETEXT,{b,b+(value.size()+1)*2}});return e;};
     for(int i=0;i<6;++i)p.history.Add(text(L"合成分组内容 "+std::to_wstring(i)));
     p.expanded=true;p.Filter();p.Place();p.Render();
-    auto center=[&](int action,uint64_t id,LPARAM& out){p.Render();for(const auto& hit:p.hits)if(hit.action==action&&hit.id==id){out=MAKELPARAM(static_cast<int>((hit.rect.left+hit.rect.right)*p.scale/2),static_cast<int>((hit.rect.top+hit.rect.bottom)*p.scale/2));return true;}return false;};
+    auto center=[&](int action,uint64_t id,LPARAM& out){/* S3: .acts render only on the hovered or current card. */if(action>=31&&action<=35&&id!=p.selected){p.Render();for(const auto& row:p.hits)if(row.action==30&&row.id==id){SendMessageW(p.window,WM_MOUSEMOVE,0,MAKELPARAM(static_cast<int>((row.rect.left+row.rect.right)*p.scale/2),static_cast<int>((row.rect.top+row.rect.bottom)*p.scale/2)));break;}}p.Render();for(const auto& hit:p.hits)if(hit.action==action&&hit.id==id){out=MAKELPARAM(static_cast<int>((hit.rect.left+hit.rect.right)*p.scale/2),static_cast<int>((hit.rect.top+hit.rect.bottom)*p.scale/2));return true;}return false;};
     auto click=[&](int action,uint64_t id){LPARAM at{};if(!center(action,id,at)){expect(false,"action has a rendered hit target");return;}SendMessageW(p.window,WM_LBUTTONDOWN,MK_LBUTTON,at);SendMessageW(p.window,WM_LBUTTONUP,0,at);};
     auto right_click=[&](int action,uint64_t id){LPARAM at{};if(!center(action,id,at)){expect(false,"right-click target is rendered");return;}SendMessageW(p.window,WM_RBUTTONDOWN,MK_RBUTTON,at);SendMessageW(p.window,WM_RBUTTONUP,0,at);};
     auto popup_index=[&](int command,uint32_t arg){for(size_t i=0;i<p.popup_items.size();++i)if(p.popup_items[i].command==command&&p.popup_items[i].arg==arg)return static_cast<int>(i);return -1;};
@@ -273,7 +273,7 @@ static int Groups(){
     expect(p.popup_open&&p.popup_hover==popup_index(1,work),"Ctrl+G opens keyboard-navigable group list");
     p.Key(VK_RETURN);expect(!p.popup_open&&p.history.Find(third)->group==work,"Enter chooses highlighted group");
     // Chips on cards in 全部; hidden inside group tabs.
-    p.Render();{bool chip_hit=false;for(const auto& hit:p.hits)chip_hit|=hit.action==35&&hit.id==second;expect(chip_hit,"grouped cards keep folder button");}
+    {const auto keep=p.selected;p.selected=second;p.Render();bool chip_hit=false;for(const auto& hit:p.hits)chip_hit|=hit.action==35&&hit.id==second;expect(chip_hit,"the current card's action bar keeps the folder button");p.selected=keep;}
     // Alt+←/→ cycles through every tab including groups; search is scoped to the tab.
     p.Action(20,0);for(int i=0;i<5;++i)SendMessageW(p.window,WM_SYSKEYDOWN,VK_RIGHT,1LL<<29);
     expect(p.tab==clipboard::History::GroupTabBase&&p.visible.size()==2,"Alt+Right reaches first group tab");
@@ -299,7 +299,7 @@ static int Groups(){
     p.SelectTab(p.TabCount()-1);p.Render();expect(p.tab_scroll_max>0&&p.tab_scroll>0,"tab strip scrolls to reveal the last group");
     {LPARAM at{};expect(center(40,p.history.groups.back().id,at),"revealed last group tab is clickable");}
     click(41,0);expect(!p.naming&&p.status.find(L"20")!=std::wstring::npos,"+ refuses beyond 20 groups");
-    {POINT origin{0,0};ClientToScreen(p.window,&origin);const float before=p.tab_scroll;SendMessageW(p.window,WM_MOUSEWHEEL,MAKEWPARAM(0,WHEEL_DELTA),MAKELPARAM(origin.x+static_cast<int>(100*p.scale),origin.y+static_cast<int>(150*p.scale)));expect(p.tab_scroll<before,"wheel over tab strip scrolls it");}
+    {POINT origin{0,0};ClientToScreen(p.window,&origin);const float before=p.tab_scroll;SendMessageW(p.window,WM_MOUSEWHEEL,MAKEWPARAM(0,WHEEL_DELTA),MAKELPARAM(origin.x+static_cast<int>(100*p.scale),origin.y+static_cast<int>((clipboard::cards::ChipTop+clipboard::cards::ChipBottom)/2*p.scale)));expect(p.tab_scroll<before,"wheel over tab strip scrolls it");}
     // Protected area capacity.
     p.SelectTab(0);for(int i=0;i<static_cast<int>(clipboard::History::MaxProtected);++i){auto e=text(L"合成收藏 "+std::to_wstring(i));e.favorite=true;p.history.Add(e);}
     p.history.Add(text(L"合成普通记录"));p.Filter();const auto plain=p.history.entries.front().id;p.selected=plain;
@@ -360,9 +360,10 @@ static int Run(){
     expect(clipboard::SavePosition(position_file,{920,90}),"moving folded panel preserves expanded size");
     const auto dimensions=clipboard::LoadPanelSize(position_file);expect(dimensions&&dimensions->cx==520&&dimensions->cy==960,"expanded dimensions survive position save and reload");
     WritePrivateProfileStringW(L"Panel",L"Width",L"-1",position_file.c_str());expect(!clipboard::LoadPanelSize(position_file),"invalid dimensions fall back to default");
+    expect(clipboard::SavePaused(position_file,true)&&clipboard::LoadPaused(position_file)&&clipboard::SavePosition(position_file,{1,2})&&clipboard::LoadPaused(position_file)&&clipboard::SavePaused(position_file,false)&&!clipboard::LoadPaused(position_file),"record pause persists across layout rewrites");
     ClipboardPanel panel(nullptr,[]{});auto& p=*panel.impl_;p.test_mode=true;expect(p.Enable(true,false),"create real panel with clipboard monitoring disabled");
     DWORD affinity=0xffffffff;expect(GetWindowDisplayAffinity(p.window,&affinity)&&affinity==WDA_NONE,"clipboard window permits screen capture");
-    for(float dpi_scale:{1.f,1.25f,1.5f,2.f}){p.scale=dpi_scale;p.LayoutSearch();RECT bounds{},format{};GetWindowRect(p.search,&bounds);MapWindowPoints(nullptr,GetParent(p.search),reinterpret_cast<POINT*>(&bounds),2);SendMessageW(p.search,EM_GETRECT,0,reinterpret_cast<LPARAM>(&format));HDC dc=GetDC(p.search);const auto old=SelectObject(dc,p.font);TEXTMETRICW metrics{};GetTextMetricsW(dc,&metrics);SelectObject(dc,old);ReleaseDC(p.search,dc);expect(std::abs(bounds.top+format.top+metrics.tmHeight/2.f-98.5f*dpi_scale)<=.51f,"native search text centered at each DPI");expect(bounds.top>=76*dpi_scale&&bounds.bottom<=121*dpi_scale,"native search control stays inside rounded field");}p.scale=1;p.LayoutSearch();
+    for(float dpi_scale:{1.f,1.25f,1.5f,2.f}){p.scale=dpi_scale;p.LayoutSearch();RECT bounds{},format{};GetWindowRect(p.search,&bounds);MapWindowPoints(nullptr,GetParent(p.search),reinterpret_cast<POINT*>(&bounds),2);SendMessageW(p.search,EM_GETRECT,0,reinterpret_cast<LPARAM>(&format));HDC dc=GetDC(p.search);const auto old=SelectObject(dc,p.font);TEXTMETRICW metrics{};GetTextMetricsW(dc,&metrics);SelectObject(dc,old);ReleaseDC(p.search,dc);expect(std::abs(bounds.top+format.top+metrics.tmHeight/2.f-(clipboard::cards::SearchTop+clipboard::cards::SearchBottom)/2.f*dpi_scale)<=.51f,"native search text centered at each DPI");expect(bounds.top>=clipboard::cards::SearchTop*dpi_scale&&bounds.bottom<=clipboard::cards::SearchBottom*dpi_scale,"native search control stays inside rounded field");}p.scale=1;p.LayoutSearch();
     p.expanded=true;p.Place();p.Render();expect(p.text_glyphs>0,"panel text rasterizes through LumaText FreeType");
     for(const auto band:{std::pair{330,366},std::pair{373,417}}){int left=p.width,right=-1;for(int y=int(band.first*p.scale);y<int(band.second*p.scale);++y)for(int x=0;x<p.width;++x){const auto pixel=p.surface->Pixels()[size_t(y)*p.width+x];if(((pixel>>16)&255)<160&&((pixel>>8)&255)<160&&(pixel&255)<180){left=std::min(left,x);right=std::max(right,x);}}expect(right>=left&&std::abs((left+right)/2.f-p.width/2.f)<3*p.scale,"empty-state line is centered across the panel");}
     {auto frame=MakeFrame({0,0,p.width,p.height});for(size_t i=0;i<frame.pixels.size();++i){const auto source=p.surface->Pixels()[i],alpha=source>>24;uint32_t pixel=0xff000000;for(int shift:{0,8,16})pixel|=std::min(255u,((source>>shift)&255)+245*(255-alpha)/255)<<shift;frame.pixels[i]=pixel;}SavePng(frame,L"build/clipboard-empty-centered.png");}
@@ -374,7 +375,7 @@ static int Run(){
         p.history.Add(std::move(e));}
     p.hotkey=true;p.status.clear();p.Filter();expect(p.visible.size()==5,"five synthetic rows");p.Action(31,4);expect(p.history.Find(4)->favorite,"favorite action");p.selected=4;
     const auto snapshot=[&](const wchar_t* path,bool expanded,bool dark,float scale){p.expanded=expanded;p.dark=dark;p.scale=scale;SetWindowPos(p.window,nullptr,0,0,static_cast<int>((expanded?p.W:p.CW)*scale),static_cast<int>((expanded?p.H:96)*scale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);p.Render();expect(p.file_icons->WaitIdle(10000),"file icon worker finishes for synthetic snapshot");p.Render();auto frame=MakeFrame({0,0,p.width,p.height});std::copy_n(p.surface->Pixels(),frame.pixels.size(),frame.pixels.begin());for(auto& pixel:frame.pixels)pixel|=0xff000000;SavePng(frame,path);expect(p.surface!=nullptr,"render production surface");};
-    snapshot(L"clipboard-expanded-light.png",true,false,1);expect(p.width==400,"expanded width is 400 DIP");for(const auto& hit:p.hits)if(hit.action>=31&&hit.action<=34)expect(hit.rect.right-hit.rect.left==32&&hit.rect.bottom-hit.rect.top==32,"smaller action graphics retain 32 DIP click targets");D2D1_MATRIX_3X2_F transform{};p.target->GetTransform(&transform);expect(transform._11==1&&transform._22==1&&transform._31==0&&transform._32==0,"icon transforms do not affect following content");snapshot(L"clipboard-expanded-dark-150.png",true,true,1.5f);snapshot(L"clipboard-folded.png",false,false,2);
+    snapshot(L"clipboard-expanded-light.png",true,false,1);expect(p.width==400,"expanded width is 400 DIP");for(const auto& hit:p.hits)if(hit.action>=31&&hit.action<=34)expect(hit.rect.right-hit.rect.left==clipboard::cards::ActButton&&hit.rect.bottom-hit.rect.top==clipboard::cards::ActButton,"card action bar buttons are 28 DIP (full.html .acts .ib)");D2D1_MATRIX_3X2_F transform{};p.target->GetTransform(&transform);expect(transform._11==1&&transform._22==1&&transform._31==0&&transform._32==0,"icon transforms do not affect following content");snapshot(L"clipboard-expanded-dark-150.png",true,true,1.5f);snapshot(L"clipboard-folded.png",false,false,2);
     p.expanded=true;p.scale=1;p.hover=-1;SetWindowPos(p.window,nullptr,0,0,400,744,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);p.Render();
     for(const auto& action:p.hits)if(action.action>=31&&action.action<=34){const auto card=std::find_if(p.hits.begin(),p.hits.end(),[&](const auto& h){return h.action==30&&h.id==action.id;});expect(card!=p.hits.end()&&action.rect.right<=card->rect.right-4&&action.rect.bottom<=card->rect.bottom-4,"row action hit areas stay inset from card border");}
     const auto button=std::find_if(p.hits.begin(),p.hits.end(),[](const auto& h){return h.action==34;});
@@ -407,6 +408,120 @@ static int Run(){
     }
     p.expanded=true;p.Place();
     p.Action(24,0);expect(p.visible.size()==1&&p.visible[0]==4,"favorite tab");p.Action(20,0);SetWindowTextW(p.search,L"MICROSOFT");expect(p.visible.size()==1,"native edit search updates results");SetWindowTextW(p.search,L"");p.Action(22,0);expect(p.visible.size()==1,"image category");
+    // S3 (full.html #panel): flavour chips, variable-height cards, record pause.
+    {p.Action(20,0);p.Render();std::set<uint64_t> flavours;for(const auto& hit:p.hits)if(hit.action==26)flavours.insert(hit.id);
+     expect(flavours==std::set<uint64_t>{1+static_cast<uint64_t>(clipboard::Flavor::Code),1+static_cast<uint64_t>(clipboard::Flavor::Link)},"代码/链接 chips appear, empty 颜色 stays hidden");
+     p.Action(26,1+static_cast<uint64_t>(clipboard::Flavor::Link));expect(p.tab==1&&p.flavor==clipboard::Flavor::Link&&p.visible.size()==1&&p.visible[0]==3,"链接 chip narrows the text tab by flavour");
+     p.Render();{bool selected_chip=false;for(const auto& c:clipboard::cards::Chips(p.history,p.tab,p.flavor))selected_chip|=c.selected&&c.flavor==clipboard::Flavor::Link;expect(selected_chip,"selected flavour chip is highlighted");}
+     p.Action(21,0);expect(!p.flavor&&p.visible.size()==3,"文本 chip shows every text flavour");
+     p.Action(26,1+static_cast<uint64_t>(clipboard::Flavor::Code));SendMessageW(p.window,WM_SYSKEYDOWN,VK_RIGHT,1LL<<29);expect(p.tab==2&&!p.flavor,"Alt+Right leaves the flavour filter for the next tab");
+     p.Action(20,0);p.Render();
+     expect(p.CardHeightFor(*p.history.Find(2))>p.CardHeightFor(*p.history.Find(3))&&p.CardHeightFor(*p.history.Find(4))>p.CardHeightFor(*p.history.Find(3)),"image and code cards are taller than link rows");
+     expect(p.FitCount(0)>=1&&p.FitCount(0)<=static_cast<int>(p.visible.size())&&p.MaxScroll()>=0,"variable-height page model");
+     const bool was=p.paused;p.Action(15,0);expect(p.paused!=was&&(p.layout_path.empty()||clipboard::LoadPaused(p.layout_path)==p.paused),"record button toggles and persists the pause");
+     p.Render();{bool rec=false;for(const auto& hit:p.hits)rec|=hit.action==15;expect(rec,"record pill is in the header");}
+     p.Action(15,0);expect(p.paused==was,"record button resumes");p.Action(22,0);}
+    // S3 part 2: full.html actsFor() per flavour, plus the .12s card transitions.
+    {p.Action(20,0);
+     const auto acts_of=[&](uint64_t id){p.selected=id;p.RevealSelection();p.Render();std::set<int> found;for(const auto& hit:p.hits)if(hit.id==id&&hit.action>=31&&hit.action<=45)found.insert(hit.action);return found;};
+     const auto has=[](const std::set<int>& set,std::initializer_list<int> want){for(int a:want)if(!set.count(a))return false;return true;};
+     const auto pin_before=p.pin_request;const auto image_before=p.image_action;p.pin_request={};p.image_action={};
+     expect(has(acts_of(3),{39,32,35,31,34})&&!acts_of(3).count(45),"link card: open / copy, then group / star / delete");
+     expect(has(acts_of(1),{42,43,35,31,34})&&!acts_of(1).count(32),"file card: reveal in Explorer / copy path");
+     expect(has(acts_of(5),{32,45,31,34})&&has(acts_of(4),{32,45}),"text and code cards: copy / plain paste");
+     {const auto image=acts_of(2);expect(image.count(32)&&!image.count(36)&&!image.count(37)&&!image.count(38),"image card hides pin / OCR / annotate without host handlers");}
+     ClipboardImageAction requested=ClipboardImageAction::Annotate;int image_calls=0;
+     p.pin_request=[&](std::shared_ptr<const Frame> frame,POINT){++image_calls;return frame!=nullptr;};
+     p.image_action=[&](ClipboardImageAction kind,std::shared_ptr<const Frame> frame,POINT){requested=kind;++image_calls;return frame!=nullptr;};
+     expect(has(acts_of(2),{36,37,38,32,31,34}),"image card: pin / OCR / annotate / copy");
+     {   // Regression: resting on pin / OCR / annotate (any bar button) made the hover bar jump to the next card.
+         const auto centre=[&](D2D1_RECT_F r){return MAKELPARAM(static_cast<int>((r.left+r.right)*p.scale/2),static_cast<int>((r.top+r.bottom)*p.scale/2));};
+         const auto card_rect=[&](uint64_t id)->std::optional<D2D1_RECT_F>{for(const auto& hit:p.hits)if(hit.action==30&&hit.id==id)return hit.rect;return std::nullopt;};
+         bool steady=true;int buttons=0;std::set<int> seen;
+         for(uint64_t id:{1ull,2ull,3ull,4ull,5ull}){
+             p.selected=id;p.RevealSelection();p.selected=id==1?2:1;p.hover=-1;p.Render();   // hovered, not current
+             const auto card=card_rect(id);if(!card){steady=false;std::cout<<"HOVER card "<<id<<" not rendered"<<std::endl;continue;}
+             SendMessageW(p.window,WM_MOUSEMOVE,0,centre(*card));p.Render();
+             std::vector<std::pair<int,D2D1_RECT_F>> bar;for(const auto& hit:p.hits)if(hit.id==id&&hit.action!=30&&hit.action>=31&&hit.action<=45)bar.push_back({hit.action,hit.rect});
+             if(bar.empty()){steady=false;std::cout<<"HOVER card "<<id<<" shows no action bar"<<std::endl;continue;}
+             for(const auto& [action,rect]:bar){
+                 SendMessageW(p.window,WM_MOUSEMOVE,0,centre(rect));p.Render();p.Render();++buttons;seen.insert(action);
+                 const bool ok=p.hover>=0&&p.hover<static_cast<int>(p.hits.size())&&p.hits[static_cast<size_t>(p.hover)].action==action&&p.hits[static_cast<size_t>(p.hover)].id==id&&p.HoverCard()==id;
+                 if(!ok){steady=false;std::cout<<"HOVER card "<<id<<" action "<<action<<" -> hover card "<<p.HoverCard()<<std::endl;}
+             }
+             SendMessageW(p.window,WM_MOUSEMOVE,0,centre(*card));p.Render();
+         }
+         expect(steady&&buttons>=20&&seen.count(36)&&seen.count(37)&&seen.count(38)&&seen.count(39)&&seen.count(42)&&seen.count(45),"hovering any card action (pin / OCR / annotate / open / reveal / plain paste) keeps the bar on that card");
+         p.hover=-1;
+     }
+     {p.Render(static_cast<int>(p.W*p.scale),static_cast<int>(p.H*p.scale));auto frame=MakeFrame({0,0,p.width,p.height});std::copy_n(p.surface->Pixels(),frame.pixels.size(),frame.pixels.begin());
+      for(auto& pixel:frame.pixels){const UINT inverse=255-(pixel>>24);const UINT background=p.dark?0x151b23:0xf5f8fc;UINT out=0xff000000;for(int shift:{0,8,16})out|=std::min(255u,((pixel>>shift)&255)+((((background>>shift)&255)*inverse+127)/255))<<shift;pixel=out;}
+      SavePng(frame,L"build/clipboard-acts.png");}
+     p.Action(37,2);expect(image_calls==1&&requested==ClipboardImageAction::Ocr&&p.status.find(L"识别")!=std::wstring::npos,"OCR action hands the decoded image to the host");
+     p.Action(36,2);expect(image_calls==2&&p.status==L"已钉到桌面","pin action pins the decoded image");
+     // Quick Look (full.html #ql): OCR area for images.
+     p.preview.Hide();p.ocr_pending_id=0;p.selected=2;p.ShowPreview();
+     expect(p.preview.IsOpen()&&clipboard::PreviewWindowTest::OcrAvailable(p.preview)&&clipboard::PreviewWindowTest::Natural(p.preview).cx==120,"Quick Look offers OCR and shows the natural image size");
+     p.Action(37,2);expect(clipboard::PreviewWindowTest::OcrPending(p.preview),"Quick Look shows OCR in progress");
+     p.ImageOcrResult(L"合成识别样例 第一行\n第二行");expect(clipboard::PreviewWindowTest::OcrText(p.preview)==L"合成识别样例 第一行\n第二行"&&!clipboard::PreviewWindowTest::OcrPending(p.preview)&&p.status==L"已识别文字并复制","OCR result reaches Quick Look");
+     SavePng(clipboard::PreviewWindowTest::Snapshot(p.preview),L"build/clipboard-quicklook-ocr.png");
+     p.preview.Hide();p.ShowPreview();expect(clipboard::PreviewWindowTest::OcrText(p.preview)==L"合成识别样例 第一行\n第二行","reopened Quick Look keeps the recognised text");
+     p.preview.Hide();
+     for(const auto& [shot_id,shot]:std::vector<std::pair<uint64_t,const wchar_t*>>{{3,L"build/clipboard-quicklook-link.png"},{4,L"build/clipboard-quicklook-code.png"}}){
+         p.selected=shot_id;p.ShowPreview();clipboard::PreviewWindowTest::WaitHighlight(p.preview);SavePng(clipboard::PreviewWindowTest::Snapshot(p.preview),shot);p.preview.Hide();}
+     p.Action(39,3);expect(p.last_shell_target.rfind(L"http",0)==0,"open link launches only an http(s) URL");
+     p.Action(43,1);expect(p.last_copied_text==L"产品需求文档 v1.0.pdf"&&p.status==L"已复制路径","copy path writes the file path text");
+     p.pin_request=pin_before;p.image_action=image_before;
+     // Transitions run only while moving and settle in about 120 ms.
+     p.test_mode=false;p.fx_enabled=true;p.StopFx();
+     {const auto& fx=p.FxFor(5,true,false,true);expect(fx.hover==0&&p.fx_running,"hover starts a transition instead of jumping");}
+     Sleep(140);p.FxTick();expect(p.card_fx[5].hover==1&&p.card_fx[5].acts==1&&!p.fx_running,"transition settles and stops its timer");
+     p.FxFor(5,false,false,false);Sleep(140);p.FxTick();expect(!p.card_fx.count(5)&&!p.fx_running,"faded-out card state is released");
+     // .item.new: slidein .45s with the spring curve, timer only while it plays.
+     {float peak=0;for(int i=0;i<=100;++i)peak=std::max(peak,p.SpringEase(i/100.f));
+      expect(std::abs(p.SpringEase(0))<.001f&&std::abs(p.SpringEase(1)-1)<.001f&&peak>1.f&&peak<1.05f,"spring curve overshoots slightly like cubic-bezier(.25,1.2,.4,1)");}
+     p.MarkNew(5);expect(p.new_id==5&&p.fx_running,"a new card starts the slide-in");
+     Sleep(470);p.FxTick();expect(p.new_id==0&&!p.fx_running,"slide-in ends and stops the timer");
+     p.test_mode=true;p.MarkNew(5);expect(p.new_id==0,"no slide-in in test mode");p.Action(22,0);}
+    // S3 part 2: multi-select (full.html msel / #bulk), undoable bulk delete, merged drag payloads.
+    {p.Action(20,0);p.Render();const auto order=p.visible;expect(order.size()==5,"multi-select fixture shows five cards");
+     const float list_top=p.ListTop;
+     const auto mark=[&](uint64_t current,uint64_t other){p.msel.clear();p.selected=current;p.click_mods=MK_CONTROL;p.Action(30,other);};
+     mark(order[0],order[1]);
+     expect(p.msel==std::set<uint64_t>{order[0],order[1]}&&p.selected==order[1],"Ctrl+click adds the card and keeps the current one");
+     p.Render();{std::set<int> bulk;for(const auto& hit:p.hits)if(hit.action>=50&&hit.action<=53)bulk.insert(hit.action);
+      expect(bulk==std::set<int>{50,51,52,53}&&p.ListTop==list_top+p.BulkHeight+p.BulkGap,"bulk bar shows and pushes the list down");}
+     {p.click_mods=MK_CONTROL;p.Action(30,order[2]);p.Render(static_cast<int>(p.W*p.scale),static_cast<int>(p.H*p.scale));auto frame=MakeFrame({0,0,p.width,p.height});std::copy_n(p.surface->Pixels(),frame.pixels.size(),frame.pixels.begin());
+      for(auto& pixel:frame.pixels){const UINT inverse=255-(pixel>>24);const UINT background=p.dark?0x151b23:0xf5f8fc;UINT out=0xff000000;for(int shift:{0,8,16})out|=std::min(255u,((pixel>>shift)&255)+((((background>>shift)&255)*inverse+127)/255))<<shift;pixel=out;}
+      SavePng(frame,L"build/clipboard-bulk.png");p.click_mods=MK_CONTROL;p.Action(30,order[2]);}
+     p.click_mods=MK_CONTROL;p.Action(30,order[1]);expect(p.msel==std::set<uint64_t>{order[0]},"Ctrl+click toggles a card off");
+     p.Render();expect(p.ListTop==list_top,"one marked card hides the bulk bar");
+     p.click_mods=MK_SHIFT;p.Action(30,order[3]);expect(p.msel.size()==4&&p.msel.count(order[2]),"Shift+click adds the range");
+     p.Key(VK_ESCAPE);expect(p.msel.empty()&&p.expanded,"Esc clears the selection before folding");
+     mark(5,3);p.Action(50,0);
+     {std::wstring expected;for(const auto id:order)if(id==5||id==3){if(!expected.empty())expected+=L"\r\n";expected+=p.history.Find(id)->text;}
+      expect(p.last_copied_text==expected&&p.msel.empty(),"合并复制 joins texts in list order and clears the selection");}
+     mark(2,5);p.Action(50,0);expect(p.last_copied_text==p.history.Find(5)->text,"合并复制 skips images");
+     mark(3,5);p.Action(51,0);expect(p.history.Find(3)->favorite&&p.history.Find(5)->favorite&&p.status==L"已收藏 2 项","bulk 收藏");
+     p.history.Find(3)->favorite=false;p.history.Find(5)->favorite=false;p.Filter();
+     mark(3,5);p.Action(52,0);
+     expect(p.history.Find(3)&&std::find(p.visible.begin(),p.visible.end(),3)==p.visible.end()&&std::find(p.visible.begin(),p.visible.end(),5)==p.visible.end(),"bulk delete hides the cards at once");
+     p.Render();{bool undo=false;for(const auto& hit:p.hits)undo|=hit.action==54;expect(undo&&p.status==L"已删除 2 项","footer offers 撤销");}
+     p.Action(54,0);expect(p.visible.size()==5&&p.pending_delete.empty(),"撤销 restores the deleted cards");
+     const auto add=[&](clipboard::Kind kind,const std::wstring& text,std::optional<std::vector<unsigned char>> drop){
+         clipboard::Entry entry;entry.kind=kind;entry.text=text;GetLocalTime(&entry.time);
+         if(drop)entry.formats.push_back({CF_HDROP,*drop});else{const auto* b=reinterpret_cast<const unsigned char*>(text.c_str());entry.formats.push_back({CF_UNICODETEXT,{b,b+(text.size()+1)*sizeof(wchar_t)}});}
+         p.history.Add(std::move(entry));uint64_t id=0;for(const auto& e:p.history.entries)if(e.text==text)id=e.id;return id;};
+     const uint64_t a=add(clipboard::Kind::Text,L"批量删除样例 A",std::nullopt),b=add(clipboard::Kind::Text,L"批量删除样例 B",std::nullopt);p.Filter();
+     expect(a&&b&&p.visible.size()==7,"synthetic bulk-delete entries are listed");
+     mark(a,b);p.Action(52,0);p.CommitPendingDelete();
+     expect(!p.history.Find(a)&&!p.history.Find(b)&&p.visible.size()==5,"bulk delete is committed after the undo window");
+     const uint64_t f=add(clipboard::Kind::Files,L"C:\\Synthetic\\b.txt\r\nC:\\Synthetic\\c.txt",p.HdropBytes({L"C:\\Synthetic\\b.txt",L"C:\\Synthetic\\c.txt"}));p.Filter();
+     mark(1,f);{const auto merged=p.MergedSelection(f);expect(merged&&merged->kind==clipboard::Kind::Files&&clipboard::FilePaths(*merged).size()==3,"multi-drag merges files into one CF_HDROP");}
+     mark(5,1);{const auto merged=p.MergedSelection(5);expect(merged&&merged->kind==clipboard::Kind::Text&&merged->text.find(L"产品需求文档")!=std::wstring::npos&&clipboard::EntryText(*merged).find(p.history.Find(5)->text)!=std::wstring::npos,"multi-drag merges text and file paths");}
+     p.msel={2};expect(!p.MergedSelection(2),"images are dragged one at a time");
+     p.msel.clear();p.history.Erase(f);p.Filter();p.Render();expect(p.ListTop==list_top&&p.visible.size()==5,"multi-select test leaves the fixture as it was");
+     p.Action(22,0);}
     const auto source=clipboard::Thumbnail(*p.history.Find(2));expect(source!=nullptr,"synthetic DIB thumbnail decodes through WIC");
     const auto retained=p.history.entries.size();p.Fold();panel.SetHotkeysSuspended(true);
     SendMessageW(p.window,WM_HOTKEY,1,0);expect(!p.expanded&&!p.hotkey&&p.enabled&&p.listening&&p.history.entries.size()==retained,"suspension blocks queued clipboard hotkey without stopping history collection");
@@ -453,8 +568,8 @@ static int Run(){
         SendMessageW(p.window,WM_EXITSIZEMOVE,0,0);p.Render();
         expect(std::abs(p.W-size.cx)<1&&std::abs(p.H-size.cy)<1,"native resize updates DIP layout without changing font scale");
         int rows=0;for(const auto& hit:p.hits)if(hit.action==30){++rows;expect(hit.rect.bottom<=p.ListBottom+.1f,"resized rows stay above footer");}
-        expect(rows==p.PageRows(),"resized list fills adaptive page capacity");
-        p.scroll=100;SendMessageW(p.window,WM_MOUSEWHEEL,MAKEWPARAM(0,0),0);expect(p.scroll==static_cast<int>(p.visible.size())-p.PageRows(),"resized scrollbar clamps to current page size");
+        expect(rows==p.DrawnRange().second-p.DrawnRange().first&&rows>=p.PageRows(),"resized list fills adaptive page capacity");
+        p.scroll=100;SendMessageW(p.window,WM_MOUSEWHEEL,MAKEWPARAM(0,0),0);expect(p.scroll==p.MaxScroll()&&p.scroll+p.FitCount(p.scroll)==static_cast<int>(p.visible.size()),"resized scrollbar clamps so the last card ends the list");
         RECT bounds{};GetWindowRect(p.window,&bounds);
         const auto hit=[&](LONG x,LONG y){return SendMessageW(p.window,WM_NCHITTEST,0,MAKELPARAM(x,y));};
         expect(hit(bounds.left+1,bounds.top+1)==HTTOPLEFT&&hit(bounds.right-1,bounds.bottom-1)==HTBOTTOMRIGHT&&hit(bounds.right-1,(bounds.top+bounds.bottom)/2)==HTRIGHT,"native edges and corners expose resize cursors");
@@ -471,7 +586,35 @@ static int Run(){
     expect(p.disk->WaitIdle(),"keyboard fixture stored asynchronously");p.DrainStore();p.tab=0;p.query.clear();SetWindowTextW(p.search,L"");p.expanded=true;p.Filter();p.selected=p.visible.front();
     const auto first=p.selected;const auto jobs_before=p.disk->Stats().jobs;
     for(int i=0;i<7;++i)SendMessageW(p.search,WM_KEYDOWN,VK_DOWN,0);
-    expect(p.selected==p.visible[7]&&p.scroll==3,"Down navigates results from search edit and scrolls selection into view");SendMessageW(p.search,WM_KEYDOWN,VK_UP,0);expect(p.selected==p.visible[6],"Up also navigates while typing focus stays in search");expect(p.disk->Stats().jobs==jobs_before,"arrow selection performs no payload disk reads");
+    expect(p.selected==p.visible[7]&&p.scroll>0&&p.block_tops[8]-clipboard::cards::Gap<=p.ScrollPx()+p.ViewHeight()+.5f&&p.block_tops[7]>=p.ScrollPx()-.5f,"Down navigates results from search edit and scrolls selection into view");SendMessageW(p.search,WM_KEYDOWN,VK_UP,0);expect(p.selected==p.visible[6],"Up also navigates while typing focus stays in search");expect(p.disk->Stats().jobs==jobs_before,"arrow selection performs no payload disk reads");
+    // S3 part 2: pixel scrolling (full.html #list scrolls by pixels, not by card).
+    {p.StopScrollAnim();p.scroll=0;p.scroll_offset=0;p.Render();
+        UINT lines=3;SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
+        const float step=lines==WHEEL_PAGESCROLL?p.ViewHeight()*.9f:static_cast<float>(lines)*33.f;
+        POINT over_list{static_cast<LONG>(p.W/2*p.scale),static_cast<LONG>((p.ListTop+120)*p.scale)};ClientToScreen(p.window,&over_list);
+        const auto wheel=[&](int delta){SendMessageW(p.window,WM_MOUSEWHEEL,MAKEWPARAM(0,static_cast<WORD>(static_cast<short>(delta))),MAKELPARAM(over_list.x,over_list.y));p.Render();};
+        wheel(-WHEEL_DELTA);
+        expect(p.scroll_target<0&&std::abs(p.ScrollPx()-std::min(std::round(step*p.scale)/p.scale,p.MaxScrollPx()))<.6f,"one wheel notch scrolls by the system wheel step in DIP");
+        if(step<p.block_tops[1]-clipboard::cards::Gap)expect(p.scroll==0&&p.Offset()>0,"wheel can stop part-way into a card");
+        bool clipped=true;for(const auto& hit:p.hits)if(hit.action>=30&&hit.action<=35)clipped&=hit.rect.top>=p.ListTop-.01f&&hit.rect.bottom<=p.ListBottom+.01f;
+        expect(clipped,"partially visible cards never take clicks outside the list");
+        const auto [drawn_first,drawn_end]=p.DrawnRange();expect(drawn_end-drawn_first>p.FitCount(p.scroll)||p.Offset()==0,"partial cards are drawn at both list edges");
+        for(int i=0;i<200;++i)wheel(-WHEEL_DELTA);
+        expect(std::abs(p.ScrollPx()-p.MaxScrollPx())<.01f&&p.scroll==p.MaxScroll(),"wheel stops exactly at the list end");
+        for(int i=0;i<200;++i)wheel(WHEEL_DELTA);
+        expect(p.ScrollPx()==0&&p.scroll==0&&p.Offset()==0,"wheel returns exactly to the top");
+        p.SetScrollPx(37.3f);expect(std::abs(p.ScrollPx()*p.scale-std::round(p.ScrollPx()*p.scale))<.01f,"scroll position snaps to whole device pixels");
+        {p.SetScrollPx(140);p.Render(static_cast<int>(p.W*p.scale),static_cast<int>(p.H*p.scale));auto frame=MakeFrame({0,0,p.width,p.height});std::copy_n(p.surface->Pixels(),frame.pixels.size(),frame.pixels.begin());
+            for(auto& pixel:frame.pixels){const UINT inverse=255-(pixel>>24);const UINT background=p.dark?0x151b23:0xf5f8fc;UINT out=0xff000000;for(int shift:{0,8,16})out|=std::min(255u,((pixel>>shift)&255)+((((background>>shift)&255)*inverse+127)/255))<<shift;pixel=out;}
+            SavePng(frame,L"build/clipboard-pixel-scroll.png");}
+        p.Key(VK_HOME);expect(p.ScrollPx()==0,"Home resets the pixel offset");}
+    {const auto* long_text=p.history.Find(p.visible.front());int shown_lines=0;
+        if(long_text){p.EnsureWriter();const auto layout=p.ClampLayout(p.CardText(long_text->text),clipboard::cards::ContentWidth(p.CardWidth()),p.Format(13),clipboard::cards::TextLineHeight,clipboard::cards::TextMaxLines,nullptr);
+            DWRITE_TEXT_METRICS metrics{};if(layout&&SUCCEEDED(layout->GetMetrics(&metrics)))shown_lines=static_cast<int>(metrics.lineCount);}
+        expect(shown_lines==clipboard::cards::TextMaxLines,"long text card shows exactly three clamped lines like .txt line-clamp:3");}
+    {bool fresh=true;for(size_t k=0;k<p.visible.size();++k)if(const auto* probe=p.history.Find(p.visible[k])){int lines_out=0;p.ClampLayout(p.CardText(probe->text),clipboard::cards::ContentWidth(p.CardWidth()),p.Format(13),clipboard::cards::TextLineHeight,clipboard::cards::TextMaxLines,&lines_out);
+            clipboard::cards::Measure m;m.text_lines=lines_out;fresh&=std::abs(p.CardHeightFor(*probe)-clipboard::cards::CardHeight(clipboard::Flavor::Text,m,p.CardWidth()))<.01f;}
+        expect(fresh,"card heights never come from a previous entry that reused the id");}
     const auto expected_id=p.selected;SendMessageW(p.search,WM_KEYDOWN,VK_RETURN,0);expect(p.copy_pending,"Enter queues selected payload without blocking");expect(p.disk->WaitIdle(),"selected payload read completes");p.DrainStore();expect(p.last_read_id==expected_id&&!p.copy_pending,"Enter reaches synthetic paste sink with correct entry");
     p.last_read_id=0;p.Copy(first,true);p.Fold();expect(p.disk->WaitIdle(),"cancelled paste worker settles");p.DrainStore();expect(p.last_read_id==0&&!p.copy_pending,"fold cancels delayed paste without touching clipboard");
     p.expanded=true;SetWindowTextW(p.search,L"KEYBOARD-TAIL-11");expect(p.disk->WaitIdle(),"background full-text search completes");p.DrainStore();expect(p.visible.size()==1,"search reaches text beyond bounded metadata summary");
@@ -511,15 +654,15 @@ static int Run(){
     for(int i=0;i<12;++i){clipboard::Entry entry;entry.kind=clipboard::Kind::Image;entry.text=L"synthetic image "+std::to_wstring(i);BITMAPINFOHEADER header{};header.biSize=sizeof(header);header.biWidth=512;header.biHeight=-512;header.biPlanes=1;header.biBitCount=32;header.biCompression=BI_RGB;std::vector<unsigned char> bytes(sizeof(header)+512*512*4);std::memcpy(bytes.data(),&header,sizeof(header));const uint32_t color=0xff506080u+static_cast<uint32_t>(i);for(size_t j=sizeof(header);j<bytes.size();j+=4)std::memcpy(bytes.data()+j,&color,4);entry.formats.push_back({CF_DIB,std::move(bytes)});expect(p.disk->Save(std::move(entry)),"queue valid synthetic DIB");}
     expect(p.disk->WaitIdle(),"valid image fixtures written");p.DrainStore();p.expanded=true;p.scroll=0;p.Filter();p.Render();expect(p.disk->WaitIdle(),"visible thumbnails decode on worker");p.DrainStore();p.Render();size_t bitmap_bytes=0;for(const auto& [image_id,bitmap]:p.images){(void)image_id;if(bitmap){const auto size=bitmap->GetPixelSize();bitmap_bytes+=size.width*size.height*4;}}
     expect(bitmap_bytes>0&&bitmap_bytes<=6*128*128*4&&p.images.size()<=6,"only visible thumbnails retained within 384 KiB pixel budget");
-    expect(p.images.size()==5&&bitmap_bytes==5*128*128*4,"every visible image has a decoded thumbnail");
+    expect(p.images.size()==static_cast<size_t>(p.DrawnRange().second-p.DrawnRange().first)&&bitmap_bytes==static_cast<size_t>(p.DrawnRange().second-p.DrawnRange().first)*128*128*4,"every visible image has a decoded thumbnail");
     p.images.clear();p.thumbnail_cache.Clear();p.Render();
     expect(p.disk->WaitIdle(),"thumbnail reload completes before target loss");
     p.images.clear();p.file_bitmaps.clear();p.app_icon.Reset();p.brush.Reset();p.target.Reset();
     p.DrainStore();p.Render();
-    expect(p.images.size()==5&&p.thumbnail_pending.empty(),"all thumbnails survive render target loss during delivery");
+    expect(p.images.size()==static_cast<size_t>(p.DrawnRange().second-p.DrawnRange().first)&&p.thumbnail_pending.empty(),"all thumbnails survive render target loss during delivery");
 
     for(int i=0;i<10;++i){p.Key(VK_DOWN);p.Render();p.disk->WaitIdle();p.DrainStore();}
-    expect(p.images.size()<=6,"scrolling many images never accumulates prior image bitmaps");
+    expect(p.images.size()<=static_cast<size_t>(p.DrawnRange().second-p.DrawnRange().first),"scrolling many images never accumulates prior image bitmaps");
     // End-to-end metadata -> encrypted payload -> background decode -> Quick Look.
     p.selected=p.visible.front();p.ShowPreview();
     expect(clipboard::PreviewWindowTest::Loading(p.preview)||clipboard::PreviewWindowTest::HasImage(p.preview),"disk image opens with cached pixels, thumbnail or explicit loading state");
@@ -585,4 +728,3 @@ static int Run(){
 };
 }
 int main(int argc,char** argv){CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);const int result=argc>1&&std::string(argv[1])=="--appearance"?lumashot::ClipboardPanelTest::Appearance():argc>1&&std::string(argv[1])=="--features"?lumashot::ClipboardPanelTest::Features():argc>1&&std::string(argv[1])=="--groups"?lumashot::ClipboardPanelTest::Groups():argc>1&&std::string(argv[1])=="--pin-only"?lumashot::ClipboardPanelTest::PinOnly():lumashot::ClipboardPanelTest::Run();CoUninitialize();return result;}
-

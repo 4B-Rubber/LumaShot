@@ -4,6 +4,7 @@
 #include "recording/preview_player.h"
 #include "capture/frame.h"
 #include "ui/glass_surface.h"
+#include "clipboard/composition.h"
 #include "ui/dropdown_window.h"
 #include "ui/themed_message.h"
 #include "ui/text_renderer.h"
@@ -34,7 +35,7 @@ int DisplayFrameRate(HMONITOR monitor){MONITORINFOEXW info{};info.cbSize=sizeof(
 struct Ui {
     HWND window{},overlay{},video{};bool dark{},gif{},drag{},picking{},selected{},system{true},microphone{},cursor{true},software{},exporting{},saved{};
     RECT monitor{},region{};POINT anchor{};HMONITOR screen{};HWND target{};
-    float scale{1};int source{},fps{30},width{0},countdown{},focus{-1},hover{-1},trim_drag{};bool acrylic{},playing{},loop{true};long long trim_begin{},trim_end{},position{};
+    float scale{1};int source{},fps{30},width{0},countdown{},focus{-1},hover{-1},trim_drag{};bool acrylic{},glassy{},playing{},loop{true};long long trim_begin{},trim_end{},position{};std::unique_ptr<ClipboardComposition> composition;
     ui::ToolbarMotion tab_motion;bool tab_timer{},tab_effects{true};int tab_pressed{-1};
     ui::InteractionMotion<96> feedback;bool feedback_timer{};int pressed{-1},feedback_context{-1};
     int quality{1},gif_preset{1},video_width{},video_fps{30},gif_width{960},gif_fps{15};
@@ -99,7 +100,7 @@ struct Ui {
         }else if(feedback_timer){KillTimer(window,FeedbackTimer);feedback_timer=false;}
     }
     void Invalidate(){const auto now=GetTickCount64();SyncTabs(now);SyncFeedback(now);if(window)InvalidateRect(window,nullptr,FALSE);}
-    PanelState Model(){PanelState value;value.media_size=recorded_size;value.preview_scale=scale;value.quality=quality;value.gif_preset=gif_preset;value.size_estimate=SizeEstimate();value.interaction=feedback.Sample(GetTickCount64());value.focus=focus>=0&&focus<int(buttons.size())?buttons[size_t(focus)].id:-1;value.tab_motion=tab_motion.Sample(GetTickCount64());value.state=status.state;value.gif=gif;value.dark=dark;value.cursor=cursor;value.system=system;value.microphone=microphone;value.loop=loop;value.software=software;value.exporting=exporting;value.selected=selected;value.playing=playing;value.acrylic=acrylic;value.fps=fps;value.width=width;value.source=source;value.countdown=countdown;{std::lock_guard lock(mutex);value.progress=progress;value.export_stage=export_stage;}value.hover=hover;value.time=status.time;value.trim_begin=trim_begin;value.trim_end=trim_end;value.position=position;value.detail=status.detail;if(status.state==State::Failed){if(status.detail.find(L"Hardware")!=std::wstring::npos)value.detail=L"当前设备无法使用硬件编码，请在录制设置中选择兼容编码后重试。";else if(status.detail.find(L"audio")!=std::wstring::npos||status.detail.find(L"Audio")!=std::wstring::npos)value.detail=L"无法使用所选声音设备，请检查设备连接或关闭声音后重试。";else if(status.detail.find(L"resized")!=std::wstring::npos)value.detail=L"目标窗口尺寸已变化，请重新选择窗口并录制。";else value.detail=L"无法完成采集，请重新选择窗口，或切换兼容编码后重试。";}value.images=images.get();value.notice=notice;value.preview_loading=!images&&!preview_failed;value.play_pending=play_requested&&!playing;return value;}
+    PanelState Model(){PanelState value;value.media_size=recorded_size;value.preview_scale=scale;value.quality=quality;value.gif_preset=gif_preset;value.size_estimate=SizeEstimate();value.interaction=feedback.Sample(GetTickCount64());value.focus=focus>=0&&focus<int(buttons.size())?buttons[size_t(focus)].id:-1;value.tab_motion=tab_motion.Sample(GetTickCount64());value.state=status.state;value.gif=gif;value.dark=dark;value.cursor=cursor;value.system=system;value.microphone=microphone;value.loop=loop;value.software=software;value.exporting=exporting;value.selected=selected;value.playing=playing;value.acrylic=acrylic;value.backdrop=glassy&&acrylic;value.fps=fps;value.width=width;value.source=source;value.countdown=countdown;{std::lock_guard lock(mutex);value.progress=progress;value.export_stage=export_stage;}value.hover=hover;value.time=status.time;value.trim_begin=trim_begin;value.trim_end=trim_end;value.position=position;value.detail=status.detail;if(status.state==State::Failed){if(status.detail.find(L"Hardware")!=std::wstring::npos)value.detail=L"当前设备无法使用硬件编码，请在录制设置中选择兼容编码后重试。";else if(status.detail.find(L"audio")!=std::wstring::npos||status.detail.find(L"Audio")!=std::wstring::npos)value.detail=L"无法使用所选声音设备，请检查设备连接或关闭声音后重试。";else if(status.detail.find(L"resized")!=std::wstring::npos)value.detail=L"目标窗口尺寸已变化，请重新选择窗口并录制。";else value.detail=L"无法完成采集，请重新选择窗口，或切换兼容编码后重试。";}value.images=images.get();value.notice=notice;value.preview_loading=!images&&!preview_failed;value.play_pending=play_requested&&!playing;return value;}
     void Size(int,int,bool keep_tabs=false){RECT previous{};if(keep_tabs)GetWindowRect(window,&previous);const auto dimensions=PanelSize(Model());MONITORINFO info{sizeof(info)};if(!GetMonitorInfoW(keep_tabs?MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST):screen,&info)){info.rcWork={0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN)};}const auto work=info.rcWork;const float oldScale=scale;
         const int fitWidth=status.state==State::Ready?544:dimensions.cx,fitHeight=status.state==State::Ready?208+(notice.empty()?0:26):dimensions.cy;
         scale=std::min({GetDpiForWindow(window)/96.f,float(work.right-work.left)/fitWidth,float(work.bottom-work.top-24)/fitHeight});
@@ -396,10 +397,13 @@ struct Ui {
         if(!render){const auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED));Check(factory->CreateDCRenderTarget(&properties,&render),"Panel surface");}
         if(!surface)surface=std::make_unique<DibSurface>(rect.right,rect.bottom);
         Check(render->BindDC(surface->Dc(),&rect),"Bind panel");render->SetDpi(96*scale,96*scale);render->BeginDraw();buttons=DrawPanel(render.Get(),write.Get(),Model());if(render->EndDraw()==D2DERR_RECREATE_TARGET)render.Reset();
-        POINT origin{};SIZE size{rect.right,rect.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};UpdateLayeredWindow(window,nullptr,nullptr,&size,surface->Dc(),&origin,0,&blend,ULW_ALPHA);
+        if(glassy){if(!composition)composition=std::make_unique<ClipboardComposition>();composition->Present(window,UINT(rect.right),UINT(rect.bottom),surface->Pixels());}
+        else{POINT origin{};SIZE size{rect.right,rect.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};UpdateLayeredWindow(window,nullptr,nullptr,&size,surface->Dc(),&origin,0,&blend,ULW_ALPHA);}
     }catch(...){EndPaint(window,&ps);throw;}EndPaint(window,&ps);}    static LRESULT CALLBACK Video(HWND w,UINT msg,WPARAM wp,LPARAM lp){if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;if(msg==WM_LBUTTONUP){auto* u=reinterpret_cast<Ui*>(GetWindowLongPtrW(GetParent(w),GWLP_USERDATA));if(u)u->Action(22);return 0;}if(msg==WM_PAINT){PAINTSTRUCT ps{};BeginPaint(w,&ps);EndPaint(w,&ps);auto* u=reinterpret_cast<Ui*>(GetWindowLongPtrW(GetParent(w),GWLP_USERDATA));if(u&&u->player)u->player->UpdateVideo();return 0;}return DefWindowProcW(w,msg,wp,lp);}
-    static LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){auto* u=reinterpret_cast<Ui*>(GetWindowLongPtrW(w,GWLP_USERDATA));if(msg==WM_NCCREATE){u=static_cast<Ui*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);u->window=w;u->ReadTabEffects();SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(u));}if(!u)return DefWindowProcW(w,msg,wp,lp);
-        try{switch(msg){case WM_PAINT:u->Paint();return 0;case WM_ERASEBKGND:return 1;case WM_NCCALCSIZE:return 0;case WM_NCHITTEST:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(w,&p);for(const auto& b:u->buttons)if(p.x/u->scale>=b.box.left&&p.x/u->scale<=b.box.right&&p.y/u->scale>=b.box.top&&p.y/u->scale<=b.box.bottom)return HTCLIENT;if(p.y<44*u->scale&&p.x<PanelSize(u->Model()).cx*u->scale-40)return HTCAPTION;break;}
+    static LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
+        if(msg==WM_GETMINMAXINFO&&(GetWindowLongPtrW(w,GWL_STYLE)&WS_THICKFRAME)){reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize={1,1};return 0;}  // glass windows carry WS_THICKFRAME only for the DWM backdrop: no minimum size
+        auto* u=reinterpret_cast<Ui*>(GetWindowLongPtrW(w,GWLP_USERDATA));if(msg==WM_NCCREATE){u=static_cast<Ui*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);u->window=w;u->ReadTabEffects();SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(u));}if(!u)return DefWindowProcW(w,msg,wp,lp);
+        try{switch(msg){case WM_PAINT:u->Paint();return 0;case WM_ERASEBKGND:return 1;case WM_NCCALCSIZE:return 0;case WM_NCACTIVATE:if(u->glassy)return DefWindowProcW(w,msg,TRUE,lp);break;case WM_NCHITTEST:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(w,&p);for(const auto& b:u->buttons)if(p.x/u->scale>=b.box.left&&p.x/u->scale<=b.box.right&&p.y/u->scale>=b.box.top&&p.y/u->scale<=b.box.bottom)return HTCLIENT;if(p.y<44*u->scale&&p.x<PanelSize(u->Model()).cx*u->scale-40)return HTCAPTION;if(u->glassy)return HTCLIENT;break;}
         case WM_LBUTTONDOWN:{if(u->status.state==State::Ready){
             const float x=GET_X_LPARAM(lp)/u->scale,y=GET_Y_LPARAM(lp)/u->scale;
             for(const auto& b:u->buttons)if(TabSlot(b.id)>0&&x>=b.box.left&&x<=b.box.right&&y>=b.box.top&&y<=b.box.bottom){u->tab_pressed=b.id;SetCapture(w);u->Invalidate();return 0;}
@@ -416,7 +420,7 @@ struct Ui {
         case WM_SETTINGCHANGE:u->ReadTabEffects();u->Invalidate();break;
         case WM_KEYDOWN:if(wp==VK_ESCAPE){u->Close();return 0;}if(wp==VK_TAB){u->focus=(u->focus+1)%std::max(1,int(u->buttons.size()));u->Invalidate();return 0;}if((wp==VK_RETURN||wp==VK_SPACE)&&u->focus>=0&&u->focus<int(u->buttons.size())){u->Action(u->buttons[u->focus].id);return 0;}break;
         case WM_ENABLE:if(!wp&&u->player)u->PausePreview();else u->LayoutVideo();return 0;
-        case WM_SIZE:ResizeBorderlessWindow(w,u->scale,ui::ToolPanelRadius);u->surface.reset();u->LayoutVideo();u->Invalidate();return 0;case WM_MOVE:u->LayoutVideo();return 0;
+        case WM_SIZE:if(!u->glassy)ResizeBorderlessWindow(w,u->scale,ui::ToolPanelRadius);u->surface.reset();u->LayoutVideo();u->Invalidate();return 0;case WM_MOVE:u->LayoutVideo();return 0;
         case WM_DPICHANGED:u->StopTabs();u->StopFeedback();u->scale=HIWORD(wp)/96.f;{const auto* r=reinterpret_cast<RECT*>(lp);SetWindowPos(w,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER);}u->LayoutVideo();u->Invalidate();return 0;
         case WM_TIMER:if(wp==FeedbackTimer){u->Invalidate();return 0;}if(wp==TabTimer){u->Invalidate();return 0;}if(wp==4){KillTimer(w,4);u->notice.clear();u->Invalidate();return 0;}if(wp==3&&u->player){if(!u->seek_drag&&!u->seek_inflight&&!u->seek_pending){PROPVARIANT value{};if(SUCCEEDED(u->player->GetPosition(MFP_POSITIONTYPE_100NS,&value))){u->position=value.hVal.QuadPart;PropVariantClear(&value);}if(u->gif&&u->position>=u->trim_end)u->PausePreview();}u->Invalidate();}if(wp==1){if(--u->countdown<=0)u->BeginCapture();u->Invalidate();}return 0;
         case StatusMessage:{Status next;{std::lock_guard lock(u->mutex);next=u->pending;}if(next.state==State::Preview&&u->status.state==State::Preview)return 0;u->status=std::move(next);if(u->status.state==State::Preview)u->Preview();if(u->status.state==State::Failed){SetWindowDisplayAffinity(w,WDA_NONE);ShowWindow(u->overlay,SW_HIDE);u->Size(760,310);u->LayoutVideo();}u->Invalidate();return 0;}
@@ -439,9 +443,10 @@ int RunUi(bool gif,bool dark,std::optional<RECT> initial_region={},std::filesyst
     // Declared after ui so it is released before ~Ui removes the folder.
     RecordingLease lease(ui.client_directory.empty()?ui.folder:std::filesystem::path{});ui.temporary=ui.folder/L"capture.mp4";
     WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=Ui::Proc;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=L"LumaShot.Recording";RegisterClassW(&wc);wc.lpfnWndProc=Ui::Selection;wc.lpszClassName=L"LumaShot.RecordingSelection";wc.hCursor=LoadCursorW(nullptr,IDC_CROSS);RegisterClassW(&wc);wc.lpfnWndProc=Ui::Video;wc.lpszClassName=L"LumaShot.RecordingVideo";wc.hbrBackground=static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));RegisterClassW(&wc);
-    ui.window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED,L"LumaShot.Recording",L"LumaShot 录制",WS_POPUP|WS_CLIPCHILDREN,monitor.rcWork.left+30,monitor.rcWork.top+30,760,170,nullptr,nullptr,GetModuleHandleW(nullptr),&ui);if(!ui.window)return 1;
-    ConfigureBorderlessWindow(ui.window);ui.scale=GetDpiForWindow(ui.window)/96.f;ui.acrylic=SetSettingsAcrylic(ui.window,dark);SetWindowDisplayAffinity(ui.window,WDA_NONE);
-    ui.video=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"LumaShot.RecordingVideo",L"",WS_POPUP,0,0,1,1,ui.window,nullptr,GetModuleHandleW(nullptr),nullptr);ui.Size(760,170);ui.LayoutVideo();SetForegroundWindow(ui.window);
+    // Glass: DWM transient acrylic on a non-layered frame window (as the menus); layered opaque fallback otherwise.
+    ui.glassy=TransparencyEffectsOn();ui.window=CreateWindowExW(ui.glassy?(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOREDIRECTIONBITMAP):(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED),L"LumaShot.Recording",L"LumaShot 录制",ui.glassy?(WS_POPUP|WS_CLIPCHILDREN|WS_THICKFRAME):(WS_POPUP|WS_CLIPCHILDREN),monitor.rcWork.left+30,monitor.rcWork.top+30,760,170,nullptr,nullptr,GetModuleHandleW(nullptr),&ui);if(!ui.window)return 1;
+    if(ui.glassy)ui.acrylic=ApplyPopupBackdrop(ui.window,dark);else{ConfigureBorderlessWindow(ui.window);ui.acrylic=SetSettingsAcrylic(ui.window,dark);}ui.scale=GetDpiForWindow(ui.window)/96.f;SetWindowDisplayAffinity(ui.window,WDA_NONE);
+    ui.video=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"LumaShot.RecordingVideo",L"",WS_POPUP,0,0,1,1,ui.window,nullptr,GetModuleHandleW(nullptr),nullptr);ui.Size(760,170);ui.LayoutVideo();SetForegroundWindow(ui.window);if(ui.glassy)SendMessageW(ui.window,WM_NCACTIVATE,TRUE,0);
     if(initial_region&&!ui.InitialRegion(*initial_region)){ui.notice=L"截图选区不可用，请重新选择录制区域";ui.Size(0,0);ui.Invalidate();}
     MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return ui.client_directory.empty()?0:ui.client_exit;
 }
@@ -460,7 +465,6 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int){
 }
 
 #endif
-
 
 
 

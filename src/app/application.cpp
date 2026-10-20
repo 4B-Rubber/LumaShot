@@ -20,6 +20,7 @@
 #include "export/clipboard.h"
 #include "recording/temp_cleanup.h"
 #include "pin/image.h"
+#include "pin/selection_capture.h"
 #include <windowsx.h>
 #include <shellapi.h>
 #include <commdlg.h>
@@ -48,6 +49,7 @@ constexpr UINT kTrayCheckUpdate=40,kTrayCancelUpdate=41,kTrayInstallUpdate=42,kT
 constexpr UINT kTrayClipboardStrip=11,kTrayEnableClipboard=12,kStripDismissed=WM_APP+121;
 constexpr UINT kTrayTranslate=13,kTrayTranslationSettings=14;
 constexpr UINT kTrayQuickOcr=15,kTrayQuickPin=16,kQuickOcrReady=WM_APP+122;
+constexpr uint64_t kClipboardOcrId=2;   // clipboard image-card OCR shares quick_ocr_; id 1 is the capture session
 constexpr wchar_t kTrayTip[]=L"LumaShot · 截图与标注";
 static Point GlobalPoint(RECT r,LPARAM lp) {return {float(r.left+GET_X_LPARAM(lp)),float(r.top+GET_Y_LPARAM(lp))};}
 static void PlaceNumberBadge(Mark& mark,Point p){const auto b=Normalize(mark.a,mark.b);const float dx=p.x-(b.left+b.right)/2,dy=p.y-(b.top+b.bottom)/2;mark.a.x+=dx;mark.b.x+=dx;mark.a.y+=dy;mark.b.y+=dy;}
@@ -140,6 +142,42 @@ int Application::Run(bool capture_now,bool demo,bool diagnostic_session) {
     clipboard_panel_=std::make_unique<ClipboardPanel>(main_,[this]{PostMessageW(main_,WM_APP+85,0,0);},[this]{if(SettingsShortcutRecording())return false;RefreshHotkeys();return !hotkeys_suspended_;});
     clipboard_panel_->SetStripDismissedHandler([this]{PostMessageW(main_,kStripDismissed,0,0);});
     pins_=std::make_unique<PinManager>(main_);
+        // Card stack: an image card dropped on the desktop becomes a pin centred on the release point.
+        clipboard_panel_->SetPinHandler([this](std::shared_ptr<const Frame> image,POINT at){
+            if(!pins_||!image||image->pixels.empty())return false;
+            MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint(at,MONITOR_DEFAULTTONEAREST),&monitor);
+            const POINT position{std::max(monitor.rcWork.left,at.x-image->Width()/2),std::max(monitor.rcWork.top,at.y-image->Height()/2)};
+            try{pins_->Create(Frame(*image),Frame{},position,std::nullopt,{},false);return true;}catch(const std::exception&){return false;}
+        });
+        // Clipboard image cards: OCR copies the text (it then joins the history as a text entry);
+        // annotate reuses the image edit session and pins the result with editable marks.
+        clipboard_panel_->SetImageActionHandler([this](ClipboardImageAction action,std::shared_ptr<const Frame> image,POINT at){
+            if(!image||image->pixels.empty())return false;
+            if(action==ClipboardImageAction::Ocr){
+                if(!ocr_available_)return false;
+                try{
+                    if(!quick_ocr_)quick_ocr_=std::make_unique<ocr::Service>(main_,kQuickOcrReady);
+                    quick_ocr_->SetModelDirectory(preferences_.ocr_model_directory);
+                    quick_ocr_->Cancel(kClipboardOcrId);quick_ocr_->Submit(kClipboardOcrId,0,std::move(image));return true;
+                }catch(const std::exception&){return false;}
+            }
+            if(active_||pending_||!pins_)return false;
+            MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint(at,MONITOR_DEFAULTTONEAREST),&monitor);const RECT work=monitor.rcWork;
+            const double fit=std::min({1.0,(work.right-work.left)*.9/image->Width(),(work.bottom-work.top)*.9/image->Height()});
+            const LONG w=std::max<LONG>(1,std::lround(image->Width()*fit)),h=std::max<LONG>(1,std::lround(image->Height()*fit));
+            const LONG x=std::clamp<LONG>(at.x,work.left,std::max(work.left,work.right-w)),y=std::clamp<LONG>(at.y,work.top,std::max(work.top,work.bottom-h));
+            const RECT bounds{x,y,x+w,y+h};
+            try{
+                return AnnotateImage(image,Document{},bounds,[this,image,bounds](std::optional<Document> marks,int follow){
+                    if(!marks||!pins_)return;
+                    try{
+                        Renderer renderer;Frame flat=renderer.Flatten(*image,*marks,image->bounds);
+                        const bool recognize=follow==15&&ocr_available_;Frame ocr_frame=recognize?flat:Frame{};
+                        pins_->Create(std::move(flat),std::move(ocr_frame),{bounds.left,bounds.top},Frame(*image),std::move(*marks),recognize);
+                    }catch(const std::exception&){Notice(L"无法创建贴图。");}
+                });
+            }catch(const std::exception&){return false;}
+        });
     pins_->sticker_style=[this]{return preferences_.pin_style;};
     pins_->translate_auto_show=[this]{return preferences_.translate_auto_show;};
     pins_->clothesline_enabled=[this]{return preferences_.clothesline_enabled;};pins_->ClotheslineConfigChanged();
@@ -148,6 +186,8 @@ int Application::Run(bool capture_now,bool demo,bool diagnostic_session) {
     pins_->clipboard_format=[this]{return preferences_.paste_as_file?preferences_.paste_file_format:-1;};
     pins_->open_translation_settings=[this]{if(!LaunchTranslationSettings(preferences_.Dark()))Notice(L"无法打开翻译设置。");};
     pins_->annotate=[this](uint64_t id,std::shared_ptr<const Frame> image,Document document,RECT bounds){return AnnotatePin(id,std::move(image),std::move(document),bounds);};
+    selection_translator_=std::make_unique<SelectionTranslator>(main_,SelectionTranslator::Host{[this]{return preferences_.Dark();},[this]{if(!LaunchTranslationSettings(preferences_.Dark()))Notice(L"无法打开翻译设置。");}});
+    pins_->translate_selection=[this](std::wstring text,POINT point){if(selection_translator_)selection_translator_->Translate(std::move(text),point);};
     {
         longshot::Host host;
         host.dark=[this]{return preferences_.Dark();};
@@ -174,6 +214,8 @@ int Application::Run(bool capture_now,bool demo,bool diagnostic_session) {
     if(!demo_&&!diagnostic_session_)CheckWin32(Shell_NotifyIconW(NIM_ADD,&tray)!=FALSE,"Add tray icon");
     clipboard_panel_->SetShortcut(preferences_.clipboard_modifiers,preferences_.clipboard_key);
     clipboard_panel_->SetStripVisible(preferences_.clipboard_strip_visible);
+    clipboard_panel_->SetHistoryLimit(static_cast<size_t>(preferences_.clipboard_max_entries));clipboard_panel_->SetCardPreview(preferences_.clipboard_card_preview);
+    if(!demo_&&!diagnostic_session_)clipboard_panel_->SetStripStyle(preferences_.clipboard_classic_strip);
     if(!demo_&&!diagnostic_session_)ConfigureHotkeyPolicy();
     if(!demo_&&!diagnostic_session_)clipboard_panel_->SetPersistent(preferences_.clipboard_persist);
     if(!demo_&&!diagnostic_session_&&!clipboard_panel_->Enable(preferences_.clipboard_enabled,preferences_.Dark()))Notice(L"剪贴板监听无法启动，请重新开启。");
@@ -257,11 +299,12 @@ LRESULT CALLBACK Application::MainProc(HWND window,UINT message,WPARAM wp,LPARAM
                 if(wp==5&&!app->ocr_available_){app->Notice(L"快捷识别需要文字识别组件。");return 0;}
                 if(!app->active_&&!app->pending_){app->quick_request_=wp==5?QuickCapture::Text:QuickCapture::Pin;app->Start();app->quick_request_=QuickCapture::None;}return 0;
             }
+            if(wp==7){app->TranslateSelection();return 0;}
             if(wp==1)app->Start();return 0;}
         if(message==kOcrReady){app->pins_->Ready();return 0;}
         if(message==kQuickOcrReady){app->QuickOcrReady();return 0;}
         if(message==kTranslateReady){app->pins_->TranslationReady(uint64_t(wp));return 0;}
-        if(message==kTranslationConfigChanged){app->pins_->TranslationConfigChanged();return 0;}
+        if(message==kTranslationConfigChanged){app->pins_->TranslationConfigChanged();if(app->selection_translator_)app->selection_translator_->ConfigChanged();return 0;}
         if(message==kPinSaveReady||(message==WM_TIMER&&wp==kPinSaveReady)){app->pins_->Saved();return 0;}
         if(message==kResult){app->ResultReady();return 0;}
         if(message==kElementsReady){app->ElementsReady();return 0;}
@@ -285,6 +328,25 @@ LRESULT CALLBACK Application::MainProc(HWND window,UINT message,WPARAM wp,LPARAM
         }
     } catch(const std::exception& e){if(app->ipc_client_){app->client_exit_=1;app->Cancel(false);}else if(!client_message)app->Notice(ErrorText(e));}
     return DefWindowProcW(window,message,wp,lp);
+}
+
+// Selection translation hotkey: a focused pin's selected OCR text, otherwise
+// the selection of the foreground application (UI Automation, then a copy
+// whose clipboard change is undone). The bubble opens next to the cursor.
+void Application::TranslateSelection(){
+    if(!selection_translator_||active_||pending_)return;
+    POINT cursor{};GetCursorPos(&cursor);
+    if(pins_){
+        const auto focused=pins_->FocusedSelection();
+        if(focused.pin){
+            if(focused.text.empty())selection_translator_->Explain(L"先识别文字，再在贴图上拖选要翻译的部分",cursor);
+            else selection_translator_->Translate(focused.text,cursor);
+            return;
+        }
+    }
+    auto captured=selection::Capture(main_);
+    if(captured.text.empty()){selection_translator_->Explain(L"先选中文字，再按快捷键",cursor);return;}
+    selection_translator_->Translate(std::move(captured.text),cursor);
 }
 
 void Application::TrayMenu() {
@@ -551,6 +613,8 @@ void Application::Settings() {
         if(!preferences_.clipboard_enabled)clipboard_panel_->Enable(false,preferences_.Dark());
         clipboard_panel_->SetPersistent(preferences_.clipboard_persist);
         clipboard_panel_->SetStripVisible(preferences_.clipboard_strip_visible);
+        clipboard_panel_->SetHistoryLimit(static_cast<size_t>(preferences_.clipboard_max_entries));clipboard_panel_->SetCardPreview(preferences_.clipboard_card_preview);
+        if(!demo_&&!diagnostic_session_)clipboard_panel_->SetStripStyle(preferences_.clipboard_classic_strip);
     }
     if(clipboard_panel_&&!clipboard_panel_->Enable(preferences_.clipboard_enabled,preferences_.Dark()))Notice(L"剪贴板监听无法启动，请重新开启。");
     if(pins_){pins_->SetOcrModelDirectory(preferences_.ocr_model_directory);pins_->RefreshAppearance();pins_->ClotheslineConfigChanged();}
@@ -561,10 +625,19 @@ bool Application::AnnotatePin(uint64_t id,std::shared_ptr<const Frame> image,Doc
     MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromRect(&bounds,MONITOR_DEFAULTTONEAREST),&monitor);
     pin_edit_id_=id;pin_edit_bounds_=bounds;pin_edit_source_=std::move(image);pin_edit_copy_=false;
     try{
-        frame_=std::make_shared<Frame>(PinAnnotationPreview(*pin_edit_source_,bounds,monitor.rcWork));
+        // The toolbar and panels draw software acrylic from frame_. Copy the screen behind them once, in
+        // memory only (never saved; dropped with the session), so they look like the capture toolbar
+        // instead of a flat light slab. Synthetic sessions keep the flat canvas for determinism.
+        Frame behind;
+        // The pin menu / hover bar that started this were just destroyed or hidden (and marked
+        // exclude-from-capture). Let DWM compose frames without them first, or their last frame (a DWM
+        // backdrop reads back black) lands in the copy and shows through the toolbar margins.
+        if(!demo_&&!diagnostic_session_){DwmFlush();DwmFlush();try{behind=CaptureRegion(monitor.rcWork);}catch(...){behind={};}}
+        pin_edit_live_=!behind.pixels.empty();
+        frame_=std::make_shared<Frame>(PinAnnotationPreview(*pin_edit_source_,bounds,monitor.rcWork,pin_edit_live_?&behind:nullptr));
         acrylic_=std::make_shared<Frame>(BlurBackdrop(*frame_));cursor_patch_.reset();monitors_={monitor.rcWork};windows_.clear();document_=PinAnnotationDisplayDocument(annotations,*pin_edit_source_,bounds);draft_.reset();
         state_={};static_cast<ToolProperties&>(state_)=preferences_.tools;state_.dark=preferences_.Dark();state_.selection=BoxOf(bounds);state_.selected=true;
-        state_.hint=L"贴图标注 · Enter 完成 · Esc 取消";ResetSessionTool();ShowViews();UpdatePinEditRegion();Invalidate();
+        state_.hint=L"贴图标注 · Enter 完成 · Esc 取消";state_.clear_outside=pin_edit_live_;ResetSessionTool();ShowViews();UpdatePinEditRegion();Invalidate();
     }catch(...){Cancel(false);throw;}
     return true;
 }
@@ -586,7 +659,16 @@ void Application::UpdatePinEditRegion(){
             auto box=Bounds(document_.marks[document_.selected]);for(auto handle:EditHandles(document_.marks[document_.selected],document_.selected_part,state_.toolbar.scale)){box.left=std::min(box.left,handle.point.x);box.right=std::max(box.right,handle.point.x);box.top=std::min(box.top,handle.point.y);box.bottom=std::max(box.bottom,handle.point.y);}
             const float padding=7*state_.toolbar.scale;add({box.left-padding,box.top-padding,box.right+padding,box.bottom+padding},false);
         }
-        add(state_.toolbar.bounds,true);if(state_.picker.open)add(state_.picker.bounds,true);if(state_.dropdown.Open())add(state_.dropdown.bounds,true);
+        // GDI round-rect regions are aliased and never match the drawn radius. Over a live screen copy
+        // (clear_outside) use a rectangle with a shadow margin instead: the margin shows that copy, so
+        // the anti-aliased rounded corners and the shadow blend into the real desktop seamlessly.
+        const float chrome_pad=std::ceil(6*state_.toolbar.scale);
+        const auto chrome_part=[&](Box b){if(state_.clear_outside)add({b.left-chrome_pad,b.top-chrome_pad,b.right+chrome_pad,b.bottom+chrome_pad},false);else add(b,true);};
+        chrome_part(state_.toolbar.bounds);if(state_.toolbar.CardVisible())chrome_part(state_.toolbar.card);if(state_.picker.open)chrome_part(state_.picker.bounds);if(state_.dropdown.Open())chrome_part(state_.dropdown.bounds);
+        // Toolbar tooltips sit ~36 DIP above (or below) the button, outside the toolbar margin. Over the
+        // screen copy that room is harmless (it shows the screen, incl. the pin's own frame, as it is), so
+        // the tooltip draws whole and on top of the pin's border instead of being cut at the region edge.
+        if(state_.clear_outside){const Box tip=ToolbarTooltipReserve(state_.toolbar,state_.hover,state_.property_drag);if(tip.right>tip.left)add(tip,false);}
         if(!SetWindowRgn(view->window,region,TRUE))DeleteObject(region);
     }
 }
@@ -824,13 +906,13 @@ void Application::UpdateToolbar(POINT point) {
     toolbar_monitor_=chosen;
     const auto now=GetTickCount64();
     const auto tool=state_.PropertyTool()==Tool::Select&&toolbar_transition_.Active(now)?state_.closing_tool:state_.PropertyTool();
-    state_.toolbar=PlaceToolbar(state_.selection,chosen,scale,toolbar_transition_.Value(now),tool,state_.number_combo);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
+    state_.toolbar=PlaceToolbar(state_.selection,chosen,scale,toolbar_transition_.Value(now),tool,state_.number_combo,preferences_.toolbar,ocr_available_,pin_edit_id_==0);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
 }
 void Application::AnimateToolbar() {
     const auto now=GetTickCount64();
     if(!state_.selected){KillTimer(main_,9);return;}
     const auto tool=state_.PropertyTool()==Tool::Select&&toolbar_transition_.Active(now)?state_.closing_tool:state_.PropertyTool();
-    state_.toolbar=PlaceToolbar(state_.selection,toolbar_monitor_,state_.toolbar.scale,toolbar_transition_.Value(now),tool,state_.number_combo);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
+    state_.toolbar=PlaceToolbar(state_.selection,toolbar_monitor_,state_.toolbar.scale,toolbar_transition_.Value(now),tool,state_.number_combo,preferences_.toolbar,ocr_available_,pin_edit_id_==0);state_.toolbar.ocr_available=ocr_available_;state_.toolbar.recording_available=pin_edit_id_==0;
     if(!toolbar_transition_.Active(now)){KillTimer(main_,9);state_.closing_tool=Tool::Select;}
     state_.hover=-1;Invalidate();
 }
@@ -838,8 +920,11 @@ void Application::AnimateToolbar() {
 void Application::PointerDown(View& view,Point point) {
     if(state_.busy)return;
     magnifier_.Hide();
+    // Clicks inside the in-place text box move its caret; outside they finish it.
+    if(TextEditPointer(point,0))return;
+    const bool finished_text=edit_&&!edit_badge_label_;
     CommitText();SetFocus(view.window);
-    if(state_.dropdown.Open()){ApplyToolbarDropdown(state_.dropdown.Hit(point));AnimateToolbar();Invalidate();return;}
+    if(state_.dropdown.Open()){if(PinFromMoreMenu(point))return;ApplyToolbarDropdown(state_.dropdown.Hit(point));AnimateToolbar();Invalidate();return;}
     if(state_.picker.open){
         if(!Contains(state_.picker.bounds,point)||state_.picker.Hit(point)==2){ClosePicker();return;}
         state_.picker.Down(point);state_.PickerColor()=state_.picker.color;ApplySelectedProperties(true);if(state_.picker.drag>=0)SetCapture(view.window);Invalidate();return;
@@ -848,7 +933,7 @@ void Application::PointerDown(View& view,Point point) {
         const int command=ui::HitTest(ToolbarControls(state_,document_),point);
         if(command==46||command==47||command==56||command==64||command==65){state_.property_drag=command;SetCapture(view.window);SetToolbarSlider(state_,command,point);ApplySelectedProperties(true);Invalidate();return;}
         if(command>=0){toolbar_pressed_=command<int(ui::ToolbarSlots)?command:-1;SyncToolbarMotion();Command(command);return;}
-        if(Contains(state_.toolbar.bounds,point))return;
+        if(Contains(state_.toolbar,point))return;
     }
     if(state_.selected&&state_.tool==Tool::Pen&&state_.pen_polyline){
         if(Contains(state_.selection,point))PolylineClick(point);
@@ -911,7 +996,9 @@ void Application::PointerDown(View& view,Point point) {
         draft_=std::move(mark);Invalidate();return;
     }else if(state_.tool==Tool::Text) {
         ReleaseCapture();
-        BeginText(view,point);
+        // Like other in-place editors, the click that finishes a text only
+        // finishes it; the next click places a new one.
+        if(!finished_text)BeginText(view,point);
     }
     else {
         Mark mark;mark.tool=state_.tool;mark.a=mark.b=point;mark.color=state_.ActiveColor();
@@ -932,6 +1019,7 @@ void Application::PointerMove(View& source,Point point,WPARAM) {
     TraceScope trace("pointer_move",state_.dragging?1:(state_.selected?2:0));
     const Box old_selection=state_.selection;
     if(state_.busy)return;state_.pointer=point;
+    if(TextEditPointer(point,1))return;
     if(mark_moving_&&mark_handle_>=0){if(const auto cursor=ui::SelectionEditCursor(document_,state_,point,GetDpiForWindow(source.window),mark_handle_))SetCursor(cursor);}
     if(state_.dropdown.Open()){const int hovered=state_.dropdown.Hit(point);if(hovered!=state_.dropdown.hover){state_.dropdown.hover=hovered;Invalidate();}return;}
     if(state_.property_drag>=0){SetToolbarSlider(state_,state_.property_drag,point);ApplySelectedProperties(true);Invalidate();for(auto& view:views_)UpdateWindow(view->window);return;}
@@ -984,7 +1072,7 @@ void Application::PointerMove(View& source,Point point,WPARAM) {
     state_.hover=state_.selected?ui::HitTest(ToolbarControls(state_,document_),point):-1;
     if(!draft_&&!moving_&&!resizing_&&!mark_moving_){
         state_.line_snap.reset();
-        if(state_.selected&&state_.tool==Tool::Pen&&state_.pen_straight&&Contains(state_.selection,point)&&!Contains(state_.toolbar.bounds,point))PenSnapPoint(point);
+        if(state_.selected&&state_.tool==Tool::Pen&&state_.pen_straight&&Contains(state_.selection,point)&&!Contains(state_.toolbar,point))PenSnapPoint(point);
     }
     previous_=point;
     if(!state_.selected&&!state_.dragging) {
@@ -1002,14 +1090,15 @@ void Application::PointerMove(View& source,Point point,WPARAM) {
 }
 void Application::PointerDoubleClick(View& view,Point point) {
     if(state_.busy||pending_)return;
+    if(TextEditPointer(point,3))return;
     if(state_.dropdown.Open()||state_.picker.open){PointerDown(view,point);return;}
     if(state_.tool==Tool::Pen&&state_.pen_polyline){
-        if(!line_vertices_.empty()&&Contains(state_.selection,point)&&!Contains(state_.toolbar.bounds,point)){
+        if(!line_vertices_.empty()&&Contains(state_.selection,point)&&!Contains(state_.toolbar,point)){
             PolylineClick(point);EndPolyline(false);
         }
         return;
     }
-    if(!state_.selected||!Contains(state_.selection,point)||Contains(state_.toolbar.bounds,point)||
+    if(!state_.selected||!Contains(state_.selection,point)||Contains(state_.toolbar,point)||
         ui::HitTest(ToolbarControls(state_,document_),point)>=0)return;
     const int index=document_.HitTest(point);
     if(index>=0){const auto& mark=document_.marks[index];
@@ -1024,6 +1113,7 @@ void Application::PointerDoubleClick(View& view,Point point) {
 void Application::PointerUp(View& view,Point point) {
     if(toolbar_pressed_>=0){toolbar_pressed_=-1;TickToolbarMotion();}
     if(state_.busy)return;
+    if(TextEditPointer(point,2))return;
     if(state_.property_drag>=0){SetToolbarSlider(state_,state_.property_drag,point);ApplySelectedProperties();state_.property_drag=-1;ReleaseCapture();RememberProperties();Invalidate();return;}
     if(state_.picker.open){state_.picker.Move(point);state_.picker.drag=-1;state_.PickerColor()=state_.picker.color;ApplySelectedProperties(true);ReleaseCapture();Invalidate();return;}
     if(!line_vertices_.empty()){ReleaseCapture();return;}
@@ -1060,6 +1150,7 @@ void Application::PointerUp(View& view,Point point) {
     if(editing_handle){const auto cursor=ui::SelectionEditCursor(document_,state_,point,GetDpiForWindow(view.window));SetCursor(cursor?cursor:LoadCursorW(nullptr,IDC_ARROW));}
 }
 void Application::Command(int id) {
+    if(id==ToolbarPropertiesId){ToggleProperties();return;}
     if(!client_output_.empty()&&(id==13||id==15||id==16||id==17||id==18)){Notice(L"聊天截图模式：请点击完成，将图片插入聊天。");return;}
     if(!state_.busy&&!line_vertices_.empty()){
         if(id==7){UndoPolylinePoint();return;}
@@ -1112,6 +1203,13 @@ void Application::Command(int id) {
         try{longshot_->Start(region);}catch(const std::exception& e){Notice(ErrorText(e));}
         return;
     }
+    if(id==ToolbarMoreId){
+        const auto anchor=state_.toolbar.Button(ToolbarMoreId);
+        const POINT center{LONG((anchor.left+anchor.right)/2),LONG((anchor.top+anchor.bottom)/2)};
+        RECT monitor=toolbar_monitor_;
+        for(const auto candidate:monitors_)if(PtInRect(&candidate,center)){monitor=candidate;break;}
+        OpenToolbarMoreMenu(state_,monitor);return;
+    }
     if(id>=20&&(state_.PropertyTool()==Tool::Select||(state_.PropertyTool()==Tool::Mosaic&&(id<24||id==28))))return;
     if((id>=0&&id<7)||id==14){
         const Tool next=id==14?Tool::Number:static_cast<Tool>(id);
@@ -1119,11 +1217,11 @@ void Application::Command(int id) {
             if(state_.picker.open)ClosePicker(true);
             if(state_.property_drag>=0){state_.property_drag=-1;ReleaseCapture();}
             if(next==Tool::Select)state_.closing_tool=state_.tool;
-            const auto now=GetTickCount64();toolbar_transition_.Target(next==Tool::Select?0.f:1.f,now);
+            const auto now=GetTickCount64();toolbar_transition_.Target(PropertyExpansion(next),now);
             BOOL animate=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
-            if(!animate)toolbar_transition_.Reset(next==Tool::Select?0.f:1.f);
+            if(!animate)toolbar_transition_.Reset(PropertyExpansion(next));
             state_.tool=next;AnimateToolbar();
-            if(toolbar_transition_.Active(now)&&!SetTimer(main_,9,16,nullptr)){toolbar_transition_.Reset(next==Tool::Select?0.f:1.f);AnimateToolbar();}
+            if(toolbar_transition_.Active(now)&&!SetTimer(main_,9,16,nullptr)){toolbar_transition_.Reset(PropertyExpansion(next));AnimateToolbar();}
         }
         document_.selected=-1;SyncSelectedProperties();
     }
@@ -1189,9 +1287,9 @@ void Application::SyncSelectedProperties(){
     }
     if(state_.tool!=Tool::Select)return;
     if(state_.selected_tool==Tool::Select&&previous!=Tool::Select)state_.closing_tool=previous;
-    const auto now=GetTickCount64();toolbar_transition_.Target(state_.selected_tool==Tool::Select?0.f:1.f,now);
+    const auto now=GetTickCount64();toolbar_transition_.Target(PropertyExpansion(state_.selected_tool),now);
     BOOL animate=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
-    if(!animate)toolbar_transition_.Reset(state_.selected_tool==Tool::Select?0.f:1.f);
+    if(!animate)toolbar_transition_.Reset(PropertyExpansion(state_.selected_tool));
     AnimateToolbar();
     if(toolbar_transition_.Active(now)&&main_)SetTimer(main_,9,16,nullptr);
 }
@@ -1206,7 +1304,51 @@ void Application::ApplySelectedProperties(bool preview){
     if(property_original_){mark=*property_original_;property_original_.reset();}
     if(changed!=mark){document_.Checkpoint();mark=std::move(changed);}
 }
+void Application::ToggleProperties(){
+    properties_open_=!properties_open_;
+    if(!properties_open_){if(state_.picker.open)ClosePicker(true);state_.dropdown.Close();}
+    const auto now=GetTickCount64();const float target=PropertyExpansion(state_.PropertyTool());
+    toolbar_transition_.Target(target,now);
+    BOOL animate=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
+    if(!animate)toolbar_transition_.Reset(target);
+    if(toolbar_transition_.Active(now)&&main_&&!SetTimer(main_,9,16,nullptr))toolbar_transition_.Reset(target);
+    AnimateToolbar();Invalidate();
+}
+bool Application::PinFromMoreMenu(Point point){
+    if(state_.dropdown.property!=ToolbarMoreId)return false;
+    const int row=state_.dropdown.Hit(point);
+    if(row<0||!Contains(ToolbarMorePinBox(state_.dropdown,row),point))return false;
+    const int id=state_.dropdown.items[static_cast<size_t>(row)].second;
+    state_.dropdown.Close();
+    auto layout=preferences_.toolbar;layout.SetOnPanel(id,true);ApplyToolbarCustomization(layout);
+    Invalidate();return true;
+}
+bool Application::OpenToolbarContext(Point point){
+    if(!state_.selected||state_.busy||state_.picker.open||!Contains(state_.toolbar,point))return false;
+    const int id=ui::HitTest(ToolbarControls(state_,document_),point);
+    if(!OpenToolbarContextMenu(state_,id,toolbar_monitor_))return false;
+    state_.hover=-1;toolbar_pressed_=-1;TickToolbarMotion();Invalidate();return true;
+}
+void Application::ApplyToolbarCustomization(ToolbarCustomization layout){
+    layout.Normalize();
+    if(layout==preferences_.toolbar)return;
+    preferences_.toolbar=std::move(layout);
+    AnimateToolbar();
+    // An explicit layout choice, not a preview: write it now instead of on the property timer.
+    if(!demo_&&!diagnostic_session_){properties_dirty_=true;FlushProperties();}
+}
 void Application::ApplyToolbarDropdown(int index) {
+    if(state_.dropdown.property==ToolbarContextMenuId){
+        const int value=index>=0&&index<static_cast<int>(state_.dropdown.items.size())?state_.dropdown.items[static_cast<size_t>(index)].second:-1;
+        state_.dropdown.Close();
+        auto layout=preferences_.toolbar;
+        if(value==ToolbarRestoreAllItem)layout.overflow.clear();else if(value>=0)layout.SetOnPanel(value,false);
+        ApplyToolbarCustomization(layout);return;
+    }
+    if(state_.dropdown.property==ToolbarMoreId){
+        const int id=index>=0&&index<static_cast<int>(state_.dropdown.items.size())?state_.dropdown.items[static_cast<size_t>(index)].second:-1;
+        state_.dropdown.Close();if(id>=0)Command(id);return;
+    }
     const bool font=state_.dropdown.property==80&&index>=0&&index<static_cast<int>(state_.dropdown.items.size());
     ChooseToolbarDropdown(state_,index);ApplySelectedProperties();
     RememberProperties();
@@ -1216,6 +1358,7 @@ void Application::ApplyToolbarDropdown(int index) {
     }
 }
 void Application::ResetSessionTool(){
+    properties_open_=false;
     StopToolbarMotion();BOOL effects=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&effects,0);toolbar_effects_=effects!=FALSE;
     line_vertices_.clear();state_.polyline_confirmed=0;state_.polyline_active=false;state_.line_snap.reset();
     // Each new capture/pin-edit starts in selection, regardless of prior tools.
@@ -1310,7 +1453,19 @@ bool Application::FinishQuickSelection(){
     return false;
 }
 void Application::QuickOcrReady(){
-    if(quick_ocr_)for(auto& completion:quick_ocr_->Take())ApplyOcrCompletion(std::move(completion));
+    if(!quick_ocr_)return;
+    for(auto& completion:quick_ocr_->Take()){
+        if(completion.id!=kClipboardOcrId){ApplyOcrCompletion(std::move(completion));continue;}
+        // Clipboard image-card OCR: copy the text and report it in a tray balloon.
+        auto text=ocr::Selected(completion.text,ocr::All(completion.text));
+        if(preferences_.ocr_remove_whitespace)text=RemoveTextWhitespace(text);
+        std::wstring message;
+        if(!completion.error.empty())message=L"识别失败："+completion.error;
+        else if(RemoveTextWhitespace(text).empty())message=L"未识别到文字";
+        else try{publish_ocr_text_(main_,text);message=L"识别到 "+std::to_wstring(completion.text.lines.size())+L" 行，已复制";}catch(const std::exception&){message=L"复制失败，请释放剪贴板后重试";}
+        if(clipboard_panel_)clipboard_panel_->SetImageOcrResult(message.rfind(L"识别到",0)==0?text:std::wstring{});
+        if(!diagnostic_session_&&!demo_){NOTIFYICONDATAW tray{sizeof(tray)};tray.hWnd=main_;tray.uID=1;tray.uFlags=NIF_INFO;tray.dwInfoFlags=NIIF_INFO|NIIF_NOSOUND;wcscpy_s(tray.szInfoTitle,L"LumaShot");wcsncpy_s(tray.szInfo,message.c_str(),_TRUNCATE);Shell_NotifyIconW(NIM_MODIFY,&tray);}
+    }
 }
 void Application::ApplyOcrCompletion(ocr::Completion completion){
     if(!quick_ocr_pending_||!active_||completion.id!=1||completion.version!=generation_)return;
@@ -1333,7 +1488,7 @@ void Application::Wheel(Point point,int steps){
     // Away from a property control, the drawing area adjusts the active stroke.
     // Text, mosaic, badges and empty selection retain their own interactions.
     const auto tool=state_.PropertyTool();
-    if(id<0&&!Contains(state_.toolbar.bounds,point)&&Contains(state_.selection,point)&&
+    if(id<0&&!Contains(state_.toolbar,point)&&Contains(state_.selection,point)&&
         (tool==Tool::Rectangle||tool==Tool::Ellipse||tool==Tool::Arrow||tool==Tool::Pen))id=24;
     if(AdjustPropertyValue(state_,id,steps)){ApplySelectedProperties();RememberProperties();Invalidate();}
 }
@@ -1414,14 +1569,21 @@ LRESULT CALLBACK Application::OverlayProc(HWND window,UINT message,WPARAM wp,LPA
         case WM_PAINT: {
             PAINTSTRUCT paint{};BeginPaint(window,&paint);
             try {if(app->frame_) {
-                // The native popup owns the live text while editing, including when
-                // the original object is rotated. Do not paint a second copy below it.
+                // The canvas paints the live in-place copy while editing, including
+                // when the original object is rotated. Do not paint the old one.
                 const int editing_text=app->edit_&&!app->edit_badge_label_?app->edit_index_:-1;
                 view->needs_paint=!view->renderer->Paint(window,view->bounds,*app->frame_,*app->acrylic_,app->document_,app->draft_,app->state_,editing_text);
                 if(view->needs_paint&&!view->renderer->FrameEvent())InvalidateRect(window,nullptr,FALSE);
             }}
             catch(...){EndPaint(window,&paint);throw;}
             EndPaint(window,&paint);return 0;
+        }
+        case WM_MOUSEACTIVATE:{
+            // Keep keyboard focus (and any IME phrase) in the in-place text
+            // field while the user clicks or drags inside its box.
+            POINT cursor{};GetCursorPos(&cursor);
+            if(app->TextEditHit({float(cursor.x),float(cursor.y)}))return MA_NOACTIVATE;
+            break;
         }
         case WM_LBUTTONDOWN:app->PointerDown(*view,GlobalPoint(view->bounds,lp));return 0;
         case WM_MOUSEMOVE:
@@ -1439,17 +1601,18 @@ LRESULT CALLBACK Application::OverlayProc(HWND window,UINT message,WPARAM wp,LPA
         case WM_LBUTTONUP:app->PointerUp(*view,GlobalPoint(view->bounds,lp));return 0;
         case WM_LBUTTONDBLCLK:app->PointerDoubleClick(*view,GlobalPoint(view->bounds,lp));return 0;
         case WM_CHAR:if(app->state_.picker.open){app->state_.picker.Type(static_cast<wchar_t>(wp));app->state_.PickerColor()=app->state_.picker.color;app->ApplySelectedProperties(true);app->Invalidate();}return 0;
-        case WM_MOUSELEAVE:{POINT cursor{};GetCursorPos(&cursor);if(!Contains(app->state_.toolbar.bounds,{float(cursor.x),float(cursor.y)})){app->state_.hover=-1;app->toolbar_pressed_=-1;app->TickToolbarMotion();}return 0;}
+        case WM_MOUSELEAVE:{POINT cursor{};GetCursorPos(&cursor);if(!Contains(app->state_.toolbar,{float(cursor.x),float(cursor.y)})){app->state_.hover=-1;app->toolbar_pressed_=-1;app->TickToolbarMotion();}return 0;}
         case WM_KILLFOCUS:case WM_CANCELMODE:app->state_.hover=-1;app->toolbar_pressed_=-1;app->TickToolbarMotion();break;
         case WM_CAPTURECHANGED:app->toolbar_pressed_=-1;app->TickToolbarMotion();app->state_.picker.drag=-1;app->state_.property_drag=-1;if(app->property_original_&&!app->state_.picker.open)app->ApplySelectedProperties();app->RememberProperties();return 0;
         case WM_KEYDOWN:if((wp==VK_RETURN||wp==VK_ESCAPE)&&(lp&(LPARAM(1)<<30)))return 0;app->Key(*view,wp);return 0;
-        case WM_RBUTTONUP:if(app->state_.dropdown.Open()){app->state_.dropdown.Close();app->Invalidate();}else if(app->state_.picker.open)app->ClosePicker(true);else if(!app->line_vertices_.empty())app->EndPolyline(false);else app->Cancel();return 0;
+        case WM_RBUTTONUP:if(app->state_.dropdown.Open()){app->state_.dropdown.Close();app->Invalidate();}else if(app->state_.picker.open)app->ClosePicker(true);else if(!app->line_vertices_.empty())app->EndPolyline(false);else if(!app->OpenToolbarContext(GlobalPoint(view->bounds,lp)))app->Cancel();return 0;
         case WM_CLOSE:case WM_DISPLAYCHANGE:PostMessageW(app->main_,kCancel,0,0);return 0;
         case WM_SETCURSOR: {
             POINT cursor{};GetCursorPos(&cursor);const Point p{float(cursor.x),float(cursor.y)};
             const auto& state=app->state_;
             const bool selecting=!state.selected||(!state.busy&&!state.picker.open&&
-                !Contains(state.toolbar.bounds,p)&&!Contains(state.selection,p,7*state.toolbar.scale));
+                !Contains(state.toolbar,p)&&!Contains(state.selection,p,7*state.toolbar.scale));
+            if(app->TextEditHit(p)){SetCursor(LoadCursorW(nullptr,IDC_IBEAM));return TRUE;}
             LPCWSTR cursor_id=selecting?IDC_CROSS:(state.tool==Tool::Text&&Contains(state.selection,p)?IDC_IBEAM:IDC_ARROW);
             const auto edit_cursor=ui::SelectionEditCursor(app->document_,state,p,GetDpiForWindow(window),app->mark_moving_?app->mark_handle_:-1);
             SetCursor(edit_cursor?edit_cursor:LoadCursorW(nullptr,cursor_id));return TRUE;
@@ -1462,6 +1625,3 @@ LRESULT CALLBACK Application::OverlayProc(HWND window,UINT message,WPARAM wp,LPA
 }
 
 }
-
-
-

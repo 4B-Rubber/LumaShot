@@ -141,24 +141,38 @@ struct StartupRenderTest {
     }
 };
 }
+// Naive form of the capture-chrome acrylic: 4x4 area average, 3 x (7-tap H, 7-tap V) box, saturation x1.3.
 static Frame Reference(const Frame& frame) {
-    const int w=std::max(1,frame.Width()/4),h=std::max(1,frame.Height()/4);
+    const int fw=frame.Width(),fh=frame.Height();
+    const int w=std::max(1,fw/4),h=std::max(1,fh/4);
     Frame reduced=MakeFrame({0,0,w,h});
-    for(int y=0;y<h;++y)for(int x=0;x<w;++x)
-        reduced.pixels[static_cast<size_t>(y)*w+x]=frame.pixels[static_cast<size_t>(y*4)*frame.Width()+x*4];
+    for(int y=0;y<h;++y)for(int x=0;x<w;++x) {
+        unsigned r{},g{},b{};
+        for(int dy=0;dy<4;++dy)for(int dx=0;dx<4;++dx) {
+            const auto c=frame.pixels[static_cast<size_t>(std::min(y*4+dy,fh-1))*fw+std::min(x*4+dx,fw-1)];
+            r+=(c>>16)&255;g+=(c>>8)&255;b+=c&255;
+        }
+        reduced.pixels[static_cast<size_t>(y)*w+x]=0xff000000u|(((r+8)/16)<<16)|(((g+8)/16)<<8)|((b+8)/16);
+    }
     std::vector<uint32_t> scratch(reduced.pixels.size());
-    for(int pass=0;pass<2;++pass) {
+    for(int round=0;round<3;++round)for(int pass=0;pass<2;++pass) {
         for(int y=0;y<h;++y)for(int x=0;x<w;++x) {
             unsigned r{},g{},b{};
-            for(int d=-4;d<=4;++d) {
+            for(int d=-3;d<=3;++d) {
                 const int px=pass==0?std::clamp(x+d,0,w-1):x;
                 const int py=pass==1?std::clamp(y+d,0,h-1):y;
                 const auto c=reduced.pixels[static_cast<size_t>(py)*w+px];
                 r+=(c>>16)&255;g+=(c>>8)&255;b+=c&255;
             }
-            scratch[static_cast<size_t>(y)*w+x]=0xff000000|((r/9)<<16)|((g/9)<<8)|(b/9);
+            scratch[static_cast<size_t>(y)*w+x]=0xff000000u|(((r+3)/7)<<16)|(((g+3)/7)<<8)|((b+3)/7);
         }
         reduced.pixels.swap(scratch);
+    }
+    for(auto& c:reduced.pixels) {
+        const unsigned r=(c>>16)&255,g=(c>>8)&255,b=c&255;
+        const int gray=static_cast<int>((r*77u+g*150u+b*29u)>>8);
+        const auto boost=[gray](unsigned v){return static_cast<uint32_t>(std::clamp(gray+(static_cast<int>(v)-gray)*13/10,0,255));};
+        c=0xff000000u|(boost(r)<<16)|(boost(g)<<8)|boost(b);
     }
     return reduced;
 }
@@ -185,6 +199,8 @@ int main(int argc,char** argv) {
             std::cout<<"\n"<<size.x<<"x"<<size.y;
             const double before=bench(Reference),after=bench(BlurBackdrop);
             std::cout<<" reference_ms="<<before<<" optimized_ms="<<after<<"\n";
+            // Runs on the capture start path (off the UI thread): keep it cheap even at 4K.
+            if(after>(size.x>=3840?120.0:40.0))throw std::runtime_error("Backdrop blur too slow");
         }
         std::cout<<"Backdrop exact-pixel tests passed\n";
     }catch(const std::exception& error){std::cerr<<error.what()<<"\n";return 1;}

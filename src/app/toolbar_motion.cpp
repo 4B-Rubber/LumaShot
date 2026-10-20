@@ -13,7 +13,8 @@ void Application::SyncToolbarMotion(uint64_t now){
     const auto origin=state_.toolbar.bounds;
     for(const auto& c:controls)if(c.id>=0&&c.id<int(ui::ToolbarSlots)&&c.Interactive())
         boxes[size_t(c.id)]={c.bounds.left-origin.left,c.bounds.top-origin.top,c.bounds.right-origin.left,c.bounds.bottom-origin.top};
-    const int selected=state_.tool==Tool::Number?14:static_cast<int>(state_.tool);
+    int selected=ToolbarToolId(state_.tool);
+    if(IsToolbarToolId(selected)&&!state_.toolbar.custom.OnPanel(selected))selected=ToolbarMoreId;
     const bool obscured=state_.picker.open||state_.dropdown.Open();
     toolbar_motion_.Update(boxes,selected,obscured?-1:state_.hover,obscured?-1:toolbar_pressed_,now,toolbar_effects_);
     if(toolbar_motion_.Active(now)){

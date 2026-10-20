@@ -20,3 +20,23 @@ pin_menu 使用合成窗口验证六项命令分派、Escape 和外部点击；�
 标注复用原截图编辑工具栏，打开时已选中当前图片；显示区域仅包含图片和工具栏，周围桌面保持可见。支持已有矩形、圆形、箭头、铅笔、文字、马赛克、序号等工具及属性。Enter / 完成更新原贴图，Esc 取消；复制按钮及 Ctrl+C 复制并更新贴图，保存使用原始分辨率。编辑仅缩放预览，标注坐标在提交时映射回原图；不重新采集桌面。
 
 验证：build.bat；pin_menu（八项命令及快捷键）、pin_interaction（锁定、重复按键、标注回调及取消）、pin_annotation（缩放映射与原图像素）、capture_to_pin（真实窗口打开工具栏、绘制、完成和取消）、capture_reselect 全部通过。
+
+## 加入剪贴板历史 / 晾到绳上（2026-10-20，参照 full.html 菜单）
+
+菜单最后一组改为与原型一致：“加入剪贴板历史”“晾到绳上 [H]”“关闭贴图”，前面一条分隔线。
+
+| 行 | 命令 | 行为 | 何时显示 / 可用 |
+|---|---|---|---|
+| 加入剪贴板历史（第 10 行） | 12 | 与悬停栏“复制”相同（`Copy(p)`）：复制当前显示的图片，剪贴板历史照常收录 | 一直显示；保存中灰显 |
+| 晾到绳上（第 11 行） | 13 | `HangPin(p)`，与贴图上按 H 相同；菜单打开时按 H 也执行 | 仅在设置中打开晾衣绳时显示（`PinMenuModel::hang`）；标注中或已晾起时灰显 |
+
+- 模型：`PinMenuModel::Count` = 13，`Commands` = {7,8,1,2,9,3,4,5,10,11,12,13,6}，新增 `hang`（默认 true）。`Height()`、`RowTop()` 按隐藏行扣除；分隔线仍在第 2、5、10 行前。
+- 新图标：剪贴板（命令 12）、衣架（命令 13）。快捷键列显示 H；“关闭贴图”显示 Esc（同 full.html）。Esc 是贴图本身的快捷键：有选中文字时先清除选择，否则关闭贴图。菜单打开时按 Esc 只关闭菜单，与原型一致。
+- “关闭贴图”悬停时使用危险样式（full.html `.mi.danger:hover`）：底色 rgba(229,72,77,.12)，文字和图标 #e5484d，明暗主题相同；不悬停时与普通行一样。预览 `build\toolbar-customization\pin-menu-danger-preview.png`；pin_menu 测试取像素校验（58 项通过）。
+- 菜单高度（有表格 + 晾衣绳）为 544 DIP；`TrackPinMenu` 原有逻辑在工作区放不下时会缩小比例，保证菜单完整显示。
+- 代码：`src/ui/pin_menu.h/.cpp`，`src/pin/pin.cpp`（`Menu()` 的 `enabled` / `hang` 与命令 12、13 分派）。修改脚本留档在会话工作区 `phase7/edits_pinmenu.py`。
+- 测试：`lumashot_pin_menu_test` 57 项通过（新增：最后一组位置、晾衣绳关闭时隐藏、菜单内 H 键分派为 13；多 DPI 用例改为与 `TrackPinMenu` 相同的适配比例）。预览 `build\toolbar-customization\pin-menu-hang-preview.png`（明暗主题，画布加高到 620 px）。`lumashot_ocr_option_test` 129 项通过：顺带修正了两条早于“翻译”行加入时就已失效的断言（无 OCR 时的导航 / 行位置），无 OCR 高度改为 418 DIP。
+
+## 玻璃效果（2026-10-20）
+
+开启透明效果时，菜单使用 Win11 瞬态 acrylic 加 Luma Glass 色调（亮 60% / 暗 72%），阴影放在独立的点击穿透窗口中；关闭透明效果时为不透明菜单。详见 `docs/menu-glass.md`。

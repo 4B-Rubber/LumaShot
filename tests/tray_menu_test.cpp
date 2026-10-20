@@ -2,6 +2,7 @@
 #include "../src/ui/tray_menu.cpp"
 #include "app/hotkey_policy.h"
 #include "export/png.h"
+#include "ui/acrylic.h"
 #include <iostream>
 using namespace lumashot;
 namespace {
@@ -18,15 +19,16 @@ void CALLBACK Tick(HWND,UINT,UINT_PTR,DWORD){
     DWORD affinity=0xffffffff;Expect(GetWindowDisplayAffinity(window,&affinity)&&affinity==WDA_NONE,"themed tray menu remains capturable");
     RECT bounds{};GetWindowRect(window,&bounds);MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&monitor);
     Expect(bounds.left>=monitor.rcWork.left&&bounds.right<=monitor.rcWork.right&&bounds.top>=monitor.rcWork.top&&bounds.bottom<=monitor.rcWork.bottom,"popup stays inside monitor work area");
+    {bool glass_ok=false;{const LONG_PTR ex=GetWindowLongPtrW(window,GWL_EXSTYLE);const HWND shadow=FindWindowW(L"LumaShot.PopupShadow",nullptr);bool below=false;for(HWND h=GetWindow(window,GW_HWNDNEXT);h&&shadow;h=GetWindow(h,GW_HWNDNEXT))if(h==shadow){below=true;break;}RECT mr{},sr{};GetWindowRect(window,&mr);if(shadow)GetWindowRect(shadow,&sr);glass_ok= TransparencyEffectsOn()?(ex&WS_EX_NOREDIRECTIONBITMAP)!=0&&(ex&WS_EX_LAYERED)==0&&shadow&&IsWindowVisible(shadow)&&below&&sr.left<mr.left&&sr.top<mr.top&&sr.right>mr.right&&sr.bottom>mr.bottom&&(GetWindowLongPtrW(shadow,GWL_EXSTYLE)&WS_EX_TRANSPARENT)!=0:(ex&WS_EX_LAYERED)!=0&&!shadow;}Expect(glass_ok,"glass tray menu uses the DWM backdrop on a body-sized window with its shadow in a click-through window below");}
     if(mode==0)PostMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);
     if(mode==1){PostMessageW(window,WM_KEYDOWN,VK_HOME,0);PostMessageW(window,WM_KEYDOWN,VK_RETURN,0);}
     if(mode==2){PostMessageW(window,WM_KEYDOWN,VK_END,0);PostMessageW(window,WM_KEYDOWN,VK_RETURN,0);}
     if(mode==3)PostMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(-8,-8));
-    if(mode==4){auto* popup=reinterpret_cast<ui::tray_detail::Popup*>(GetWindowLongPtrW(window,GWLP_USERDATA));const auto row=popup->Row(7);const LPARAM point=MAKELPARAM(int(70*popup->scale),int((row.top+row.bottom)*.5f*popup->scale));PostMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,point);PostMessageW(window,WM_LBUTTONUP,0,point);}
+    if(mode==4){auto* popup=reinterpret_cast<ui::tray_detail::Popup*>(GetWindowLongPtrW(window,GWLP_USERDATA));const auto row=popup->Row(7);const LPARAM point=MAKELPARAM(int((70-popup->origin)*popup->scale),int(((row.top+row.bottom)*.5f-popup->origin)*popup->scale));PostMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,point);PostMessageW(window,WM_LBUTTONUP,0,point);}
     if(mode==5)PostMessageW(window,WM_CANCELMODE,0,0);
     if(mode==6)PostMessageW(window,WM_ACTIVATE,WA_INACTIVE,0);
-    if(mode==7){auto* popup=reinterpret_cast<ui::tray_detail::Popup*>(GetWindowLongPtrW(window,GWLP_USERDATA));const auto row=popup->Row(6);const LPARAM point=MAKELPARAM(int(70*popup->scale),int((row.top+row.bottom)*.5f*popup->scale));SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,point);SendMessageW(window,WM_LBUTTONUP,0,point);Expect(!popup->done&&!popup->choice,"clicking divider neither selects nor closes menu");PostMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);}
-    if(mode==8){auto* popup=reinterpret_cast<ui::tray_detail::Popup*>(GetWindowLongPtrW(window,GWLP_USERDATA));const auto a=popup->Row(0),b=popup->Row(1);SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(int(70*popup->scale),int((a.top+a.bottom)*.5f*popup->scale)));SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(int(70*popup->scale),int((b.top+b.bottom)*.5f*popup->scale)));Expect(!popup->choice&&!popup->done,"drag release on another row does not trigger accidental command");PostMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);}
+    if(mode==7){auto* popup=reinterpret_cast<ui::tray_detail::Popup*>(GetWindowLongPtrW(window,GWLP_USERDATA));const auto row=popup->Row(6);const LPARAM point=MAKELPARAM(int((70-popup->origin)*popup->scale),int(((row.top+row.bottom)*.5f-popup->origin)*popup->scale));SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,point);SendMessageW(window,WM_LBUTTONUP,0,point);Expect(!popup->done&&!popup->choice,"clicking divider neither selects nor closes menu");PostMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);}
+    if(mode==8){auto* popup=reinterpret_cast<ui::tray_detail::Popup*>(GetWindowLongPtrW(window,GWLP_USERDATA));const auto a=popup->Row(0),b=popup->Row(1);SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(int((70-popup->origin)*popup->scale),int(((a.top+a.bottom)*.5f-popup->origin)*popup->scale)));SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(int((70-popup->origin)*popup->scale),int(((b.top+b.bottom)*.5f-popup->origin)*popup->scale)));Expect(!popup->choice&&!popup->done,"drag release on another row does not trigger accidental command");PostMessageW(window,WM_KEYDOWN,VK_ESCAPE,0);}
 }
 }
 int main(){

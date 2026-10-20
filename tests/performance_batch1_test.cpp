@@ -74,7 +74,9 @@ struct RenderOptimizationTest {
         Mark mosaic;mosaic.tool=Tool::Mosaic;mosaic.mosaic_mode=MosaicMode::Blur;mosaic.a={405,60};mosaic.b={510,175};doc.Add(mosaic);
         for(int editing:{0,1}){
             doc.selected=editing;Document legacy=doc;
-            if(legacy.marks[editing].tool==Tool::Number)legacy.marks[editing].text=L"\u200b";else legacy.marks.erase(legacy.marks.begin()+editing);legacy.selected=-1;
+            // In-place editing paints the whole live copy (ViewState::text_edit), so the
+            // edited object, including a number's badge, is skipped entirely.
+            legacy.marks.erase(legacy.marks.begin()+editing);legacy.selected=-1;
             const auto expected=Draw(frame,legacy,-1),actual=Draw(frame,doc,editing);
             Expect(Equal(actual,expected),"borrowed editing render matches old copied-document pixels, chrome and selection");
             Expect(doc.CanUndo()&&doc.selected==editing&&doc.marks.size()==3,"editing render does not mutate document or history");

@@ -138,6 +138,7 @@ struct QuickWindow::Impl {
             const UINT32 ink = dark ? 0xe6edf8 : 0x243042, muted = dark ? 0x98abc4 : 0x70829b;
             target->Clear(D2D1::ColorF(0, 0.f));
             if (!acrylic) Rounded(D2D1::RectF(.5f, .5f, w - .5f, h - .5f), 10.f, PanelBackground(dark));
+            else { brush->SetColor(D2D1::ColorF(PanelBackground(dark), glass::Opacity(dark))); target->FillRectangle(D2D1::RectF(0, 0, w, h), brush.Get()); }  // transient acrylic alone is too thin
             const wchar_t* tabs[]{L"全部", L"收藏", L"文本", L"图片", L"文件"};
             for (int i = 0; i < 5; ++i) {
                 const float left = i * w / 5.f;
@@ -184,23 +185,27 @@ struct QuickWindow::Impl {
                 const float y = Header + 4 + (track - thumb) * static_cast<float>(first) / static_cast<float>(rows.size() - 6);
                 Rounded(D2D1::RectF(w - 4, y, w - 2, y + thumb), 1, muted, .65f);
             }
-            brush->SetColor(D2D1::ColorF(dark ? 0x40516a : 0xc9d9ed));
-            target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(.5f, .5f, w - .5f, h - .5f), 10, 10), brush.Get(), 1.f);
+            if (!acrylic) {  // glass: DWM draws the rounded outline
+                brush->SetColor(D2D1::ColorF(dark ? 0x40516a : 0xc9d9ed));
+                target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(.5f, .5f, w - .5f, h - .5f), 10, 10), brush.Get(), 1.f);
+            }
         } catch (...) { target->EndDraw(); throw; }
         const HRESULT hr = target->EndDraw();
         if (hr == D2DERR_RECREATE_TARGET) { brush.Reset(); target.Reset(); }
         Check(hr);
     }
     void ApplyBackdrop() {
-        const BOOL night = dark;
-        DwmSetWindowAttribute(window, 20, &night, sizeof(night));
-        const DWORD backdrop = 3, corner = 2;
-        DwmSetWindowAttribute(window, 33, &corner, sizeof(corner));
-        const MARGINS margins{-1}; DwmExtendFrameIntoClientArea(window, &margins);
-        acrylic = SUCCEEDED(DwmSetWindowAttribute(window, 38, &backdrop, sizeof(backdrop)));
+        // WS_THICKFRAME + NCCALCSIZE 0 lets DWM render real acrylic; a plain WS_POPUP gets the grey fallback.
+        acrylic = ApplyPopupBackdrop(window, dark);
+        if (!acrylic) { const DWORD corner = 2; DwmSetWindowAttribute(window, 33, &corner, sizeof(corner)); }
+        // Never activated (WS_EX_NOACTIVATE): without this DWM shows the inactive fallback material.
+        if (acrylic) SendMessageW(window, WM_NCACTIVATE, TRUE, 0);
     }
     static LRESULT CALLBACK Proc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (message == WM_GETMINMAXINFO) {  // WS_THICKFRAME would otherwise enforce a minimum track size
+            reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {1, 1}; return 0;
+        }
         if (message == WM_NCCREATE) {
             self = static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
             self->window = hwnd; SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
@@ -208,6 +213,9 @@ struct QuickWindow::Impl {
         if (!self) return DefWindowProcW(hwnd, message, wp, lp);
         switch (message) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_NCCALCSIZE: if (wp) return 0; break;  // no frame: client == window
+        case WM_NCHITTEST: return HTCLIENT;
+        case WM_NCACTIVATE: if (self->acrylic) return DefWindowProcW(hwnd, message, TRUE, lp); break;
         case WM_SETTINGCHANGE: self->ApplyBackdrop(); self->Invalidate(); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
@@ -278,7 +286,7 @@ void QuickWindow::Show(HWND owner, POINT anchor, float scale, bool dark) {
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = L"LumaShot.Clipboard.Quick";
         if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) throw std::runtime_error("Quick clipboard class failed");
         if (!CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
-            wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, owner, nullptr, wc.hInstance, &p)) throw std::runtime_error("Quick clipboard window failed");
+            wc.lpszClassName, L"", WS_POPUP | WS_THICKFRAME, 0, 0, 1, 1, owner, nullptr, wc.hInstance, &p)) throw std::runtime_error("Quick clipboard window failed");
     }
     SetWindowLongPtrW(p.window, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
     p.ApplyBackdrop();
@@ -291,6 +299,7 @@ void QuickWindow::Show(HWND owner, POINT anchor, float scale, bool dark) {
     const int x = std::clamp(static_cast<int>(anchor.x), static_cast<int>(work.left), static_cast<int>(work.right) - width);
     const int y = std::clamp(static_cast<int>(anchor.y) - height - static_cast<int>(6 * p.scale), static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
     SetWindowPos(p.window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (p.acrylic) SendMessageW(p.window, WM_NCACTIVATE, TRUE, 0);
     p.Invalidate();
 }
 void QuickWindow::Update(std::vector<QuickRow> rows, size_t selected, int tab, bool continuous, bool busy, std::wstring status) {

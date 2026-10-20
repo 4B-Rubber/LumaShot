@@ -32,9 +32,9 @@ int main() {
         }
     }
     PinMenuModel menu;menu.ocr_available=false;
-    expect(!menu.Visible(7)&&menu.Next(6,1)==8&&menu.Next(8,-1)==6,"missing OCR removes recognition from menu navigation");
-    expect(menu.Hit(40,menu.RowTop(8)+21)==8,"close row moves into removed OCR row");
-    expect(menu.Height()==334.f,"menu closes unused OCR space");
+    expect(!menu.Visible(7)&&menu.Next(6,1)==10&&menu.Next(10,-1)==6,"missing OCR removes recognition from menu navigation");
+    expect(menu.Hit(40,menu.RowTop(10)+21)==10&&menu.RowTop(10)==menu.RowTop(6)+50,"history row moves into removed OCR rows");
+    expect(menu.Height()==418.f,"menu closes unused OCR space");
     for(const auto* asset:ocr::RequiredAssets)std::filesystem::remove(root/asset);
     std::filesystem::remove(root/L"ocr");std::filesystem::remove(root);
     return failures?1:0;

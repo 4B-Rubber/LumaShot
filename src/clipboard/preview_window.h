@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "clipboard/preview_data.h"
+#include "clipboard/entry_flavor.h"
 #include "clipboard/composition.h"
 #include "clipboard/syntax_highlight.h"
 #include "capture/frame.h"
@@ -28,6 +29,9 @@ public:
 
     void Show(HWND owner, const Entry& entry, RECT panel_rect, bool dark, float scale, PreviewData data = {});
     void SetCopyAction(std::function<void()> action){copy_action_=std::move(action);}
+    // full.html #ql image body: natural size and the OCR text area. `ocr_available` shows "按 O 识别图中文字".
+    void SetOcrAction(std::function<void()> action){ocr_action_=std::move(action);}
+    void SetImageDetails(uint64_t id,SIZE natural,std::wstring ocr_text,bool ocr_available,bool ocr_pending);
     void Hide();
     bool ForwardWheel(WPARAM key, LPARAM position);
     void SetContent(uint64_t id, PreviewData data);
@@ -58,7 +62,11 @@ private:
     std::wstring SelectedText() const;
     void CopyText();
     std::unique_ptr<ClipboardComposition> composition_;
-    std::function<void()> copy_action_;
+    std::function<void()> copy_action_,ocr_action_;
+    std::wstring ocr_text_;bool ocr_available_{},ocr_pending_{};SIZE natural_{};D2D1_RECT_F ocr_link_{};
+    Flavor flavor_{};SYSTEMTIME time_{};
+    static constexpr float HeaderHeight=42,FooterHeight=34;
+    float TextWidth(const std::wstring& text,IDWriteTextFormat* format);
     RECT panel_rect_{};
     bool acrylic_{},selecting_{};
     UINT32 selection_anchor_{},selection_end_{};
@@ -83,6 +91,7 @@ private:
     ComPtr<IDWriteTextFormat> title_font_;
     ComPtr<IDWriteTextFormat> body_font_;
     ComPtr<IDWriteTextFormat> meta_font_;
+    ComPtr<IDWriteTextFormat> icon_font_,prose_font_,kbd_font_,line_font_;
     ComPtr<IDWriteTextLayout> text_layout_;
 };
 

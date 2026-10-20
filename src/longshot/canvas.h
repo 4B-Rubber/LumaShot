@@ -2,6 +2,7 @@
 #include "capture/frame.h"
 #include "ui/controls.h"
 #include "ui/text_renderer.h"
+#include "clipboard/composition.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace lumashot::longshot {
 using Microsoft::WRL::ComPtr;
@@ -51,7 +53,8 @@ public:
     void Panel(Box b,bool acrylic,float radius_dip=14);
     // Whole-window surface for DWM-rounded layered windows: DWM draws the
     // corners and border; acrylic keeps a single alpha quantum for hit testing.
-    void Backdrop(Box b,bool acrylic);
+    // tint: window on the DWM system backdrop (ApplyPopupBackdrop) -> Luma Glass tint instead of the alpha quantum.
+    void Backdrop(Box b,bool acrylic,bool tint=false);
     ui::PaintContext Context(bool acrylic);
 private:
     IDWriteTextFormat* Format(float px,bool bold,DWRITE_TEXT_ALIGNMENT align,DWRITE_PARAGRAPH_ALIGNMENT vertical,bool wrap);
@@ -64,7 +67,8 @@ private:
     std::map<std::tuple<int,bool,int,int,bool>,ComPtr<IDWriteTextFormat>> formats_;
 };
 
-// Software D2D target bound to a DIB and pushed with UpdateLayeredWindow.
+// Software D2D target bound to a DIB and pushed with UpdateLayeredWindow, or, for glass windows
+// (WS_EX_NOREDIRECTIONBITMAP on the DWM backdrop), moved with SetWindowPos and presented through DirectComposition.
 // Used for the small always-on-top session windows (per-pixel alpha, no
 // swap chain and no render loop).
 class LayeredCanvas {
@@ -75,6 +79,8 @@ private:
     ComPtr<ID2D1RenderTarget> target_;
     std::unique_ptr<DibSurface> surface_;
     SIZE size_{};
+    std::unique_ptr<ClipboardComposition> composition_;
+    std::vector<uint32_t> packed_;
 };
 
 // Area-averaged reduction that keeps the aspect ratio; never upscales.

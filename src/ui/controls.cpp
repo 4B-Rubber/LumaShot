@@ -40,7 +40,7 @@ void DrawControls(const PaintContext& p,const Theme& theme,std::span<const Contr
         const auto ink=!c.enabled?theme.Muted():(c.primary?0xffffffff:(c.selected?theme.Accent():theme.Ink()));
         if(c.kind==Kind::Surface){p.surface(b,14*s);continue;}
         if(c.kind==Kind::Group){fill(b,theme.dark?0x1823344d:0x60ffffff,10*s);stroke(b,theme.dark?0x225f7697:0x60ffffff,10*s);continue;}
-        if(c.kind==Kind::Label){p.text(c.text,b,12*s,c.enabled?theme.Ink():theme.Muted());continue;}
+        if(c.kind==Kind::Label){p.text(c.text,b,12*s,c.caption?theme.Caption():(c.enabled?theme.Ink():theme.Muted()));continue;}
         if(c.kind==Kind::Separator){const float x=(b.left+b.right)/2;p.target->DrawLine({x,b.top},{x,b.bottom},p.brush(theme.Border()),s);continue;}
         if(c.kind==Kind::Slider) {
             const auto track=SliderTrack(b,s);const Point knob=SliderThumb(b,c.value,s);

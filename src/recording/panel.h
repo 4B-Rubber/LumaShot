@@ -19,7 +19,7 @@ PreviewImages ReadPreview(const std::filesystem::path& path,long long duration,s
 struct PanelButton {int id{};D2D1_RECT_F box{};};
 struct PanelState {
     State state{State::Ready};bool gif{},dark{},cursor{true},system{true},microphone{},loop{true},software{},exporting{};
-    bool selected{},playing{},acrylic{};int fps{30},width{0},source{},countdown{},progress{},hover{-1},quality{1},gif_preset{1};
+    bool selected{},playing{},acrylic{},backdrop{};int fps{30},width{0},source{},countdown{},progress{},hover{-1},quality{1},gif_preset{1};
     std::wstring size_estimate;SIZE media_size{};float preview_scale{1};
     long long time{},trim_begin{},trim_end{},position{};std::wstring detail,notice,export_stage;bool preview_loading{},play_pending{};
     const PreviewImages* images{};
@@ -29,4 +29,3 @@ struct PanelState {
 SIZE PanelSize(const PanelState& state);
 std::vector<PanelButton> DrawPanel(ID2D1RenderTarget* target,IDWriteFactory* fonts,const PanelState& state);
 }
-

@@ -74,7 +74,7 @@ struct Painter {
 std::vector<PanelButton> DrawPanel(ID2D1RenderTarget* target,IDWriteFactory* fonts,const PanelState& s){
     Painter p(target,fonts,s);const auto size=PanelSize(s);const float width=float(size.cx),height=float(size.cy);
     const wchar_t* quality=s.gif?(s.gif_preset<0?L"自定义":s.gif_preset==0?L"小体积":s.gif_preset==2?L"清晰优先":L"均衡"):(s.quality==0?L"小体积":s.quality==2?L"高画质":L"均衡");
-    target->Clear(D2D1::ColorF(0,0.f));ui::DrawGlassSurface(target,p.brush.Get(),{0,0,width,height},s.dark,s.acrylic);
+    target->Clear(D2D1::ColorF(0,0.f));if(s.backdrop)ui::DrawBackdropTint(target,p.brush.Get(),{0,0,width,height},s.dark);else ui::DrawGlassSurface(target,p.brush.Get(),{0,0,width,height},s.dark,s.acrylic);
     if(s.state==State::Ready){
         const float left=(width-246)/2;p.Round({left,10,left+246,36},13,s.dark?0x1c2837:0xccdcec,.22f);
         const auto& motion=s.tab_motion;
@@ -160,7 +160,6 @@ std::vector<PanelButton> DrawPanel(ID2D1RenderTarget* target,IDWriteFactory* fon
     return p.buttons;
 }
 }
-
 
 
 

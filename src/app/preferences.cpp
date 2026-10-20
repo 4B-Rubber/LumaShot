@@ -2,6 +2,7 @@
 #include "app/hotkeys.h"
 #include "app/tool_preferences.h"
 #include "app/settings_process.h"
+#include "clipboard/layout.h"
 #include <commctrl.h>
 #include <shlobj.h>
 #include <functional>
@@ -49,6 +50,18 @@ static std::filesystem::path ConfigPath() {
     CoTaskMemFree(raw);
     return path/L"LumaShot"/L"settings.ini";
 }
+static ToolbarCustomization LoadToolbarCustomization(const std::filesystem::path& path){
+    ToolbarCustomization value;wchar_t text[256]{};
+    GetPrivateProfileStringW(L"Toolbar",L"Order",L"",text,256,path.c_str());
+    if(text[0])value.order=ParseToolbarIds(text);
+    GetPrivateProfileStringW(L"Toolbar",L"Overflow",L"",text,256,path.c_str());
+    value.overflow=ParseToolbarIds(text);
+    const int labels=static_cast<int>(GetPrivateProfileIntW(L"Toolbar",L"Labels",0,path.c_str()));
+    value.labels=labels>=0&&labels<=2?static_cast<ToolbarLabels>(labels):ToolbarLabels::Auto;
+    value.auto_properties=GetPrivateProfileIntW(L"Toolbar",L"AutoProperties",1,path.c_str())!=0;
+    value.property_style=GetPrivateProfileIntW(L"Toolbar",L"PropertyStyle",0,path.c_str())==1?PropertyBarStyle::Card:PropertyBarStyle::Strip;
+    value.Normalize();return value;
+}
 Preferences Preferences::Load() {
     return LoadFrom(ConfigPath());
 }
@@ -56,16 +69,25 @@ Preferences Preferences::LoadFrom(const std::filesystem::path& path) {
     Preferences value;
     if(path.empty()) return value;
     value.tools=LoadToolProperties(path,value.tools);
+    value.toolbar=LoadToolbarCustomization(path);
     value.start_with_windows=GetPrivateProfileIntW(L"General",L"StartWithWindows",1,path.c_str())!=0;
     value.include_cursor=GetPrivateProfileIntW(L"General",L"IncludeCursor",1,path.c_str())!=0;
     value.clipboard_enabled=GetPrivateProfileIntW(L"General",L"ClipboardEnabled",0,path.c_str())!=0;
     value.clipboard_persist=GetPrivateProfileIntW(L"General",L"ClipboardPersist",0,path.c_str())!=0;
     value.clipboard_strip_visible=GetPrivateProfileIntW(L"General",L"ClipboardStripVisible",1,path.c_str())!=0;
     value.clipboard_strip_hint_shown=GetPrivateProfileIntW(L"General",L"ClipboardStripHintShown",0,path.c_str())!=0;
+    value.clipboard_max_entries=static_cast<int>(GetPrivateProfileIntW(L"General",L"ClipboardMaxEntries",100,path.c_str()));
+    if(!ValidClipboardLimit(value.clipboard_max_entries))value.clipboard_max_entries=100;
+    // The strip style used to live only in clipboard-layout.ini; adopt it until saved here.
+    if(const int style=static_cast<int>(GetPrivateProfileIntW(L"General",L"ClipboardStripStyle",-1,path.c_str()));style>=0)value.clipboard_classic_strip=style==1;
+    else value.clipboard_classic_strip=clipboard::LoadStripStyle(path.parent_path()/L"clipboard-layout.ini")==clipboard::StripStyle::Classic;
+    value.clipboard_card_preview=GetPrivateProfileIntW(L"General",L"ClipboardCardPreview",1,path.c_str())!=0;
     value.translate_auto_show=GetPrivateProfileIntW(L"General",L"TranslateAutoShow",1,path.c_str())!=0;
     value.clothesline_enabled=GetPrivateProfileIntW(L"General",L"ClotheslineEnabled",1,path.c_str())!=0;
     value.ocr_remove_whitespace=GetPrivateProfileIntW(L"General",L"OcrRemoveWhitespace",0,path.c_str())!=0;
-    value.settings_page=std::clamp(static_cast<int>(GetPrivateProfileIntW(L"General",L"SettingsPage",0,path.c_str())),0,5);
+    // SettingsTab indexes the eight-page dialog; older builds wrote SettingsPage for the six-page one.
+    if(const int tab=static_cast<int>(GetPrivateProfileIntW(L"General",L"SettingsTab",-1,path.c_str()));tab>=0)value.settings_page=std::clamp(tab,0,7);
+    else if(const int legacy=static_cast<int>(GetPrivateProfileIntW(L"General",L"SettingsPage",-1,path.c_str()));legacy>=0){constexpr int moved[]{1,2,4,2,6,0};value.settings_page=moved[std::clamp(legacy,0,5)];}
     value.hotkeys_disabled=GetPrivateProfileIntW(L"General",L"HotkeysDisabled",0,path.c_str())!=0;
     value.disable_hotkeys_in_game=GetPrivateProfileIntW(L"General",L"DisableHotkeysInGame",0,path.c_str())!=0;
     value.paste_as_file=GetPrivateProfileIntW(L"General",L"PasteAsFile",1,path.c_str())!=0;
@@ -91,6 +113,9 @@ Preferences Preferences::LoadFrom(const std::filesystem::path& path) {
     if(value.translate_key&&!ValidShortcut(value.translate_modifiers,value.translate_key)){value.translate_key='Y';value.translate_modifiers=MOD_CONTROL|MOD_ALT;}
     shortcut(L"OcrHotkey",L"OcrModifiers",'O',value.ocr_key,value.ocr_modifiers);
     shortcut(L"PinHotkey",L"PinModifiers",'P',value.pin_key,value.pin_modifiers);
+    shortcut(L"SelectionTranslateHotkey",L"SelectionTranslateModifiers",'T',value.selection_key,value.selection_modifiers);
+    // Added with selection translation: a default that collides with a chord the user already chose stays unset.
+    if(value.selection_key){const auto all=AllShortcuts(value);const Shortcut mine{value.selection_modifiers,value.selection_key};if(std::count(all.begin(),all.end(),mine)>1)value.selection_key=0;}
     wchar_t folder[32768]{};
     GetPrivateProfileStringW(L"General",L"OcrModelDirectory",L"",folder,32768,path.c_str());
     value.ocr_model_directory=folder;
@@ -132,9 +157,12 @@ void Preferences::SaveTo(const std::filesystem::path& destination) const {
     write(L"ClipboardPersist",clipboard_persist?L"1":L"0");
     write(L"ClipboardStripVisible",clipboard_strip_visible?L"1":L"0");
     write(L"ClipboardStripHintShown",clipboard_strip_hint_shown?L"1":L"0");
+    write(L"ClipboardMaxEntries",std::to_wstring(ValidClipboardLimit(clipboard_max_entries)?clipboard_max_entries:100));
+    write(L"ClipboardStripStyle",clipboard_classic_strip?L"1":L"0");
+    write(L"ClipboardCardPreview",clipboard_card_preview?L"1":L"0");
     write(L"TranslateAutoShow",translate_auto_show?L"1":L"0");
     write(L"ClotheslineEnabled",clothesline_enabled?L"1":L"0");
-    write(L"SettingsPage",std::to_wstring(std::clamp(settings_page,0,5)));
+    write(L"SettingsTab",std::to_wstring(std::clamp(settings_page,0,7)));
     write(L"HotkeysDisabled",hotkeys_disabled?L"1":L"0");
     write(L"DisableHotkeysInGame",disable_hotkeys_in_game?L"1":L"0");
     write(L"PasteAsFile",paste_as_file?L"1":L"0");
@@ -148,7 +176,17 @@ void Preferences::SaveTo(const std::filesystem::path& destination) const {
     write(L"OcrModelDirectory",ocr_model_directory.native());
     write(L"OcrHotkey",std::to_wstring(ocr_key));write(L"OcrModifiers",std::to_wstring(ocr_modifiers));
     write(L"PinHotkey",std::to_wstring(pin_key));write(L"PinModifiers",std::to_wstring(pin_modifiers));
+    write(L"SelectionTranslateHotkey",std::to_wstring(selection_key));write(L"SelectionTranslateModifiers",std::to_wstring(selection_modifiers));
     SaveToolProperties(temporary,tools);
+    {
+        auto layout=toolbar;layout.Normalize();
+        const auto put=[&](LPCWSTR key,const std::wstring& value){
+            if(!WritePrivateProfileStringW(L"Toolbar",key,value.c_str(),temporary.c_str()))throw std::runtime_error("Unable to save toolbar settings");
+        };
+        put(L"Order",FormatToolbarIds(layout.order));put(L"Overflow",FormatToolbarIds(layout.overflow));
+        put(L"Labels",std::to_wstring(static_cast<int>(layout.labels)));put(L"AutoProperties",layout.auto_properties?L"1":L"0");
+        put(L"PropertyStyle",layout.property_style==PropertyBarStyle::Card?L"1":L"0");
+    }
     // Remove obsolete tool selection while preserving all style preferences.
     if(!WritePrivateProfileStringW(L"General",L"LastTool",nullptr,temporary.c_str()))
         throw std::runtime_error("Unable to remove obsolete last tool setting");

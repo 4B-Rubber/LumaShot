@@ -7,7 +7,9 @@
 #include "number_reconnect_cases.h"
 #include <string_view>
 #include <commctrl.h>
+#include <imm.h>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <filesystem>
 
@@ -28,6 +30,7 @@ struct TextEditTest {
         for(auto& pixel:image.pixels){const unsigned alpha=pixel>>24;uint32_t result=0xff000000;for(int shift:{0,8,16})result|=std::min(255u,((pixel>>shift)&255)+(((background>>shift)&255)*(255-alpha)+127)/255)<<shift;pixel=result;}
         return image;
     }
+    static Frame Canvas(Application& app){Renderer renderer;return renderer.Canvas(*app.frame_,app.document_,app.state_,app.edit_&&!app.edit_badge_label_?app.edit_index_:-1);}
     #include "number_label_editor_cases.h"
     #include "tag_editor_cases.h"
     static int Run(bool numberLabelOnly=false){
@@ -45,40 +48,54 @@ struct TextEditTest {
         ShowWindow(v.window,SW_SHOW);SetForegroundWindow(v.window);UpdateWindow(v.window);Pump();
         if(numberLabelOnly){LabelEditorCases(app,v,expect);return failures?1:0;}
         state.color=0xff243142;app.BeginText(v,{140,150});Pump();
-        expect(app.edit_&&app.edit_host_&&app.edit_frame_&&GetAncestor(app.edit_,GA_ROOT)==app.edit_host_&&GetWindow(app.edit_host_,GW_OWNER)==app.edit_frame_->Window()&&GetWindow(app.edit_frame_->Window(),GW_OWNER)==v.window,"native editor and rounded frame have separate composition surfaces above the real DXGI overlay");
+        expect(app.edit_&&app.edit_host_&&!app.edit_frame_&&GetAncestor(app.edit_,GA_ROOT)==app.edit_host_&&GetWindow(app.edit_host_,GW_OWNER)==v.window,"in-place text opens no popup card; the input host is owned by the canvas");
+        {const auto ex=GetWindowLongPtrW(app.edit_host_,GWL_EXSTYLE);BYTE alpha=255;DWORD flags{};GetLayeredWindowAttributes(app.edit_host_,nullptr,&alpha,&flags);
+         expect((ex&WS_EX_LAYERED)&&(ex&WS_EX_TRANSPARENT)&&(flags&LWA_ALPHA)&&alpha<=1,"native input host is invisible and lets clicks reach the canvas");}
         GUITHREADINFO gui{sizeof(gui)};GetGUIThreadInfo(GetCurrentThreadId(),&gui);
-        expect(gui.hwndFocus==app.edit_&&gui.hwndCaret==app.edit_&&gui.rcCaret.bottom>gui.rcCaret.top,"empty editor immediately owns a native insertion caret and keyboard focus");
-        RECT initial{};GetWindowRect(app.edit_,&initial);
+        expect(gui.hwndFocus==app.edit_&&app.state_.text_edit.mark&&app.state_.text_edit.mark->tool==Tool::Text&&app.state_.text_edit.caret==0&&app.state_.text_edit.caret_visible,"empty in-place editor owns keyboard focus and shows a canvas caret at the click point");
+        const auto empty_box=app.state_.text_edit.mark?Normalize(app.state_.text_edit.mark->a,app.state_.text_edit.mark->b):Box{};
+        expect(empty_box.left==140&&empty_box.right-empty_box.left<8,"empty automatic text collapses to the insertion point instead of a wide input field");
         for(wchar_t ch:std::wstring(L"可再次编辑的文字"))SendMessageW(app.edit_,WM_CHAR,ch,0);
         Key(app.edit_,VK_RETURN,false,true);
         for(wchar_t ch:std::wstring(L"第二行，也能实时看见"))SendMessageW(app.edit_,WM_CHAR,ch,0);
-        Pump();RECT grown{};GetWindowRect(app.edit_,&grown);
-        expect(app.edit_&&SendMessageW(app.edit_,EM_GETLINECOUNT,0,0)>=2&&grown.bottom>initial.bottom,"typed Chinese text and Shift+Enter grow the multiline editor without committing");
+        Pump();
+        const std::wstring typed=L"可再次编辑的文字\r\n第二行，也能实时看见";
+        expect(app.edit_&&app.state_.text_edit.mark&&app.state_.text_edit.mark->text==typed&&app.state_.text_edit.caret==int(typed.size()),"typed Chinese text and Shift+Enter update the live canvas text without committing");
+        const Mark live=app.state_.text_edit.mark?*app.state_.text_edit.mark:Mark{};
+        expect(live.b.y-live.a.y>2*live.font_size&&live.a==Point{140,150},"live text grows to two lines from the click point");
+        const auto end_caret=MeasureTextEdit(live,int(typed.size()),int(typed.size()),int(typed.size()));
+        GetGUIThreadInfo(GetCurrentThreadId(),&gui);POINT system_caret{gui.rcCaret.left,gui.rcCaret.top};ClientToScreen(gui.hwndCaret?gui.hwndCaret:app.edit_,&system_caret);
+        std::cout<<"Painted caret: "<<end_caret.caret.left<<","<<end_caret.caret.top<<" system caret: "<<system_caret.x<<","<<system_caret.y<<'\n';
+        expect(gui.hwndCaret==app.edit_&&std::abs(float(system_caret.x)-end_caret.caret.left)<=1.5f&&std::abs(float(system_caret.y)-end_caret.caret.top)<=1.5f,"system caret follows the painted caret so IME candidates open beside it");
         for(int i=0;i<4;++i){v.renderer->FrameReady();InvalidateRect(v.window,nullptr,FALSE);UpdateWindow(v.window);Pump();}
-        const POINT hit{grown.left+8,grown.top+8};expect(WindowFromPoint(hit)==app.edit_,"editor remains above the canvas after repeated flip-model presentations");
-        GetGUIThreadInfo(GetCurrentThreadId(),&gui);
-        std::cout<<"Native caret after input: "<<gui.rcCaret.left<<","<<gui.rcCaret.top<<" focus="<<(gui.hwndFocus==app.edit_)<<" owner="<<(gui.hwndCaret==app.edit_)<<'\n';
-        expect(gui.hwndCaret==app.edit_&&gui.hwndFocus==app.edit_&&gui.rcCaret.left>0,"canvas repaint preserves text focus and the moving insertion caret");
-        RECT host{};GetWindowRect(app.edit_host_,&host);DibSurface surface(host.right-host.left,host.bottom-host.top);
-        expect(PrintWindow(app.edit_host_,surface.Dc(),0)!=FALSE,"native editing surface can be rendered for visual inspection");
-        auto preview=MakeFrame({0,0,host.right-host.left,host.bottom-host.top});std::copy_n(surface.Pixels(),preview.pixels.size(),preview.pixels.begin());for(auto& pixel:preview.pixels)pixel|=0xff000000;
-        size_t ink=0;for(auto pixel:preview.pixels)if(NoteLuminance(pixel)<.5)++ink;
-        expect(ink>100,"actual native editor painting contains visible text pixels");
-        expect(app.edit_text_glyphs_>0,"live input and PrintWindow rasterize glyphs through LumaText");
-        SendMessageW(app.edit_,EM_SETSEL,0,3);const auto selected_preview=Preview(app);
-        size_t selected_pixels=0;for(auto pixel:selected_preview.pixels)if((pixel&0xffffff)==0x267aff)++selected_pixels;
-        expect(selected_pixels>20,"native selection has a visible LumaText selection backdrop");
-        SavePng(selected_preview,L"text-editor-lumatext-selection.png");
+        GetGUIThreadInfo(GetCurrentThreadId(),&gui);expect(gui.hwndFocus==app.edit_,"canvas repaints preserve text focus");
+        const auto canvas=Canvas(app);
+        size_t ink=0;for(LONG y=LONG(live.a.y);y<LONG(std::ceil(live.b.y));++y)for(LONG x=LONG(live.a.x);x<LONG(std::ceil(live.b.x));++x)if(NoteLuminance(canvas.pixels[size_t(y-canvas.bounds.top)*canvas.Width()+x-canvas.bounds.left])<.5)++ink;
+        expect(ink>100,"canvas paints the live text in its final colour and font");
+        expect(app.document_.marks.empty(),"live preview is not an annotation until committed");
+        SavePng(Crop(canvas,{100,110,560,260}),L"build/text-inplace-typing.png");
+        SendMessageW(app.edit_,EM_SETSEL,0,3);
+        expect(app.state_.text_edit.selection_start==0&&app.state_.text_edit.selection_end==3,"native selection is mirrored on the canvas");
+        {const auto selected=Canvas(app);const auto parts=MeasureTextEdit(live,0,3,3).selection;size_t tinted=0;
+         for(const auto& part:parts)for(LONG y=LONG(part.top)+1;y<LONG(part.bottom)-1;++y)for(LONG x=LONG(part.left)+1;x<LONG(part.right)-1;++x){const auto c=selected.pixels[size_t(y-selected.bounds.top)*selected.Width()+x-selected.bounds.left];if(int(c&255)>int((c>>16)&255)+25)++tinted;}
+         expect(!parts.empty()&&tinted>20,"selection has a visible blue wash over the final glyphs");SavePng(Crop(selected,{100,110,560,260}),L"build/text-inplace-selection.png");}
         SendMessageW(app.edit_,EM_SETSEL,3,1);DWORD reverse_first{},reverse_last{};
         SendMessageW(app.edit_,EM_GETSEL,reinterpret_cast<WPARAM>(&reverse_first),reinterpret_cast<LPARAM>(&reverse_last));
-        GetGUIThreadInfo(GetCurrentThreadId(),&gui);const auto active_position=SendMessageW(app.edit_,EM_POSFROMCHAR,1,0);
-        expect(reverse_first==1&&reverse_last==3&&gui.rcCaret.left==static_cast<short>(LOWORD(active_position))&&gui.rcCaret.top==static_cast<short>(HIWORD(active_position)),"reverse selection retains its native active-end caret after LumaText repaint");
+        expect(reverse_first==1&&reverse_last==3&&app.state_.text_edit.caret==1,"reverse selection keeps its active end at the leading position");
         Key(app.edit_,VK_LEFT);SendMessageW(app.edit_,EM_GETSEL,reinterpret_cast<WPARAM>(&reverse_first),reinterpret_cast<LPARAM>(&reverse_last));
-        GetGUIThreadInfo(GetCurrentThreadId(),&gui);
-        expect(reverse_first==1&&reverse_last==1&&gui.rcCaret.left==static_cast<short>(LOWORD(active_position)),"Left collapses reverse selection at the native leading caret");
-        SendMessageW(app.edit_,EM_SETSEL,static_cast<WPARAM>(-1),-1);
-        const auto frame_pixels=app.edit_frame_->Snapshot();expect((frame_pixels.pixels.front()>>24)==0,"rounded frame and shadow have transparent outer corners");
-        Key(app.edit_,VK_RETURN);expect(!app.edit_&&!app.edit_host_&&!app.edit_frame_&&app.document_.marks.size()==1&&app.document_.marks[0].text.find(L"\r\n")!=std::wstring::npos,"Enter commits multiline content and destroys both editing surfaces");
+        expect(reverse_first==1&&reverse_last==1&&app.state_.text_edit.caret==1,"Left collapses a reverse selection at the leading caret");
+        const auto at=[&](int index){if(!app.state_.text_edit.mark)return Point{};const auto g=MeasureTextEdit(*app.state_.text_edit.mark,index,index,index);return Point{g.caret.left+.5f,(g.caret.top+g.caret.bottom)/2};};
+        reverse_first=reverse_last=99;app.PointerDown(v,at(2));app.PointerUp(v,at(2));if(app.edit_)SendMessageW(app.edit_,EM_GETSEL,reinterpret_cast<WPARAM>(&reverse_first),reinterpret_cast<LPARAM>(&reverse_last));
+        expect(app.edit_&&reverse_first==2&&reverse_last==2&&GetFocus()==app.edit_,"clicking inside the text box moves the caret and keeps editing");
+        if(app.edit_){app.PointerDown(v,at(0));app.PointerMove(v,at(4),MK_LBUTTON);app.PointerUp(v,at(4));SendMessageW(app.edit_,EM_GETSEL,reinterpret_cast<WPARAM>(&reverse_first),reinterpret_cast<LPARAM>(&reverse_last));}
+        expect(app.edit_&&reverse_first==0&&reverse_last==4,"dragging inside the text box selects characters");
+        if(app.edit_){app.PointerDoubleClick(v,at(2));SendMessageW(app.edit_,EM_GETSEL,reinterpret_cast<WPARAM>(&reverse_first),reinterpret_cast<LPARAM>(&reverse_last));}
+        expect(app.edit_&&reverse_first==0&&reverse_last==8,"double click selects the run of characters under the pointer");
+        if(app.edit_)expect(app.TextEditHit(at(2))&&!app.TextEditHit({700,450}),"I-beam hit area covers only the edit box");
+        if(app.edit_){SendMessageW(app.edit_,EM_SETSEL,static_cast<WPARAM>(-1),-1);Pump();}
+        const Mark preview_before_commit=app.state_.text_edit.mark?*app.state_.text_edit.mark:Mark{};
+        Key(app.edit_,VK_RETURN);expect(!app.edit_&&!app.edit_host_&&!app.state_.text_edit.mark&&app.document_.marks.size()==1&&app.document_.marks[0].text.find(L"\r\n")!=std::wstring::npos,"Enter commits multiline content and removes the live preview");
+        expect(app.document_.marks.size()==1&&app.document_.marks[0]==preview_before_commit,"committed annotation is exactly what was shown while typing");
         expect(app.document_.marks[0].a==Point{140,150}&&app.document_.marks[0].b.x<440&&app.document_.marks[0].text_auto_size,"new text bounds fit its content without including editor padding or the return button");
         expect(app.document_.marks[0].text_background==TextBackground::None,"temporary editing background is excluded from the annotation");
         app.document_.marks[0].rotation=25;app.document_.marks[0].text_auto_size=false;const auto original=app.document_.marks[0];app.BeginText(v,original.a,0);Pump();
@@ -90,30 +107,38 @@ struct TextEditTest {
         app.BeginText(v,original.a,0);SetWindowTextW(app.edit_,L"");Key(app.edit_,VK_RETURN);expect(app.document_.marks.empty(),"committing an emptied text object removes it");
         app.document_.Undo();expect(app.document_.marks.size()==1&&app.document_.marks[0].text==L"继续编辑","undo restores cleared text");
         for(bool dark:{false,true})for(uint32_t color:{0xff000000u,0xffffffffu,0xffffff00u,0xffff574fu}){
-            state.dark=dark;state.color=color;state.toolbar.scale=1.5f;app.BeginText(v,{150,150});
-            expect(NoteContrast(NoteLuminance(app.edit_display_color_),NoteLuminance(app.edit_surface_color_))>=3&&app.edit_surface_color_==TextEditorFrame::Background(dark)&&app.edit_color_==color,"preview ink remains readable while theme background and exported custom color stay exact at 150% scale");app.CommitText(true);
+            state.dark=dark;state.color=color;state.toolbar.scale=1.5f;app.BeginText(v,{150,150});if(app.edit_)SendMessageW(app.edit_,WM_CHAR,L'A',0);
+            expect(app.state_.text_edit.mark&&app.state_.text_edit.mark->color==color&&app.edit_color_==color,"live text uses the exact annotation colour on the screenshot, not an input-panel tint");app.CommitText(true);
         }
         state.color=0xff243142;app.BeginText(v,{150,150});
         SendMessageW(app.edit_,WM_IME_STARTCOMPOSITION,0,0);Key(app.edit_,VK_ESCAPE);expect(app.edit_!=nullptr,"IME composition consumes Escape without cancelling the text object");
-        app.edit_ime_text_=L"中文预编辑";app.edit_ime_first_=app.edit_ime_last_=0;
-        const auto before_ime=app.edit_text_glyphs_;SavePng(Preview(app),L"text-editor-lumatext-ime.png");
-        expect(app.edit_text_glyphs_>before_ime&&GetWindowTextLengthW(app.edit_)==0,"synthetic IME preedit is rendered with LumaText without committing native text");
+        app.edit_ime_text_=L"中文预编辑";app.edit_ime_first_=app.edit_ime_last_=0;app.edit_ime_cursor_=2;app.UpdateTextPreview();
+        expect(app.state_.text_edit.mark&&app.state_.text_edit.mark->text==L"中文预编辑"&&app.state_.text_edit.composition_start==0&&app.state_.text_edit.composition_length==5&&app.state_.text_edit.caret==2&&GetWindowTextLengthW(app.edit_)==0,"IME preedit is painted inline with its own caret and underline, without committing native text");
+        SavePng(Crop(Canvas(app),{100,110,560,260}),L"build/text-inplace-ime.png");
+        {
+            const LPARAM all=static_cast<LPARAM>(ISC_SHOWUIALL),inplace=Application::TextImeContext(all,true);
+            expect(!(inplace&static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW))&&(inplace&static_cast<LPARAM>(ISC_SHOWUICANDIDATEWINDOW))&&Application::TextImeContext(all,false)==all,"in-place text hides the IME's own preedit window (no doubled string) but keeps candidates");
+        }
         SendMessageW(app.edit_,WM_IME_ENDCOMPOSITION,0,0);SetWindowTextW(app.edit_,L"失焦提交");SetFocus(v.window);Pump();
         expect(!app.edit_&&app.document_.marks.back().text==L"失焦提交","focus loss commits text after the native notification completes");
         app.document_.Reset();Mark label;label.tool=Tool::Number;label.number_combo=NumberCombo::Text;label.a={150,150};label.b={182,182};label.number_target={440,210};label.number_text_preset=-2;label.text=L"原说明";app.document_.Add(label);
         const auto appearance=ResolveNoteAppearance(*app.frame_,label);app.BeginText(v,label.a,0);
+        expect(app.state_.text_edit.mark&&app.state_.text_edit.mark->tool==Tool::Number&&app.state_.text_edit.mark->text==L"原说明","number note description is edited in place beside its badge");
         expect(app.edit_color_==appearance.ink&&!app.edit_bold_,"number note editing uses its resolved ink and the same regular weight as rendering");
         SetWindowTextW(app.edit_,L"修改说明");Key(app.edit_,VK_RETURN);
         expect(app.document_.marks[0].number_text_preset==-2&&app.document_.marks[0].text==L"修改说明","editing a badge label preserves automatic color mode");
         for(bool dark:{false,true}){
-            state.dark=dark;state.toolbar.scale=1.5f;state.color=0xffff574f;state.font_size=24;app.BeginText(v,{150,150});SetWindowTextW(app.edit_,L"水电费是的啊");const int length=GetWindowTextLengthW(app.edit_);SendMessageW(app.edit_,EM_SETSEL,length,length);SendMessageW(app.edit_,EM_SCROLLCARET,0,0);Pump();
-            SavePng(Preview(app),dark?L"docs/text-editor-dark-preview.png":L"docs/text-editor-preview.png");
-            const RECT button=app.edit_frame_->ButtonRect();const LPARAM point=MAKELPARAM((button.left+button.right)/2,(button.top+button.bottom)/2);const HWND frame=app.edit_frame_->Window();
-            SendMessageW(frame,WM_LBUTTONDOWN,MK_LBUTTON,point);expect(GetFocus()==app.edit_,"pressing the return button keeps native text focus until release");
-            SendMessageW(frame,WM_LBUTTONUP,0,point);expect(!app.edit_&&!app.edit_frame_&&app.document_.marks.back().text==L"水电费是的啊"&&app.document_.marks.back().color==state.color,"return button commits text and preserves its exact selected color");
+            app.document_.Reset();state.dark=dark;state.toolbar.scale=1.5f;state.color=0xffff574f;state.font_size=24;app.BeginText(v,{150,150});SetWindowTextW(app.edit_,L"水电费是的啊");const int length=GetWindowTextLengthW(app.edit_);SendMessageW(app.edit_,EM_SETSEL,length,length);Pump();
+            SavePng(Crop(Canvas(app),{100,100,620,260}),dark?L"docs/text-editor-dark-preview.png":L"docs/text-editor-preview.png");
+            {Document other;Mark box;box.a={120,215};box.b={300,240};other.Add(box);other.selected=0;const auto saved=app.document_;app.document_=other;
+             const auto with_selected=Canvas(app);app.document_.selected=-1;const auto without=Canvas(app);app.document_=saved;
+             expect(with_selected.pixels==without.pixels,"selection handles of other objects are hidden while typing");}
+            const size_t count=app.document_.marks.size();
+            app.PointerDown(v,{700,300});app.PointerUp(v,{700,300});
+            expect(!app.edit_&&app.document_.marks.size()==count+1&&app.document_.marks.back().text==L"水电费是的啊"&&app.document_.marks.back().color==state.color,"clicking outside the box finishes the text, keeps its exact colour and starts no second text");
         }
-        app.BeginText(v,{750,450});RECT edge{};GetWindowRect(app.edit_frame_->Window(),&edge);
-        expect(edge.left>=bounds.left&&edge.top>=bounds.top&&edge.right<=bounds.right&&edge.bottom<=bounds.bottom,"frame, return button and hints stay visible near a monitor edge");
+        app.BeginText(v,{750,450});
+        expect(app.edit_&&app.state_.text_edit.mark&&app.state_.text_edit.mark->a==Point{750,450},"text near the selection edge opens in place at the requested anchor");
         SetWindowTextW(app.edit_,L"边缘");Key(app.edit_,VK_RETURN);
         expect(app.document_.marks.back().a==Point{750,450}&&app.document_.marks.back().b.x<850,"repositioning the editor at a monitor edge preserves the requested annotation anchor and fits its content");
         state.dark=false;state.toolbar.scale=1.5f;app.document_.Reset();app.BeginText(v,{150,150});SetWindowTextW(app.edit_,L"地方没错");Key(app.edit_,VK_RETURN);

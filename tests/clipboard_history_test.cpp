@@ -55,5 +55,9 @@ int main(){
     History full;for(int i=0;i<static_cast<int>(History::MaxProtected);++i){auto e=entry(5000+i);e.favorite=true;full.Add(e);}
     const auto box=full.AddGroup(L"盒子");full.Add(entry(6000));expect(!full.SetGroup(full.entries[0].id,box)&&full.entries[0].group==0,"full protected area refuses move into group");
     expect(full.SetGroup(full.entries[1].id,box),"favorite already protected can still join a group");
+    {History small;small.SetLimit(20);for(int i=0;i<40;++i)small.Add(entry(7000+i));expect(small.Limit()==20&&small.OrdinaryCount()==20,"history limit caps ordinary entries");
+     small.entries.back().favorite=true;small.SetLimit(5);small.TrimOrdinary();expect(small.OrdinaryCount()==5&&small.entries.size()==6,"lowering the limit trims the oldest ordinary entries and keeps favorites");
+     History big;big.SetLimit(200);for(int i=0;i<260;++i)big.Add(entry(8000+i));expect(big.OrdinaryCount()==200,"history limit can be raised to 200");
+     big.SetLimit(1000);expect(big.Limit()==History::MaxLimit&&History::MaxTotal==History::MaxLimit+History::MaxProtected,"history limit is clamped and the stored total covers it");}
     return failures?1:0;
 }

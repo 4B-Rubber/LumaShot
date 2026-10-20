@@ -18,7 +18,7 @@ constexpr float Width = 348.f;
 constexpr float MinHeight = 420.f;
 constexpr float BodyTop = 110.f, FooterHeight = 60.f;
 constexpr UINT_PTR DotsTimer = 1, CopiedTimer = 2;
-enum Id { None = -1, Close = 1, ShowTranslated, ShowOriginal, Language, CopyTranslation, CopyBilingual, Settings, Retry, OpenSettings, LanguageOption = 100, Row = 1000 };
+enum Id { None = -1, Close = 1, ShowTranslated, ShowOriginal, Language, CopyTranslation, CopyBilingual, Settings, Retry, OpenSettings, Pin, LanguageOption = 100, Row = 1000 };
 
 struct Theme {
     bool dark{};
@@ -46,6 +46,8 @@ struct TranslationPanel::Impl {
     float scale{1}, scroll{0}, content_height{0}, layout_width{0};
     int hover{None}, down{None}, dots{0};
     bool picker{}, layouts_dirty{true};
+    POINT anchor_point{};
+    bool anchored{}, moved{};   // text mode: placed beside a point / dragged away by the user
     ULONGLONG copied_until{};
     std::wstring copied_label;
     ComPtr<ID2D1Factory> factory;
@@ -138,7 +140,7 @@ struct TranslationPanel::Impl {
     }
 
     std::wstring Subtitle() const {
-        std::wstring text = view.engine.empty() ? L"截图翻译" : view.engine;
+        std::wstring text = view.engine.empty() ? (view.text_mode ? L"划词翻译" : L"截图翻译") : view.engine;
         if (view.state == TranslationView::State::Done || view.state == TranslationView::State::Running) {
             text += L" · ";
             text += view.source == translate::Language::Auto ? L"自动检测" : std::wstring(translate::LanguageLabel(view.source));
@@ -170,7 +172,7 @@ struct TranslationPanel::Impl {
         target->SetTransform(D2D1::Matrix3x2F::Identity());
         target->Clear(D2D1::ColorF(t.bg()));
         // Header
-        Text(L"翻译", {16, 10, 200, 34}, 16, t.ink(), true);
+        Text(view.text_mode ? L"划词翻译" : L"翻译", {16, 10, 200, 34}, 16, t.ink(), true);
         Text(Subtitle(), {16, 34, Width - 56, 54}, 12, t.muted());
         const D2D1_RECT_F close{Width - 44, 12, Width - 14, 42};
         if (hover == Close) Fill(close, t.hover(), 8);
@@ -180,14 +182,29 @@ struct TranslationPanel::Impl {
         AddHit(Close, close);
         // Controls: original/translation toggle + target language chip
         const bool done = view.state == TranslationView::State::Done;
-        const D2D1_RECT_F segment{16, 64, 16 + 132, 96};
-        Fill(segment, t.dark ? 0x1b212b : 0xeef2f7, 9);
-        const D2D1_RECT_F left{segment.left + 3, segment.top + 3, segment.left + 66, segment.bottom - 3}, right{segment.left + 66, segment.top + 3, segment.right - 3, segment.bottom - 3};
-        if (done) Fill(view.show_translation ? left : right, t.card(), 7);
-        Text(L"译文", left, 13, !done ? t.muted() : view.show_translation ? t.accent() : t.ink(), view.show_translation && done, DWRITE_TEXT_ALIGNMENT_CENTER);
-        Text(L"原图", right, 13, !done ? t.muted() : !view.show_translation ? t.accent() : t.ink(), !view.show_translation && done, DWRITE_TEXT_ALIGNMENT_CENTER);
-        AddHit(ShowTranslated, left, done);
-        AddHit(ShowOriginal, right, done);
+        if (view.text_mode) {
+            // Pinned bubbles ignore outside clicks and Escape; only × closes them.
+            const D2D1_RECT_F pin{16, 64, 16 + 112, 96};
+            Fill(pin, view.pinned ? t.accent_soft() : hover == Pin ? t.hover() : t.card(), 9);
+            Stroke(pin, view.pinned ? t.accent() : t.border(), 9);
+            const UINT32 ink = view.pinned ? t.accent() : t.ink();
+            brush->SetColor(D2D1::ColorF(ink));
+            const float px = pin.left + 20, py = pin.top + 9;
+            target->DrawRoundedRectangle(D2D1::RoundedRect({px - 4, py, px + 4, py + 7}, 1.5f, 1.5f), brush.Get(), 1.4f);
+            target->DrawLine({px - 7, py + 8}, {px + 7, py + 8}, brush.Get(), 1.4f);
+            target->DrawLine({px, py + 8}, {px, py + 15}, brush.Get(), 1.4f);
+            Text(view.pinned ? L"已固定" : L"固定", {pin.left + 34, pin.top, pin.right - 8, pin.bottom}, 13, ink, view.pinned);
+            AddHit(Pin, pin);
+        } else {
+            const D2D1_RECT_F segment{16, 64, 16 + 132, 96};
+            Fill(segment, t.dark ? 0x1b212b : 0xeef2f7, 9);
+            const D2D1_RECT_F left{segment.left + 3, segment.top + 3, segment.left + 66, segment.bottom - 3}, right{segment.left + 66, segment.top + 3, segment.right - 3, segment.bottom - 3};
+            if (done) Fill(view.show_translation ? left : right, t.card(), 7);
+            Text(L"译文", left, 13, !done ? t.muted() : view.show_translation ? t.accent() : t.ink(), view.show_translation && done, DWRITE_TEXT_ALIGNMENT_CENTER);
+            Text(L"原图", right, 13, !done ? t.muted() : !view.show_translation ? t.accent() : t.ink(), !view.show_translation && done, DWRITE_TEXT_ALIGNMENT_CENTER);
+            AddHit(ShowTranslated, left, done);
+            AddHit(ShowOriginal, right, done);
+        }
         const D2D1_RECT_F chip{Width - 16 - 164, 64, Width - 16, 96};
         Fill(chip, picker || hover == Language ? t.hover() : t.card(), 9);
         Stroke(chip, picker ? t.accent() : t.border(), 9);
@@ -213,7 +230,9 @@ struct TranslationPanel::Impl {
         };
         const std::wstring dotted = std::wstring(size_t(dots % 4), L'.');
         if (view.state == State::WaitingOcr) center_message(L"正在识别文字" + dotted, L"识别完成后会自动翻译", t.ink());
+        else if (view.state == State::Running && view.text_mode) center_message(L"正在翻译" + dotted, view.sources.size() > 1 ? L"共 " + std::to_wstring(view.sources.size()) + L" 段 · 只发送选中的文字" : std::wstring(L"只发送选中的文字"), t.ink());
         else if (view.state == State::Running) center_message(L"正在翻译" + dotted, L"共 " + std::to_wstring(view.sources.size()) + L" 段文字 · 只发送文字，不上传图片", t.ink());
+        else if (view.state == State::Idle && view.text_mode) center_message(L"没有读取到选中的文字", view.error, t.ink());
         else if (view.state == State::NeedsSetup) {
             const float y = center_message(L"还没有配置翻译引擎", L"可使用本机模型（Ollama、LM Studio），或 DeepSeek、通义千问、DeepL、百度、有道、腾讯等服务。", t.ink());
             Button(OpenSettings, {Width / 2 - 110, y, Width / 2 + 2, y + 38}, L"打开翻译设置", true);
@@ -312,6 +331,7 @@ struct TranslationPanel::Impl {
         case CopyBilingual: lumashot::CopyText(window, Join(true)); Copied(L"已复制原文和译文"); break;
         case Settings: case OpenSettings: if (callbacks.settings) callbacks.settings(); break;
         case Retry: if (callbacks.retry) callbacks.retry(); break;
+        case Pin: if (callbacks.pinned) callbacks.pinned(!view.pinned); break;
         default:
             if (id >= Row && size_t(id - Row) < view.results.size()) { lumashot::CopyText(window, view.results[size_t(id - Row)]); Copied(L"已复制这一段"); }
         }
@@ -323,6 +343,43 @@ struct TranslationPanel::Impl {
         using State = TranslationView::State;
         if (view.state == State::Running || view.state == State::WaitingOcr) SetTimer(window, DotsTimer, 420, nullptr);
         else KillTimer(window, DotsTimer);
+    }
+
+    // Text mode height in DIP: messages get a fixed card, results fit their rows.
+    float DesiredHeight() {
+        using State = TranslationView::State;
+        if (view.state == State::NeedsSetup || view.state == State::Failed) return MinHeight;
+        if (view.state != State::Done) return 310.f;
+        if (!dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dw.GetAddressOf()));
+        if (!dw) return MinHeight;
+        BuildLayouts();
+        return std::clamp(BodyTop + content_height + 8 + FooterHeight + 4, 250.f, 560.f);
+    }
+    void Reposition() {
+        if (!window) return;
+        const float dpi = GetDpiForWindow(window) / 96.f;
+        if (std::abs(dpi - scale) > .001f) { scale = dpi; formats.clear(); layouts_dirty = true; }
+        RECT current{};
+        GetWindowRect(window, &current);
+        const bool follow = anchored && !moved;
+        const POINT probe = follow ? anchor_point : POINT{current.left, current.top};
+        MONITORINFO monitor{sizeof(monitor)};
+        GetMonitorInfoW(MonitorFromPoint(probe, MONITOR_DEFAULTTONEAREST), &monitor);
+        const RECT work = monitor.rcWork;
+        const int margin = int(std::lround(8 * scale));
+        const int width = int(std::lround(Width * scale));
+        const int height = std::min<int>(int(std::lround(DesiredHeight() * scale)), std::max<int>(1, work.bottom - work.top - 2 * margin));
+        int x = current.left, y = current.top;
+        if (follow) {
+            const int dx = int(std::lround(14 * scale)), dy = int(std::lround(20 * scale));
+            x = anchor_point.x + dx;
+            y = anchor_point.y + dy;
+            if (x + width > work.right - margin) x = anchor_point.x - dx - width;
+            if (y + height > work.bottom - margin) y = anchor_point.y - dy / 2 - height;
+        }
+        x = std::clamp<int>(x, work.left + margin, std::max<int>(work.left + margin, work.right - margin - width));
+        y = std::clamp<int>(y, work.top + margin, std::max<int>(work.top + margin, work.bottom - margin - height));
+        SetWindowPos(window, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     static LRESULT CALLBACK Proc(HWND w, UINT message, WPARAM wp, LPARAM lp) {
@@ -338,7 +395,18 @@ struct TranslationPanel::Impl {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: { PAINTSTRUCT ps{}; BeginPaint(w, &ps); p->Paint(); EndPaint(w, &ps); return 0; }
         case WM_SIZE: if (p->target) p->target->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp))); InvalidateRect(w, nullptr, FALSE); return 0;
-        case WM_DPICHANGED: p->scale = HIWORD(wp) / 96.f; p->formats.clear(); p->layouts_dirty = true; InvalidateRect(w, nullptr, FALSE); return 0;
+        case WM_DPICHANGED: p->scale = HIWORD(wp) / 96.f; p->formats.clear(); p->layouts_dirty = true; if (p->view.text_mode) p->Reposition(); InvalidateRect(w, nullptr, FALSE); return 0;
+        case WM_NCHITTEST: {
+            // Text mode: the empty part of the header drags the bubble.
+            if (!p->view.text_mode || p->picker) break;
+            POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(w, &point);
+            const float x = point.x / p->scale, y = point.y / p->scale;
+            if (y < 0 || y >= 56) break;
+            for (const auto& hit : p->hits) if (Contains(hit.rect, x, y)) return HTCLIENT;
+            return HTCAPTION;
+        }
+        case WM_EXITSIZEMOVE: if (p->view.text_mode) p->moved = true; return 0;
         case WM_MOUSEMOVE: {
             const int hit = p->HitTest(lp);
             if (hit != p->hover) { p->hover = hit; InvalidateRect(w, nullptr, FALSE); }
@@ -413,7 +481,18 @@ void TranslationPanel::Update(const TranslationView& view) {
     impl_->view = view;
     if (content) { impl_->layouts_dirty = true; impl_->scroll = 0; }
     if (view.state != TranslationView::State::Done) impl_->picker = impl_->picker && view.state != TranslationView::State::NeedsSetup;
-    if (impl_->window) { impl_->SyncTimer(); InvalidateRect(impl_->window, nullptr, FALSE); }
+    if (impl_->window) {
+        impl_->SyncTimer();
+        if (view.text_mode) impl_->Reposition();
+        InvalidateRect(impl_->window, nullptr, FALSE);
+    }
+}
+
+void TranslationPanel::PlaceNear(POINT point) {
+    impl_->anchor_point = point;
+    impl_->anchored = true;
+    impl_->moved = false;
+    impl_->Reposition();
 }
 
 void TranslationPanel::Place(RECT anchor) {

@@ -9,7 +9,7 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
     paint.text=[this](const std::wstring& text,Box b,float size,uint32_t color){Text(text,b,size,color,false);};
     paint.measure_text=[this](const std::wstring& text,float size){return MeasureText(text,size);};
     paint.icon=[this,&state,&paint](int id,Box b,uint32_t color){
-        if(id>=0&&id<=18){
+        if(id>=0&&id<=19){
             const float size=std::min({b.right-b.left,b.bottom-b.top,28*state.toolbar.scale});
             const float cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
             b={cx-size/2,cy-size/2,cx+size/2,cy+size/2};
@@ -25,6 +25,11 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
             const auto line=[&](float x,float y,float x2,float y2){target_->DrawLine({cx+x*u,cy+y*u},{cx+x2*u,cy+y2*u},paint.brush(color),1.65f*u);};
             for(float side:{-1.f,1.f}){line(side*9,-4,side*9,-9);line(side*9,-9,side*4,-9);line(side*9,4,side*9,9);line(side*9,9,side*4,9);}
             line(-4,-3,4,-3);line(-4,1,4,1);line(-4,5,1,5);
+        }else if(id==ToolbarPropertiesId){
+            // Three sliders: the "属性" (properties) toggle.
+            const float u=std::min(b.right-b.left,b.bottom-b.top)/32,cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
+            for(int k=0;k<3;++k){const float y=cy+float(k-1)*6*u,knob=cx+(k==1?4.f:-4.f)*u;
+                target_->DrawLine({cx-9*u,y},{cx+9*u,y},paint.brush(color),1.6f*u);target_->FillEllipse(D2D1::Ellipse({knob,y},2.6f*u,2.6f*u),paint.brush(color));}
         }else Icon(id,b,color);
     };
     paint.surface=[this,&frame,&state](Box b,float radius){Panel(b,acrylic_bitmap_.Get(),frame,state.dark,radius);};
@@ -46,8 +51,10 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
     const auto controls=ToolbarControls(state,document);
     const ui::Theme theme{state.toolbar.scale,state.dark};
     ui::DrawControls(paint,theme,std::span(controls).first(1));
-    const auto toolbar_bounds=state.toolbar.bounds;
-    target_->PushAxisAlignedClip(D2D1::RectF(toolbar_bounds.left,toolbar_bounds.top,toolbar_bounds.right,toolbar_bounds.bottom-8*state.toolbar.scale),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    const auto toolbar_bounds=state.toolbar.bounds;const auto& card_full=state.toolbar.card_full;
+    const auto in_card=[&card_full](const ui::Control& c){return card_full.right>card_full.left&&c.bounds.left>=card_full.left-.5f&&c.bounds.right<=card_full.right+.5f&&
+        c.bounds.top>=card_full.top-.5f&&c.bounds.bottom<=card_full.bottom+.5f;};
+    target_->PushAxisAlignedClip(D2D1::RectF(toolbar_bounds.left,toolbar_bounds.top,toolbar_bounds.right,toolbar_bounds.bottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     const auto& motion=state.toolbar_visual;
     if(motion.ready){
         const auto pill=motion.indicator;const float radius=theme.Radius();
@@ -56,7 +63,7 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
         target_->DrawRoundedRectangle(rounded,paint.brush(0x6692c4ff),theme.scale);
     }
     for(size_t i=1;i<controls.size();++i){
-        auto c=controls[i];int hovered=state.hover;
+        auto c=controls[i];int hovered=state.hover;if(in_card(c))continue;
         if(motion.ready&&c.id>=0&&c.id<int(ui::ToolbarSlots)&&c.kind==ui::Kind::Button){
             const float hot=motion.hover[size_t(c.id)],down=motion.press[size_t(c.id)];
             const auto r=D2D1::RoundedRect(D2D1::RectF(c.bounds.left,c.bounds.top,c.bounds.right,c.bounds.bottom),theme.Radius(),theme.Radius());
@@ -70,6 +77,14 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
         ui::DrawControls(paint,theme,std::span(&c,1),hovered,state.property_drag);
     }
     target_->PopAxisAlignedClip();
+    if(state.toolbar.CardVisible()){
+        // 方案 C: the property card, its own acrylic panel; it grows out of the bar while expanding.
+        const auto card=state.toolbar.card;
+        paint.surface(card,std::min(14*theme.scale,(card.bottom-card.top)/2));
+        target_->PushAxisAlignedClip(D2D1::RectF(card.left,card.top,card.right,card.bottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        for(size_t i=1;i<controls.size();++i)if(in_card(controls[i]))ui::DrawControls(paint,theme,std::span(&controls[i],1),state.hover,state.property_drag);
+        target_->PopAxisAlignedClip();
+    }
     if(state.dropdown.Open()){
         const auto& popup=state.dropdown;const float s=popup.scale;const auto b=popup.bounds;
         const ui::Theme menu{s,state.dark};
@@ -77,6 +92,15 @@ void Renderer::Toolbar(const Frame& frame,const Document& document,const ViewSta
         for(int i=0;i<static_cast<int>(popup.items.size());++i){
             const auto row=popup.Row(i);
             float text_left=ui::DrawDropdownRow(paint,menu,row,i==popup.hover,i==popup.selected);
+            if(popup.property==ToolbarMoreId){
+                // Tool icon, label, and a pin at the row end that puts the entry back on the panel.
+                const float cy=(row.top+row.bottom)/2;const auto pin=ToolbarMorePinBox(popup,i);
+                paint.icon(popup.items[i].second,{text_left,cy-9*s,text_left+18*s,cy+9*s},menu.Ink());text_left+=26*s;
+                const float px=(pin.left+pin.right)/2,py=(pin.top+pin.bottom)/2;
+                Icon(13,{px-8*s,py-8*s,px+8*s,py+8*s},i==popup.hover?menu.Accent():menu.Muted());
+                Text(popup.items[i].first,{text_left,row.top+5*s,pin.left-4*s,row.bottom},13*s,menu.Ink(),false);
+                continue;
+            }
             if(popup.property==49||popup.property==66){
                 Mark sample;sample.tool=Tool::Arrow;sample.color=menu.Accent();sample.width=1.5f*s;sample.arrow_size=11*s;
                 sample.a={text_left+3*s,row.top+17*s};sample.b={text_left+53*s,row.top+13*s};

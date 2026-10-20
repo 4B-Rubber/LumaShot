@@ -14,7 +14,7 @@
 - 焦点与目标进程校验、等待按键释放、失败时提示手动粘贴、固定面板连续插入：src/clipboard/panel.cpp:587-650。不能因此声称已通过真实第三方应用验证。
 - 会话加密磁盘载荷、摘要加异步全文检索、退出清理不恢复：docs/mcp-clipboard-session-storage.md。会话保留是既定选择，不视为缺陷。
 - 异步 Quick Look、错误状态、预览取消和资源限制：docs/mcp-clipboard-preview-focus-fix.md。
-- 现有限额 100 条、64 MiB 总载荷、16 MiB 单条，收藏占满会拒绝新条目：src/clipboard/history.h:27-46。
+- 现有限额：普通条目 100 条、收藏与分组条目另计最多 200 条、128 MiB 总载荷、16 MiB 单条；受保护条目占满预算时拒绝新条目：`src/clipboard/history.h` 的 `History`（2026-10-17 按代码更正，原写 64 MiB）。
 - 现有隐私格式检查：src/clipboard/native.cpp:14-18。
 
 README.md 与 docs/mcp-clipboard-history.md 中“仅内存”“不支持富文本”等描述已与当前实现不一致。本轮不直接改写原文，后续应同步文档。

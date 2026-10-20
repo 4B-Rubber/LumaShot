@@ -9,6 +9,8 @@
 #include <functional>
 #include <array>
 #include <iterator>
+#include <optional>
+#include "clipboard/entry_flavor.h"
 
 namespace lumashot::clipboard {
 enum class Kind { Text, Image, Files };
@@ -28,6 +30,7 @@ struct Entry {
     SYSTEMTIME time{};bool favorite{};uint32_t group{};uint32_t file_count{};std::array<std::wstring,3> file_names;std::shared_ptr<const DiskPayload> payload;
     size_t Bytes()const {if(payload)return payload->bytes;size_t n=text.size()*sizeof(wchar_t);for(const auto& f:formats)n+=f.bytes.size();return n;}
 };
+inline Flavor FlavorOf(const Entry& e){return e.kind==Kind::Image?Flavor::Image:e.kind==Kind::Files?Flavor::Files:TextFlavor(e.text);}
 // Capacity model: ordinary entries roll over at MaxEntries. Favorites and
 // grouped entries are "protected": they are never evicted, do not consume the
 // ordinary budget and are capped separately at MaxProtected. MaxBytes bounds the
@@ -35,7 +38,8 @@ struct Entry {
 // over, so a new ordinary capture is only rejected when it alone cannot fit.
 class History {
 public:
-    static constexpr size_t MaxEntries=100,MaxProtected=200,MaxTotal=MaxEntries+MaxProtected;
+    // MaxEntries is the default 最多保留; settings may choose up to MaxLimit (see SetLimit).
+    static constexpr size_t MaxEntries=100,MaxLimit=200,MaxProtected=200,MaxTotal=MaxLimit+MaxProtected;
     static constexpr size_t MaxBytes=128*1024*1024,MaxItemBytes=16*1024*1024;
     static constexpr size_t MaxGroups=20,MaxGroupName=12;
     static constexpr int GroupTabBase=5;  // tabs 0..4 are 全部/文本/图片/文件/收藏
@@ -59,7 +63,7 @@ public:
             std::erase_if(entries,[&](const Entry& e){return e.id==item.id;});
         }else item.id=++next_;
         const size_t incoming=Protected(item)?0:1;
-        while(OrdinaryCount()+incoming>MaxEntries||Bytes()+item.Bytes()>MaxBytes){
+        while(OrdinaryCount()+incoming>limit_||Bytes()+item.Bytes()>MaxBytes){
             auto last=std::find_if(entries.rbegin(),entries.rend(),[](const Entry& e){return !Protected(e);});
             if(last==entries.rend())break;
             entries.erase(std::next(last).base());
@@ -121,19 +125,25 @@ public:
         for(auto& g:value){g.name=CleanGroupName(std::move(g.name));if(g.id&&!g.name.empty()&&groups.size()<MaxGroups&&!FindGroup(g.id)&&!GroupNameTaken(g.name))groups.push_back(std::move(g));}
         for(auto& e:entries)if(e.group&&!FindGroup(e.group))e.group=0;
     }
+    // Ordinary-entry budget (最多保留). Lowering it takes effect on the next TrimOrdinary/Add.
+    size_t Limit()const {return limit_;}
+    void SetLimit(size_t value){limit_=std::clamp(value,size_t{1},MaxLimit);}
     void TrimOrdinary(){
-        while(OrdinaryCount()>MaxEntries){
+        while(OrdinaryCount()>limit_){
             auto last=std::find_if(entries.rbegin(),entries.rend(),[](const Entry& e){return !Protected(e);});
             if(last==entries.rend())break;
             entries.erase(std::next(last).base());
         }
     }
-    std::vector<uint64_t> Filter(int tab,const std::wstring& query,bool oldest=false)const {
+    // flavor narrows the result further (panel chips 代码/链接/颜色); tab
+    // semantics are unchanged so the quick window and stored state still work.
+    std::vector<uint64_t> Filter(int tab,const std::wstring& query,bool oldest=false,std::optional<Flavor> flavor=std::nullopt)const {
         auto lower=[](std::wstring s){for(auto& c:s)c=static_cast<wchar_t>(std::towlower(c));return s;};
         const uint32_t group=tab>=GroupTabBase&&static_cast<size_t>(tab-GroupTabBase)<groups.size()?groups[static_cast<size_t>(tab-GroupTabBase)].id:0;
         std::vector<uint64_t> result;const auto needle=lower(query);
         for(const auto& e:entries){if(tab==1&&e.kind!=Kind::Text)continue;if(tab==2&&e.kind!=Kind::Image)continue;if(tab==3&&e.kind!=Kind::Files)continue;if(tab==4&&!e.favorite)continue;
             if(tab>=GroupTabBase&&(!group||e.group!=group))continue;
+            if(flavor&&FlavorOf(e)!=*flavor)continue;
             if(!needle.empty()&&lower(e.text).find(needle)==std::wstring::npos)continue;result.push_back(e.id);}
         if(oldest)std::reverse(result.begin(),result.end());
         std::stable_partition(result.begin(),result.end(),[&](uint64_t id){
@@ -141,6 +151,6 @@ public:
         });
         return result;
     }
-private:uint64_t next_{};
+private:uint64_t next_{};size_t limit_{MaxEntries};
 };
 }

@@ -92,7 +92,7 @@ private:
     void Pointer(HWND window, UINT message, POINT client);
 
     RECT region_{}, work_{};
-    bool dark_{}, acrylic_bar_{}, acrylic_panel_{};
+    bool dark_{}, acrylic_bar_{}, acrylic_panel_{}, glassy_{};
     float scale_{1};
     Done done_;
     Closed closed_;

@@ -11,6 +11,7 @@
 #include "ui/render.h"
 #include "ui/magnifier.h"
 #include "pin/pin.h"
+#include "pin/selection_translator.h"
 #include "longshot/long_capture.h"
 #include "model/selection.h"
 #include "ui/text_editor.h"
@@ -46,10 +47,14 @@ private:
     static LRESULT CALLBACK MainProc(HWND,UINT,WPARAM,LPARAM);
     static LRESULT CALLBACK OverlayProc(HWND,UINT,WPARAM,LPARAM);
     static LRESULT CALLBACK EditProc(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
+    // WM_IME_SETCONTEXT flags for the text field: the in-place canvas paints the preedit
+    // itself, so the IME's own composition window is hidden (candidates stay visible).
+    static LPARAM TextImeContext(LPARAM flags,bool canvas_preedit);
     static LRESULT CALLBACK TextHostProc(HWND,UINT,WPARAM,LPARAM);
     void Start();
     bool FinishQuickSelection();
     void QuickOcrReady();
+    void TranslateSelection();
     void ApplyOcrCompletion(ocr::Completion);
     void Wheel(Point,int);
     DWORD WaitForWork(std::span<const HANDLE> extra = {});
@@ -79,6 +84,14 @@ private:
     void Command(int id);
     void ResetSessionTool();
     void ApplyToolbarDropdown(int index);
+    // Toolbar customization changed from the capture UI: re-layout and persist at once.
+    void ApplyToolbarCustomization(ToolbarCustomization layout);
+    bool OpenToolbarContext(Point point);
+    bool PinFromMoreMenu(Point point);
+    // Property-bar target: 0 for Select; otherwise 1 when 自动展开属性栏 is on or the user opened it.
+    float PropertyExpansion(Tool tool)const{return tool==Tool::Select?0.f:(preferences_.toolbar.auto_properties||properties_open_)?1.f:0.f;}
+    void ToggleProperties();
+    bool properties_open_{};
     bool HasPropertyTarget()const;
     void SyncSelectedProperties();
     void ApplySelectedProperties(bool preview=false);
@@ -111,6 +124,14 @@ private:
     void CommitText(bool cancel=false);
     void ResizeTextEditor();
     void PaintTextEditor(HDC);
+    // In-place editing: the native EDIT is an invisible input engine (IME,
+    // caret movement, clipboard, undo); the canvas paints the live text.
+    Mark EditedTextMark(const std::wstring& text) const;
+    void UpdateTextPreview();
+    void PlaceTextIme();
+    // phase: 0 down, 1 move, 2 up, 3 double click. True when consumed.
+    bool TextEditPointer(Point point,int phase);
+    bool TextEditHit(Point point) const;
     void Notice(const std::wstring& text);
     HWND Owner() const;
     // In-app updater (src/update); all of this state is UI-thread only.
@@ -159,6 +180,11 @@ private:
     TextBackground edit_background_{TextBackground::None};
     int edit_index_{-1};
     Point edit_point_{};
+    float edit_wrap_width_{};
+    std::optional<Mark> edit_base_;
+    int edit_ime_cursor_{-1};
+    DWORD edit_anchor_{};
+    bool edit_selecting_{};
     Preferences preferences_;
     std::unique_ptr<ClipboardPanel> clipboard_panel_;
     // All settings writes funnel through one worker so debounced saves never
@@ -168,6 +194,8 @@ private:
     bool settings_open_{};int recording_finish_wait_{};
     std::shared_ptr<Frame> frame_,acrylic_,cursor_patch_;
     std::unique_ptr<PinManager> pins_;
+    // Selection translation bubble (hotkey id 7 and the pin menu); after pins_.
+    std::unique_ptr<SelectionTranslator> selection_translator_;
     // Declared after pins_: sessions and viewers go away before the pins they may create.
     std::unique_ptr<LongCaptureManager> longshot_;
     std::vector<std::unique_ptr<View>> views_;
@@ -190,6 +218,7 @@ private:
     std::unique_ptr<Result> result_;
     uint64_t generation_{},pin_edit_id_{};
     std::shared_ptr<const Frame> pin_edit_source_;RECT pin_edit_bounds_{};bool pin_edit_copy_{};
+    bool pin_edit_live_{};  // frame_ holds an in-memory copy of the screen behind the pin annotation session
     // Screenshot translation: request (hotkey) → capture session flag → pin to translate.
     bool translate_request_{},translate_capture_{},translate_next_{};
     enum class QuickCapture { None, Text, Pin };
@@ -213,5 +242,3 @@ private:
     UINT taskbar_created_{};
 };
 }
-
-

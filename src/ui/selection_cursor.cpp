@@ -31,7 +31,7 @@ HCURSOR SelectionEditCursor(const Document& document,const ViewState& state,Poin
     if(!state.selected||state.tool!=Tool::Select||state.busy||state.picker.open||state.dropdown.Open()||
         document.selected<0||static_cast<size_t>(document.selected)>=document.marks.size())return nullptr;
     if(active_handle==8)return RotationCursor(dpi);
-    if(active_handle<0&&Contains(state.toolbar.bounds,point))return nullptr;
+    if(active_handle<0&&Contains(state.toolbar,point))return nullptr;
     const auto& mark=document.marks[document.selected];
     const int handle=active_handle>=0?active_handle:HitEditHandle(mark,document.selected_part,point,state.toolbar.scale);
     if(handle==8)return RotationCursor(dpi);

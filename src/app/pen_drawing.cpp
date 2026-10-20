@@ -34,7 +34,7 @@ void Application::PolylinePreview(Point point){
     if(line_vertices_.empty()||!draft_)return;
     draft_->points=line_vertices_;draft_->b=line_vertices_.back();
     state_.line_snap.reset();
-    if(Contains(state_.selection,point)&&!Contains(state_.toolbar.bounds,point)){
+    if(Contains(state_.selection,point)&&!Contains(state_.toolbar,point)){
         point=PenSnapPoint(point,line_vertices_.back());
         if(point!=line_vertices_.back())draft_->points.push_back(point);
         draft_->b=point;

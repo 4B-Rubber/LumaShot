@@ -60,6 +60,9 @@ int main() {
         const LONG_PTR ex = GetWindowLongPtrW(window, GWL_EXSTYLE);
         Expect((ex & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) == (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST), "popup carries all no-activation styles");
         Expect(SendMessageW(window, WM_MOUSEACTIVATE, 0, MAKELPARAM(HTCLIENT, WM_LBUTTONDOWN)) == MA_NOACTIVATE, "mouse activation is rejected");
+        Expect((ex & WS_EX_NOREDIRECTIONBITMAP) != 0 && (GetWindowLongPtrW(window, GWL_STYLE) & WS_THICKFRAME) != 0, "popup uses the DWM system-backdrop frame recipe");
+        { RECT client{}, outer{}; GetClientRect(window, &client); GetWindowRect(window, &outer);
+          Expect(client.right == outer.right - outer.left && client.bottom == outer.bottom - outer.top, "frame recipe keeps client area equal to the window"); }
         UpdateWindow(window);
         Expect(GetForegroundWindow() == foreground && GetFocus() == focus && GetActiveWindow() == active, "show and paint preserve foreground focus and activation");
         Expect(Inside(popup.Bounds(), work), "initial popup stays in monitor work area");
@@ -108,7 +111,7 @@ int main() {
         if (SUCCEEDED(DwmGetWindowAttribute(window, 38, &backdrop, sizeof(backdrop)))) {
             Expect(backdrop == 3, "popup requests transient acrylic backdrop");
             const auto alpha = normal.pixels[40 * normal.Width() + 2] >> 24;
-            Expect(alpha == 0, "system acrylic is not covered by a tint layer");
+            Expect(alpha >= 140 && alpha <= 200, "system acrylic carries the Luma glass token tint (.60 light)");
         }
         auto singleLine = rows; singleLine[4].text = L"第一行  第二行 末尾";
         popup.Update(singleLine, 0, 0, false, false);

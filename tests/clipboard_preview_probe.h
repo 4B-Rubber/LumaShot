@@ -17,6 +17,10 @@ struct PreviewWindowTest {
     static const void* Renderer(const PreviewWindow& p) { return p.target_.Get(); }
     static const ClipboardComposition* Composition(const PreviewWindow& p){return p.composition_.get();}
     static HWND Window(const PreviewWindow& p) { return p.window_; }
+    static const std::wstring& OcrText(const PreviewWindow& p){return p.ocr_text_;}
+    static bool OcrAvailable(const PreviewWindow& p){return p.ocr_available_;}
+    static bool OcrPending(const PreviewWindow& p){return p.ocr_pending_;}
+    static SIZE Natural(const PreviewWindow& p){return p.natural_;}
     static bool RenderedImage(PreviewWindow& p) {
         p.Render();
         if (!p.image_bitmap_ || !p.surface_) return false;

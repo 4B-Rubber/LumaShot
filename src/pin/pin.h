@@ -45,6 +45,12 @@ public:
     void TranslationReady(uint64_t job);
     void TranslationConfigChanged();
     std::function<void()> open_translation_settings;
+    // Selection translation: the selected OCR text of the pin that has focus
+    // (pin=false when no pin is focused), and the handler that shows the
+    // translation bubble for the pin menu's "翻译选中文字".
+    struct FocusedText {bool pin{};std::wstring text;};
+    FocusedText FocusedSelection();
+    std::function<void(std::wstring,POINT)> translate_selection;
 private:
     friend struct PinTest;
     friend struct PinSessionLifecycleTest;
@@ -92,9 +98,16 @@ private:
     // System drag and drop of the pin picture into another program: Ctrl+drag
     // on a pin, or (without Shift) a card pulled off the rope.
     void DragOut(Pin&);
-    // Hover buttons on the pin (hang, close): fade in/out and the fading close.
+    // Hover bar of a pin (annotate, OCR, copy, hang, more | close): fade
+    // in/out, button commands and the fading close.
     void UpdateHoverTools(Pin&);
     void HoverToolsStep(Pin&);
+    void HoverTool(Pin&,int tool);
+    // The bar is a layered window owned by the pin, above (or below) the image.
+    static LRESULT CALLBACK HoverBarProc(HWND,UINT,WPARAM,LPARAM);
+    bool HoverBarRect(Pin&,RECT& out);
+    void PlaceHoverBar(Pin&);
+    void DrawHoverBar(Pin&);
     void FadeClose(Pin&);
     struct SaveResult {uint64_t id{};std::wstring error;std::unique_ptr<ClipboardImage> clipboard_image;};
     HWND host_;ocr::Service service_;uint64_t next_id_{1};

@@ -1,5 +1,7 @@
 #pragma once
 #include "capture/frame.h"
+#include "clipboard/composition.h"
+#include <memory>
 #include "ui/glass_surface.h"
 #include "ui/controls.h"
 #include "ui/text_renderer.h"
@@ -16,7 +18,7 @@ using Microsoft::WRL::ComPtr;
 inline void Check(HRESULT result,const char* text){if(FAILED(result))throw std::runtime_error(text);}
 struct Dialog {
     HWND window{};
-    bool dark{},acrylic{},confirm{},done{},accepted{};
+    bool dark{},acrylic{},confirm{},done{},accepted{},glassy{};std::unique_ptr<ClipboardComposition> composition;
     float scale{1};
     int focus{},hover{-1},pressed{-1};
     std::wstring title,body,action,cancel;
@@ -43,7 +45,7 @@ struct Dialog {
             DibSurface surface(r.right,r.bottom);Check(target->BindDC(surface.Dc(),&r),"Message surface");
             Check(target->CreateSolidColorBrush(D2D1::ColorF(0),&brush),"Message brush");
             target->SetDpi(96*scale,96*scale);target->BeginDraw();target->Clear(D2D1::ColorF(0,0.f));
-            DrawGlassSurface(target.Get(),brush.Get(),{0,0,480,216},dark,acrylic);
+            if(glassy&&acrylic)DrawBackdropTint(target.Get(),brush.Get(),{0,0,480,216},dark);else DrawGlassSurface(target.Get(),brush.Get(),{0,0,480,216},dark,acrylic);
             TextRenderer renderer;PaintContext p;p.target=target.Get();
             p.brush=[&](uint32_t c){brush->SetColor(D2D1::ColorF(c&0xffffff,float(c>>24)/255));return brush.Get();};
             p.text=[&](const std::wstring& value,Box b,float size,uint32_t color){
@@ -63,17 +65,22 @@ struct Dialog {
             p.text(body,{24,58,456,140},13,theme.Ink());
             const auto buttons=Buttons();DrawControls(p,theme,std::span(buttons.data(),confirm?2:1),hover,pressed);
             target->DrawRoundedRectangle(D2D1::RoundedRect({buttons[focus].bounds.left-3,153,buttons[focus].bounds.right+3,195},9,9),p.brush(theme.Accent()),1);
-            Check(target->EndDraw(),"Message paint");POINT origin{};SIZE size{r.right,r.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
-            if(!UpdateLayeredWindow(window,nullptr,nullptr,&size,surface.Dc(),&origin,0,&blend,ULW_ALPHA)){std::fprintf(stderr,"Message composition failed: %lu\n",GetLastError());done=true;}
+            Check(target->EndDraw(),"Message paint");
+            if(glassy){if(!composition)composition=std::make_unique<ClipboardComposition>();composition->Present(window,UINT(r.right),UINT(r.bottom),surface.Pixels());}else{POINT origin{};SIZE size{r.right,r.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+            if(!UpdateLayeredWindow(window,nullptr,nullptr,&size,surface.Dc(),&origin,0,&blend,ULW_ALPHA)){std::fprintf(stderr,"Message composition failed: %lu\n",GetLastError());done=true;}}
         }catch(const std::exception& error){std::fprintf(stderr,"Message rendering failed: %s\n",error.what());done=true;}
         EndPaint(window,&ps);
     }
     static LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
+        if(msg==WM_GETMINMAXINFO&&(GetWindowLongPtrW(w,GWL_STYLE)&WS_THICKFRAME)){reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize={1,1};return 0;}  // glass windows carry WS_THICKFRAME only for the DWM backdrop: no minimum size
         auto* d=reinterpret_cast<Dialog*>(GetWindowLongPtrW(w,GWLP_USERDATA));
         if(msg==WM_NCCREATE){d=static_cast<Dialog*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);d->window=w;SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(d));}
         if(!d)return DefWindowProcW(w,msg,wp,lp);
         switch(msg){
         case WM_ERASEBKGND:return 1;
+        case WM_NCCALCSIZE:if(wp&&d->glassy)return 0;break;
+        case WM_NCACTIVATE:if(d->glassy)return DefWindowProcW(w,msg,TRUE,lp);break;  // Windows 11 shows a flat fallback for inactive backdrops
+        case WM_NCHITTEST:if(d->glassy)return HTCLIENT;break;
         case WM_PAINT:d->Paint();return 0;
         case WM_CLOSE:case WM_DESTROY:d->done=true;return 0;
         case WM_MOUSEMOVE:d->hover=d->Hit(lp);InvalidateRect(w,nullptr,FALSE);return 0;
@@ -84,7 +91,7 @@ struct Dialog {
             if(wp==VK_ESCAPE){d->done=true;return 0;}
             if(wp==VK_TAB||wp==VK_LEFT||wp==VK_RIGHT){if(d->confirm)d->focus=1-d->focus;InvalidateRect(w,nullptr,FALSE);return 0;}
             if(wp==VK_RETURN||wp==VK_SPACE){d->Choose(d->focus);return 0;}break;
-        case WM_DPICHANGED:{d->scale=HIWORD(wp)/96.f;const auto* r=reinterpret_cast<RECT*>(lp);SetWindowPos(w,nullptr,r->left,r->top,int(480*d->scale),int(216*d->scale),SWP_NOZORDER|SWP_NOACTIVATE);ResizeBorderlessWindow(w,d->scale,ToolPanelRadius);InvalidateRect(w,nullptr,FALSE);return 0;}
+        case WM_DPICHANGED:{d->scale=HIWORD(wp)/96.f;const auto* r=reinterpret_cast<RECT*>(lp);SetWindowPos(w,nullptr,r->left,r->top,int(480*d->scale),int(216*d->scale),SWP_NOZORDER|SWP_NOACTIVATE);if(!d->glassy)ResizeBorderlessWindow(w,d->scale,ToolPanelRadius);InvalidateRect(w,nullptr,FALSE);return 0;}
         }
         return DefWindowProcW(w,msg,wp,lp);
     }
@@ -101,11 +108,14 @@ inline bool ShowThemedMessage(HWND owner,bool dark,const std::wstring& title,con
     const int width=int(480*d.scale),height=int(216*d.scale);
     const int x=std::max(int(monitor.rcWork.left),std::min(int((anchor.left+anchor.right-width)/2),int(monitor.rcWork.right)-width));
     const int y=std::max(int(monitor.rcWork.top),std::min(int((anchor.top+anchor.bottom-height)/2),int(monitor.rcWork.bottom)-height));
-    HWND w=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED,wc.lpszClassName,title.c_str(),WS_POPUP,x,y,width,height,owner,nullptr,wc.hInstance,&d);
+    d.glassy=TransparencyEffectsOn();
+    HWND w=CreateWindowExW(d.glassy?(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOREDIRECTIONBITMAP):(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED),wc.lpszClassName,title.c_str(),d.glassy?(WS_POPUP|WS_THICKFRAME):WS_POPUP,x,y,width,height,owner,nullptr,wc.hInstance,&d);
     if(!w)return false;
-    ConfigureBorderlessWindow(w);ResizeBorderlessWindow(w,d.scale,ToolPanelRadius);d.acrylic=SetSettingsAcrylic(w,dark);SetWindowDisplayAffinity(w,WDA_EXCLUDEFROMCAPTURE);
+    if(d.glassy){SetWindowPos(w,nullptr,0,0,width,height,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);d.acrylic=ApplyPopupBackdrop(w,dark);}
+    else{ConfigureBorderlessWindow(w);ResizeBorderlessWindow(w,d.scale,ToolPanelRadius);d.acrylic=SetSettingsAcrylic(w,dark);}
+    SetWindowDisplayAffinity(w,WDA_EXCLUDEFROMCAPTURE);
     const HWND previous=GetFocus();const bool enabled=owner&&IsWindowEnabled(owner);if(enabled)EnableWindow(owner,FALSE);
-    ShowWindow(w,SW_SHOW);SetForegroundWindow(w);SetFocus(w);
+    ShowWindow(w,SW_SHOW);SetForegroundWindow(w);SetFocus(w);if(d.glassy)SendMessageW(w,WM_NCACTIVATE,TRUE,0);
     MSG msg{};while(!d.done){const BOOL result=GetMessageW(&msg,nullptr,0,0);if(result<=0){if(!result)PostQuitMessage(int(msg.wParam));break;}TranslateMessage(&msg);DispatchMessageW(&msg);}
     if(GetCapture()==w)ReleaseCapture();if(enabled&&IsWindow(owner))EnableWindow(owner,TRUE);
     if(IsWindow(w))DestroyWindow(w);if(IsWindow(owner)){SetForegroundWindow(owner);SetFocus(IsWindow(previous)?previous:owner);}

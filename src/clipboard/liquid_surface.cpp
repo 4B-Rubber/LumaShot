@@ -1,6 +1,7 @@
 #include "clipboard/liquid_surface.h"
 #include "clipboard/liquid_neck.h"
 #include "ui/memory_target.h"
+#include "ui/luma_glass.h"
 #include <d2d1helper.h>
 #include <wrl/client.h>
 #include <stdexcept>
@@ -111,7 +112,7 @@ struct LiquidSurface::Impl {
         // Small analytic halo, not a sampled/blurred copy of the desktop.
         brush->SetColor(Color(0x0a192e,.018f*frame.detail));target->DrawGeometry(geometry.Get(),brush.Get(),7*frame.scale,stroke.Get());
         brush->SetColor(Color(0x0a192e,.035f*frame.detail));target->DrawGeometry(geometry.Get(),brush.Get(),3*frame.scale,stroke.Get());
-        brush->SetColor(Color(frame.dark?0x192330:0xf5f8fc,frame.opacity));target->FillGeometry(geometry.Get(),brush.Get());
+        brush->SetColor(Color(glass::Pick(glass::LiquidFill,frame.dark),frame.opacity));target->FillGeometry(geometry.Get(),brush.Get());
         brush->SetColor(Color(frame.dark?0x8da7c5:0xffffff,.22f*frame.detail));target->DrawGeometry(geometry.Get(),brush.Get(),frame.scale,stroke.Get());
         target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),geometry.Get()),layer.Get());
         const auto& b=frame.pose.bounds;

@@ -145,12 +145,14 @@ struct ClipboardPanelTest {
                     const auto card=std::find_if(p.hits.begin(),p.hits.end(),[&](const auto& row){return row.action==30&&row.id==hit.id;});
                     expect(card!=p.hits.end()&&hit.rect.left>=card->rect.left+4&&hit.rect.right<=card->rect.right-4&&hit.rect.bottom<=card->rect.bottom-4,
                            "card action click targets remain inside each card");
-                    expect(hit.rect.right-hit.rect.left==32&&hit.rect.bottom-hit.rect.top==32,"card actions keep full-size click targets");
+                    expect(hit.rect.right-hit.rect.left==clipboard::cards::ActButton&&hit.rect.bottom-hit.rect.top==clipboard::cards::ActButton,"card action bar keeps 28 DIP click targets");
                 }
             }
             for(size_t i=0;i<controls.size();++i)for(size_t j=i+1;j<controls.size();++j)
                 expect(!Overlap(controls[i],controls[j]),"independent controls do not overlap at narrow widths");
-            expect(categories==5&&tabs[4].right<=sort.left-4,"all five categories fit before the sort button");
+            expect(categories>=1&&tabs[0].right>tabs[0].left,"全部 chip is always reachable");
+            for(int i=0;i<5;++i)if(tabs[static_cast<size_t>(i)].right>0)expect(tabs[static_cast<size_t>(i)].right<=sort.left-4,"visible chips end before the sort button");
+            expect(categories==5||p.tab_scroll_max>0,"chips that do not fit scroll horizontally");
             RECT search{};GetWindowRect(p.search,&search);MapWindowPoints(nullptr,p.window,reinterpret_cast<POINT*>(&search),2);
             expect(search.right>search.left&&search.left>=0&&search.right<=static_cast<LONG>(std::lround(p.W*scale)),"native search remains usable inside resized panel");
             RECT bounds{};GetWindowRect(p.window,&bounds);

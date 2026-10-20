@@ -55,7 +55,8 @@ struct ClipboardPanelTest {
             // Cover branding, shortcut text, broad central whitespace, both side
             // margins, button gaps, and whitespace above/below the button row.
             const std::array<float,10> xs{8,36,90,175,p.W/2,p.W-120,p.W-85,p.W-51,p.W-17,p.W-8};
-            for(float y:{8.f,23.f,40.f,56.f,65.f,75.f})for(float x:xs) {
+            // S3 header (full.html .ph) ends at HeaderBottom = 54 DIP; search starts at 56.
+            for(float y:{6.f,14.f,27.f,40.f,47.f,52.f})for(float x:xs) {
                 const bool control=std::any_of(p.hits.begin(),p.hits.end(),[&](const auto& hit) {
                     const auto r=hit.rect;
                     return x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom;
@@ -69,8 +70,8 @@ struct ClipboardPanelTest {
             prepare();
             RECT before{},after{};
             GetWindowRect(p.window,&before);
-            mouse(WM_LBUTTONDOWN,p.W/2,68);
-            mouse(WM_MOUSEMOVE,p.W/2,68);
+            mouse(WM_LBUTTONDOWN,p.W/2,48);
+            mouse(WM_MOUSEMOVE,p.W/2,48);
             expect(p.drag_pending&&!p.dragged,"stationary header press does not cross drag threshold");
             mouse(WM_MOUSEMOVE,p.W/2-24,92);
             GetWindowRect(p.window,&after);
@@ -110,9 +111,9 @@ struct ClipboardPanelTest {
             prepare();p.pinned=true;p.UpdateActivationPolicy();
             const HWND foreground=GetForegroundWindow();
             expect(SendMessageW(p.window,WM_MOUSEACTIVATE,0,0)==MA_NOACTIVATE,"pinned panel keeps no-activate policy");
-            mouse(WM_LBUTTONDOWN,p.W/2,68);
+            mouse(WM_LBUTTONDOWN,p.W/2,48);
             expect(p.drag_pending&&p.pinned&&GetForegroundWindow()==foreground,"pinned blank-header drag does not steal focus");
-            mouse(WM_LBUTTONUP,p.W/2,68);
+            mouse(WM_LBUTTONUP,p.W/2,48);
 
             GetWindowRect(p.window,&before);
             expect(SendMessageW(p.window,WM_NCHITTEST,0,MAKELPARAM(before.left+1,before.top+1))==HTTOPLEFT,

@@ -11,6 +11,9 @@ int main(){
         Renderer renderer;auto flattened=renderer.Flatten(image,mapped,image.bounds);
         expect(flattened.Width()==400&&flattened.Height()==200&&flattened.pixels[60*400+60]!=image.pixels[60*400+60]&&flattened.pixels[0]==image.pixels[0],"annotation commits at source resolution with unchanged exterior");
         auto preview=PinAnnotationPreview(image,display,{-300,0,300,400});expect(preview.Width()==600&&preview.pixels[110*600+210]==0xfffafafa,"negative-monitor preview uses source image without desktop capture");
+        {auto behind=MakeFrame({-300,0,300,400},0xff123456);auto composed=PinAnnotationPreview(image,display,{-300,0,300,400},&behind);
+         expect(composed.pixels[110*600+210]==0xfffafafa&&composed.pixels[5*600+5]==0xff123456&&preview.pixels[5*600+5]==0xfff4f7fb,"screen copy fills around the pin so toolbar acrylic shows what is behind");
+         auto mismatched=MakeFrame({0,0,10,10},0xff123456);expect(PinAnnotationPreview(image,display,{-300,0,300,400},&mismatched).pixels==preview.pixels,"a screen copy of the wrong size falls back to the flat canvas");}
         Document empty;expect(renderer.Flatten(image,PinAnnotationDocument(empty,display,image),image.bounds).pixels==image.pixels,"empty annotation preserves every source pixel");
         Mark text;text.tool=Tool::Text;text.a={20,20};text.b={180,70};text.font_family=L"Consolas";text.text_auto_size=true;text.text_wrap_width=300;Document fonts;fonts.marks.push_back(text);
         const auto shown=PinAnnotationDisplayDocument(fonts,image,display);const auto restored=PinAnnotationDocument(shown,display,image);

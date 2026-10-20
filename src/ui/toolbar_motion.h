@@ -6,7 +6,7 @@
 
 namespace lumashot::ui {
 // Toolbar action ids 0..16 plus 17 (long capture).
-inline constexpr size_t ToolbarSlots=19;
+inline constexpr size_t ToolbarSlots=20;
 struct ToolbarMotionFrame {
     Box indicator{};
     std::array<float,ToolbarSlots> hover{},press{};
@@ -34,7 +34,7 @@ class ToolbarMotion {
     int selected_{-1};bool ready_{},moving_{},effects_{};
     static bool Valid(Box b){return b.right>b.left&&b.bottom>b.top;}
     static bool Near(Box a,Box b){return std::abs(a.left-b.left)<.05f&&std::abs(a.top-b.top)<.05f&&std::abs(a.right-b.right)<.05f&&std::abs(a.bottom-b.bottom)<.05f;}
-    static bool ToolSlot(int id){return (id>=1&&id<=6)||id==14;}
+    static bool ToolSlot(int id){return (id>=1&&id<=6)||id==14||id==19;}
     static Box Mix(Box a,Box b,float t){return {a.left+(b.left-a.left)*t,a.top+(b.top-a.top)*t,a.right+(b.right-a.right)*t,a.bottom+(b.bottom-a.bottom)*t};}
     Box Indicator(uint64_t now)const{
         if(!moving_||now>=start_+365)return goal_;

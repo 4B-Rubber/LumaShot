@@ -6,22 +6,27 @@ IDI_LUMASHOT ICON "app.ico"
 #pragma code_page(65001)
 1 RT_MANIFEST "app.manifest"
 100 DIALOGEX 0, 0, 333, 379
-STYLE DS_SETFONT | WS_POPUP | WS_CLIPCHILDREN
-EXSTYLE WS_EX_CONTROLPARENT
+// WS_THICKFRAME + WS_EX_NOREDIRECTIONBITMAP (0x00200000): DWM system backdrop, frames presented through
+// DirectComposition; the frame has zero size (WM_NCCALCSIZE returns 0).
+STYLE DS_SETFONT | WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME
+EXSTYLE WS_EX_CONTROLPARENT | 0x00200000L
 // Window text is set at runtime: CAPTION implicitly adds WS_CAPTION.
 FONT 10, "Microsoft YaHei UI"
 BEGIN
-    CONTROL "快捷键", 135, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "截图", 136, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "剪贴板", 137, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "截图翻译", 138, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "外观", 139, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "通用", 140, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "常规", 135, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "快捷键", 136, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "截图", 137, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "工具面板", 138, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "剪贴板", 139, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "贴图", 140, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "外观", 149, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "关于", 150, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "截图快捷键", 103, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "GIF 快捷键", 119, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "录屏快捷键", 120, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "剪贴板快捷键", 128, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "翻译快捷键", 133, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "划词翻译快捷键", 148, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "OCR 快捷复制", 142, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "置顶贴图", 143, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "OCR 去除空白", 144, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
@@ -35,9 +40,18 @@ BEGIN
     CONTROL "开机自启动", 127, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "自动检查更新", 130, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "检查更新", 131, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "打开", 173, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "查看", 174, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "开启剪贴板", 126, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "显示剪贴板侧边条", 132, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "退出后保留剪贴板历史", 129, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "20 条", 166, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "50 条", 167, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "100 条", 168, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "200 条", 169, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "显示剪贴板侧边条", 132, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "卡片堆叠", 170, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "经典细条", 171, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "卡片显示内容预览", 172, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "PNG", 116, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "JPEG", 117, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "BMP", 118, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
@@ -49,7 +63,25 @@ BEGIN
     CONTROL "跟随系统", 110, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "浅色", 111, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "深色", 112, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
-    CONTROL "恢复默认", 113, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "矩形", 151, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "圆形", 152, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "箭头", 153, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "铅笔", 154, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "文字", 155, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "马赛克", 156, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "序号", 157, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "贴图", 175, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "识别文字", 158, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "截图翻译", 159, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "长截图", 160, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "录制", 161, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "自动", 162, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "图标 + 文字", 163, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "仅图标", 164, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "窄条", 176, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "卡片", 177, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "自动展开属性栏", 165, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
+    CONTROL "恢复本页默认", 113, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "取消", IDCANCEL, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "保存", IDOK, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1
     CONTROL "×", 114, "Button", BS_OWNERDRAW | WS_TABSTOP, 0, 0, 1, 1

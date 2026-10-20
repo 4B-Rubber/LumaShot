@@ -113,6 +113,44 @@ struct ToolbarMotionTest {
             app.StopToolbarMotion();s.selected=false;app.SyncToolbarMotion();expect(!s.toolbar_visual.ready&&!app.toolbar_motion_timer_,"new selection/session hides stale motion");
             app.active_=false;DestroyWindow(app.main_);app.main_=nullptr;
         }
+        {   // Pin annotation over a live screen copy: no dim and no size chip outside the selection, so the
+            // rectangular window-region margin around the toolbar shows exactly the screen behind it.
+            constexpr int cw=800,ch=400;constexpr uint32_t behind=0xff3366cc;
+            const auto render=[&](bool clear){
+                ViewState s;s.selected=true;s.tool=Tool::Rectangle;s.selection={200,40,600,160};s.clear_outside=clear;
+                s.toolbar=PlaceToolbar(s.selection,{0,0,cw,ch},1,1,s.tool);
+                auto screen=MakeFrame({0,0,cw,ch},behind);Renderer renderer;
+                ComPtr<IWICImagingFactory> wic;Check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&wic)));
+                ComPtr<IWICBitmap> bitmap;Check(wic->CreateBitmap(cw,ch,GUID_WICPixelFormat32bppPBGRA,WICBitmapCacheOnLoad,&bitmap));
+                Check(renderer.factory_->CreateWicBitmapRenderTarget(bitmap.Get(),D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96),&renderer.target_));
+                renderer.screen_bitmap_=renderer.Bitmap(screen);renderer.acrylic_bitmap_=renderer.Bitmap(BlurBackdrop(screen));renderer.monitor_=screen.bounds;
+                renderer.target_->BeginDraw();renderer.Chrome(screen,screen,Document{},std::nullopt,s,screen.bounds,-1);Check(renderer.target_->EndDraw());
+                Frame out=MakeFrame({0,0,cw,ch});Check(bitmap->CopyPixels(nullptr,cw*4,UINT(out.pixels.size()*4),reinterpret_cast<BYTE*>(out.pixels.data())));
+                return std::pair{out,s.toolbar.bounds};
+            };
+            const auto [dimmed,unused]=render(false);const auto [clean,bar]=render(true);
+            const auto at=[&](const Frame& f,int x,int y){return f.pixels[size_t(y)*cw+size_t(x)];};
+            expect(at(dimmed,5,20)!=behind&&at(clean,5,20)==behind,"pin annotation over a screen copy leaves the outside undimmed");
+            expect(at(clean,210,20)==behind,"no size chip over a pin annotation");
+            const int bx=int(std::floor(bar.left))+1,by=int(std::floor(bar.top))+1;
+            expect(at(clean,bx,by)==behind&&at(clean,bx-3,by-3)==behind,"toolbar corner margin shows the screen behind it");
+            expect(at(clean,int(bar.left+bar.right)/2,int(bar.top+bar.bottom)/2)!=behind,"toolbar itself is still drawn");
+            // Over a pin: no resize handles (they never work there) and the border stays inside the pin.
+            expect(at(clean,197,37)==behind&&at(clean,400,161)==behind,"no handles or outer border half outside a pin");
+            expect(at(clean,200,100)!=behind,"pin border is drawn inside the pin");
+            expect(at(dimmed,400,161)!=behind,"normal capture keeps its resize handles");
+            // Tooltip room: the region reserve contains every tooltip the toolbar can draw for that hover.
+            const auto layout=PlaceToolbar({200,40,600,160},{0,0,cw,ch},1,1,Tool::Rectangle);
+            const Box view{0,0,float(cw),float(ch)};bool covered=true;int tested=0;
+            for(int hover:{0,1,2,3,7,9,11,12}){const Box anchor=layout.Button(hover);if(anchor.right<=anchor.left)continue;++tested;
+                const Box tip=ui::TooltipBounds(anchor,view,Point{140,17},1),reserve=ToolbarTooltipReserve(layout,hover);
+                covered=covered&&reserve.left<=tip.left&&reserve.top<=tip.top&&reserve.right>=tip.right&&reserve.bottom>=tip.bottom;}
+            expect(tested>=4&&covered,"tooltip reserve contains the tooltip of each hovered button");
+            const Box none=ToolbarTooltipReserve(layout,-1),dragging=ToolbarTooltipReserve(layout,1,28);
+            expect(none.right<=none.left&&dragging.right<=dragging.left,"no tooltip reserve without a tooltip");
+            (void)unused;
+        }
         std::cout<<"TOOLBAR_MOTION checks="<<checks<<" failures="<<failures<<std::endl;return failures?1:0;
     }
 };

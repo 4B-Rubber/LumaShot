@@ -22,6 +22,7 @@ struct Control {
     int icon{-1};uint32_t color{};float value{};
     bool selected{},enabled{true},primary{},square{},rainbow{};
     bool indicator_backed{}; // The toolbar paints its shared animated backdrop.
+    bool caption{}; // Label drawn in the secondary caption colour (property group titles).
     std::wstring accessible_name; // Semantic name retained for icon-only controls.
     bool Interactive()const;
 };
@@ -30,6 +31,8 @@ struct Theme {
     float Radius()const{return 7*scale;}
     uint32_t Ink()const{return dark?0xffedf4ff:0xff243142;}
     uint32_t Muted()const{return dark?0xff8090a6:0xff8793a4;}
+    // Group captions: quieter than Ink but readable on the light acrylic.
+    uint32_t Caption()const{return dark?0xffa9b6c9:0xff4f5b6c;}
     uint32_t Border()const{return dark?0x556f839d:0x448294ae;}
     uint32_t Accent()const{return 0xff0784ff;}
 };

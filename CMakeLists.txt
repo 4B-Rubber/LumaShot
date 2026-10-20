@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(LumaShot VERSION 0.4.0 LANGUAGES CXX RC)
+project(LumaShot VERSION 0.4.1 LANGUAGES CXX RC)
 set(LUMATEXT_PACKAGE "${CMAKE_CURRENT_SOURCE_DIR}/deps/lumatext")
 add_library(lumatext_binary SHARED IMPORTED)
 set_target_properties(lumatext_binary PROPERTIES
@@ -177,8 +177,8 @@ configure_file("${LUMASHOT_OCR_RUNTIME}" "${CMAKE_BINARY_DIR}/onnxruntime.dll" C
 add_executable(lumashot_ocr_worker src/ocr/worker_main.cpp)
 target_link_libraries(lumashot_ocr_worker PRIVATE lumashot_ocr_engine)
 # Screenshot translation rendering + side panel; separate so tests that compile pin.cpp directly can link it.
-add_library(lumashot_pin_translation STATIC src/pin/translation.cpp src/pin/translation_panel.cpp)
-target_link_libraries(lumashot_pin_translation PUBLIC lumashot_translate lumashot_ui dwmapi)
+add_library(lumashot_pin_translation STATIC src/pin/translation.cpp src/pin/translation_panel.cpp src/pin/selection_capture.cpp src/pin/selection_translator.cpp)
+target_link_libraries(lumashot_pin_translation PUBLIC lumashot_translate lumashot_ui dwmapi ole32 oleaut32)
 # Pin clothesline (rope at the top edge); here so tests that compile pin.cpp directly link it too.
 target_sources(lumashot_pin_translation PRIVATE src/pin/clothesline.cpp)
 add_executable(lumashot_clothesline_test tests/clothesline_test.cpp)
@@ -543,6 +543,9 @@ add_executable(lumashot_pin_session_test tests/pin_session_test.cpp src/app/pref
 target_link_libraries(lumashot_pin_session_test PRIVATE lumashot_pin_translation)
 target_link_libraries(lumashot_pin_session_test PRIVATE lumashot_pin shell32 advapi32 comctl32 comdlg32)
 add_test(NAME pin_session COMMAND lumashot_pin_session_test)
+add_executable(lumashot_selection_translate_test tests/selection_translate_test.cpp src/app/preferences.cpp)
+target_link_libraries(lumashot_selection_translate_test PRIVATE lumashot_pin shell32 advapi32 comctl32 comdlg32)
+add_test(NAME selection_translate COMMAND lumashot_selection_translate_test)
 set_tests_properties(pin_session PROPERTIES TIMEOUT 40)
 target_sources(lumashot_pin_test PRIVATE src/pin/session.cpp)
 target_sources(lumashot_ui PRIVATE src/clipboard/file_icons.cpp)
@@ -740,3 +743,4 @@ add_executable(lumashot_translation_preview EXCLUDE_FROM_ALL tests/translation_p
 target_link_libraries(lumashot_translation_preview PRIVATE lumashot_pin)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/translate")
 set_tests_properties(translate PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/translate" TIMEOUT 90)
+include(cmake/card_stack.cmake)

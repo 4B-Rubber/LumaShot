@@ -4,6 +4,12 @@
 #include "clipboard/quick_input.h"
 #include "clipboard/liquid_surface.h"
 #include "clipboard/strip_dismiss.h"
+#include "clipboard/stack_items.h"
+#include "clipboard/panel_cards.h"
+#include "clipboard/syntax_highlight.h"
+#include "ui/luma_glass.h"
+#include "clipboard/stack_window.h"
+#include "clipboard/card_drag.h"
 #include "clipboard/input_focus.h"
 #include "ui/shortcut_label.h"
 #include "clipboard/composition.h"
@@ -18,6 +24,7 @@
 #include "ui/memory_target.h"
 #include "ui/text_renderer.h"
 #include <shlobj.h>
+#include <shellapi.h>
 #include <shlwapi.h>
 #include <wincodec.h>
 #include "capture/frame.h"
@@ -104,12 +111,21 @@ struct ClipboardPanel::Impl {
     // Hidden strip: history, the shortcut and the tray entry keep working; only the
     // edge tab is gone. Dragging the strip onto the close target hides it.
     bool strip_hidden{};std::function<void()> strip_dismissed;
+    // Card stack (docs/clipboard-card-stack.md) replaces the folded strip unless
+    // [Strip] Style=Classic. Test mode keeps the strip; stack tests opt in.
+    std::unique_ptr<clipboard::StackWindow> stack;bool stack_style{},stack_moving{};
+    // Settings: 侧边条样式 (unset: clipboard-layout.ini decides) and 卡片显示内容预览.
+    std::optional<bool> classic_override;bool card_preview{true};
+    std::vector<uint64_t> stack_ids;size_t stack_total{};bool stack_dark{};std::vector<bool> stack_has_thumb;
+    std::map<uint64_t,std::shared_ptr<const Frame>> stack_thumbs;// downscaled; survive Fold()'s CancelReads
+    bool copy_stack{},paste_stack{};
     clipboard::DismissTracker dismiss_tracker;std::unique_ptr<clipboard::DismissTarget> dismiss_target;POINT drag_anchor{};
-    bool UpdateDismiss(POINT point,RECT work){
-        const bool armed=dismiss_tracker.Update(point,work,GetDpiForWindow(window)/96.f);
+    bool UpdateDismiss(POINT point,RECT work,HWND relative=nullptr){
+        const HWND w=relative?relative:window;
+        const bool armed=dismiss_tracker.Update(point,work,GetDpiForWindow(w)/96.f);
         if(dismiss_tracker.Active()&&!test_mode){
             if(!dismiss_target)dismiss_target=std::make_unique<clipboard::DismissTarget>(owner);
-            dismiss_target->Show(dismiss_tracker.Zone(),dark,window);
+            dismiss_target->Show(dismiss_tracker.Zone(),dark,w);
             dismiss_target->SetState(armed,dismiss_tracker.Proximity());
         }
         return armed;
@@ -122,6 +138,7 @@ struct ClipboardPanel::Impl {
     }
     // Nothing of the folded strip stays on screen or in the GPU while it is hidden.
     void ParkHiddenStrip(){
+        if(stack)stack->Show(false);
         StopOpening(false);StopLiquidDrag(false);
         if(!window)return;
         SelectWindow();reveal_window=false;drag_pending=false;
@@ -200,7 +217,12 @@ struct ClipboardPanel::Impl {
     clipboard::PreviewCache preview_cache;
     clipboard::PreviewCache thumbnail_cache{384 * 1024};
     uint64_t preview_pending{};
-    float W=400,H=744,ListBottom=682;bool resizing{};
+    float W=400,H=744,ListBottom=744-clipboard::cards::FooterHeight;bool resizing{};
+    // Pixel scrolling: `scroll` stays the index of the block at the list top;
+    // `scroll_offset` is the pixel offset into it and applies only while
+    // offset_index==scroll, so plain index assignments keep their meaning.
+    float scroll_offset{};int offset_index{-1};float scroll_target{-1};ULONGLONG scroll_tick{};
+    std::vector<float> block_tops;std::vector<char> block_header;std::optional<D2D1_RECT_F> hit_clip;
     clipboard::LiquidTween liquid_drag_tween;clipboard::LiquidPull liquid_pull;
     clipboard::LiquidEdge liquid_drag_edge{clipboard::LiquidEdge::None};
     std::unique_ptr<clipboard::LiquidSurface> liquid_surface;
@@ -385,8 +407,10 @@ struct ClipboardPanel::Impl {
         if(enabled)Place();
         if(resume){drag_start=pointer;drag_rect=VisualBodyBounds();dragged=true;snap_x=snap_y=0;drag_monitor=nullptr;}
     }
-    static constexpr float CW=28,CH=96,HeaderBottom=76,ListTop=202;
-    int PageRows()const{return std::max(1,static_cast<int>((ListBottom-ListTop)/96));}
+    static constexpr float CW=28,CH=96,HeaderBottom=clipboard::cards::HeaderBottom,BulkHeight=32,BulkGap=8;
+    float ListTop=clipboard::cards::ListTop;   // + bulk bar while 2+ cards are selected
+    // Cards are variable height (panel_cards.h): a page is what fits below `scroll`.
+    int PageRows(){return FitCount(scroll);}
     int ResizeHit(POINT point)const{
         if(!expanded){
             RECT actual{};GetWindowRect(window,&actual);
@@ -411,12 +435,12 @@ struct ClipboardPanel::Impl {
     }
     void ResizeClient(int pixels_w,int pixels_h){
         if(!expanded||!resizing||pixels_w<=0||pixels_h<=0)return;
-        W=pixels_w/scale;H=pixels_h/scale;ListBottom=H-62;
-        scroll=std::clamp(scroll,0,std::max(0,static_cast<int>(visible.size())-PageRows()));
+        W=pixels_w/scale;H=pixels_h/scale;ListBottom=H-clipboard::cards::FooterHeight;
+        ClampScroll();
         LayoutSearch();Invalidate();
     }
     explicit Impl(HWND host,std::function<void()> callback,std::function<bool()> allowed = {}):owner(host),settings(std::move(callback)),hotkey_allowed(std::move(allowed)){}
-    ~Impl(){ReleaseDisabledResources();}
+    ~Impl(){if(!pending_delete.empty()){for(const auto id:pending_delete)history.Erase(id);pending_delete.clear();if(disk)disk->Commit(history.entries,history.groups);}ReleaseDisabledResources();}
     void Invalidate(){if(window)InvalidateRect(window,nullptr,FALSE);}
     void ClearFileIcons(){if(file_icons)file_icons->Clear();file_bitmaps.clear();}
     void ReleaseDisabledResources(){
@@ -435,6 +459,7 @@ struct ClipboardPanel::Impl {
         if(window){RemoveClipboardFormatListener(EventWindow());UnregisterShortcut();KillTimer(EventWindow(),1);KillTimer(EventWindow(),2);KillTimer(EventWindow(),3);KillTimer(EventWindow(),4);KillTimer(EventWindow(),6);KillTimer(EventWindow(),11);if(GetCapture()==window)ReleaseCapture();}
         ClosePreview();listening=hotkey=paste_inflight=false;disk.reset();file_icons.reset();
         composition.reset();parked_composition.reset();
+        stack.reset();stack_ids.clear();stack_has_thumb.clear();stack_thumbs.clear();stack_total=0;stack_moving=false;stack_first=0;
         idle_layered=false;if(idle_strip){DestroyWindow(idle_strip);idle_strip=nullptr;}ClipboardComposition::DropPrewarm();
         switching_window=true;
         if(folded_window)DestroyWindow(folded_window);
@@ -442,35 +467,37 @@ struct ClipboardPanel::Impl {
         else if(window)DestroyWindow(window);
         window=native_window=folded_window=nullptr;search=nullptr;switching_window=reveal_window=false;
         // Release bitmap references before render target, and target before bound DC.
-        images.clear();thumbnail_pending.clear();thumbnail_failed.clear();thumbnail_cache.Clear();file_bitmaps.clear();app_icon.Reset();brush.Reset();target.Reset();surface.reset();search_text_glyphs=0;ime_active=false;ime_original.clear();ime_text.clear();
+        images.clear();thumbnail_pending.clear();thumbnail_failed.clear();thumbnail_cache.Clear();file_bitmaps.clear();app_icon.Reset();brush.Reset();checker.Reset();target.Reset();surface.reset();search_text_glyphs=0;ime_active=false;ime_original.clear();ime_text.clear();
         fonts.clear();writer.Reset();factory.Reset();
         if(font){DeleteObject(font);font=nullptr;}if(edit_brush){DeleteObject(edit_brush);edit_brush=nullptr;}
         history=clipboard::History{};std::vector<uint64_t>().swap(visible);std::vector<uint64_t>().swap(search_matches);std::vector<Hit>().swap(hits);
         std::wstring().swap(completed_query);std::wstring().swap(query);std::wstring().swap(status);selected=last_read_id=0;copy_target=previous=paste_target=previous_focus=copy_focus=paste_focus=nullptr;copy_process=paste_process=paste_sequence=0;
-        copy_remove_whitespace=copy_plain=copy_keyboard=paste_keyboard=paste_activated=paste_returning=copy_quick=paste_quick=false;paste_return_at=0;
-        suppress_search_space=false;search_complete=false;tab=scroll=retry=paste_wait=0;hover=-1;width=height=0;
+        copy_remove_whitespace=copy_plain=copy_keyboard=paste_keyboard=paste_activated=paste_returning=copy_quick=paste_quick=copy_stack=paste_stack=false;paste_return_at=0;
+        suppress_search_space=false;search_complete=false;tab=scroll=retry=paste_wait=0;scroll_offset=0;offset_index=-1;scroll_target=-1;hover=-1;width=height=0;
         // Keep only small user placement/policy fields; recreate resources on demand.
         // The history and decoded images just freed leave tens of MB of free pages that
         // the process heap would otherwise keep committed until later churn reuses them.
         HeapCompact(GetProcessHeap(),0);
     }
-    void SelectVisible(){scroll=std::clamp(scroll,0,std::max(0,static_cast<int>(visible.size())-PageRows()));if(std::find(visible.begin(),visible.end(),selected)==visible.end())selected=visible.empty()?0:visible.front();if(preview.IsOpen())ShowPreview();else PrefetchPreview();Invalidate();}
+    void SelectVisible(){ClampScroll();if(std::find(visible.begin(),visible.end(),selected)==visible.end())selected=visible.empty()?0:visible.front();if(preview.IsOpen())ShowPreview();else PrefetchPreview();Invalidate();}
     void Filter(bool cancel_copy=true){
         if(tab<0||tab>=TabCount())tab=0;
         if(cancel_copy){++copy_token;copy_pending=false;}
-        const auto summaries=history.Filter(tab,query,oldest);
+        const auto summaries=history.Filter(tab,query,oldest,flavor);
         if(search_complete&&!query.empty()&&completed_query==query){
-            visible=history.Filter(tab,L"",oldest);
+            visible=history.Filter(tab,L"",oldest,flavor);
             std::erase_if(visible,[&](uint64_t id){return std::find(search_matches.begin(),search_matches.end(),id)==search_matches.end()&&std::find(summaries.begin(),summaries.end(),id)==summaries.end();});
         }else{search_complete=false;visible=summaries;}
+        if(!pending_delete.empty())std::erase_if(visible,[&](uint64_t id){return std::find(pending_delete.begin(),pending_delete.end(),id)!=pending_delete.end();});
+        if(!msel.empty())std::erase_if(msel,[&](uint64_t id){return std::find(visible.begin(),visible.end(),id)==visible.end();});
         SelectVisible();
         if(disk&&!query.empty())disk->Search(history.entries,query,++search_token);else ++search_token;
     }
     void ClosePreview(){++preview_token;preview_pending=0;if(disk)disk->CancelPreview();preview.Close();preview_cache.Clear();}
     void CancelReads(){ClosePreview();++copy_token;++image_token;++search_token;copy_pending=false;if(disk)disk->CancelReads();images.clear();thumbnail_pending.clear();thumbnail_failed.clear();thumbnail_cache.Clear();}
-    bool ImageNeeded(uint64_t id)const{
+    bool ImageNeeded(uint64_t id){
         if(!expanded)return false;
-        for(int i=scroll;i<std::min(scroll+PageRows(),static_cast<int>(visible.size()));++i)if(visible[static_cast<size_t>(i)]==id)return true;return false;
+        const auto [first,end]=DrawnRange();for(int i=first;i<end;++i)if(visible[static_cast<size_t>(i)]==id)return true;return false;
     }
     void DrainStore(){
         if(!disk)return;bool changed=false;
@@ -479,9 +506,10 @@ struct ClipboardPanel::Impl {
             case clipboard::StoreResultKind::Restored:
                 history.SetGroups(std::move(result.groups));for(auto it=result.entries.rbegin();it!=result.entries.rend();++it)history.Add(std::move(*it));if(!result.message.empty())status=result.message;changed=true;break;
             case clipboard::StoreResultKind::Saved:
-                if(!history.Add(std::move(result.entry)))status=L"历史容量已满，未记录该条";changed=true;break;
+                if(!history.Add(std::move(result.entry)))status=L"历史容量已满，未记录该条";else if(!history.entries.empty())MarkNew(history.entries.front().id);changed=true;break;
             case clipboard::StoreResultKind::Loaded:
-                if(copy_pending&&result.token==copy_token){copy_pending=false;FinishCopy(result.entry,copy_paste,copy_target,copy_process);}break;
+                if(copy_pending&&result.token==copy_token){copy_pending=false;FinishCopy(result.entry,copy_paste,copy_target,copy_process);}
+                else if(drag_waiting&&result.token==drag_token)drag_loaded=std::make_unique<clipboard::Entry>(std::move(result.entry));break;
             case clipboard::StoreResultKind::Thumbnail:
                 if(result.token==image_token&&history.Find(result.entry.id)){
                     thumbnail_pending.erase(result.entry.id);
@@ -499,7 +527,7 @@ struct ClipboardPanel::Impl {
                 break;
             case clipboard::StoreResultKind::Search:
                 if(result.token==search_token&&!query.empty()){
-                    search_matches=std::move(result.matches);search_complete=true;completed_query=query;if(!result.message.empty())status=result.message;visible=history.Filter(tab,L"",oldest);
+                    search_matches=std::move(result.matches);search_complete=true;completed_query=query;if(!result.message.empty())status=result.message;visible=history.Filter(tab,L"",oldest,flavor);
                     std::erase_if(visible,[&](uint64_t id){return std::find(search_matches.begin(),search_matches.end(),id)==search_matches.end();});SelectVisible();
                 }break;
             case clipboard::StoreResultKind::Error:
@@ -508,10 +536,12 @@ struct ClipboardPanel::Impl {
                 if(result.preview_read&&expanded&&preview.IsOpen()&&result.token==preview_token&&result.entry.id==selected){
                     clipboard::PreviewData data;data.error=result.message;preview.SetContent(selected,std::move(data));
                 }
+                if(drag_waiting&&result.token==drag_token)drag_failed=true;
                 if(result.token==0||(result.foreground_read&&copy_pending&&result.token==copy_token)){status=result.message;if(result.token)copy_pending=false;}break;
             }
         }
         if(changed){disk->Commit(history.entries,history.groups);Filter(false);if(quick_active)RefreshQuick();}else if(quick_active)UpdateQuick();Invalidate();
+        QueueStackRefresh();
     }
     bool Create(){
         if(window)return true;WNDCLASSEXW wc{sizeof(wc)};wc.lpfnWndProc=Proc;wc.hInstance=GetModuleHandleW(nullptr);wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=L"LumaShot.Clipboard";
@@ -539,8 +569,9 @@ struct ClipboardPanel::Impl {
     }
     void LoadLayout(){
         if(layout_path.empty())return;
-        if(const auto dimensions=clipboard::LoadPanelSize(layout_path)){W=static_cast<float>(dimensions->cx);H=static_cast<float>(dimensions->cy);ListBottom=H-62;}
+        if(const auto dimensions=clipboard::LoadPanelSize(layout_path)){W=static_cast<float>(dimensions->cx);H=static_cast<float>(dimensions->cy);ListBottom=H-clipboard::cards::FooterHeight;}
         if(!placed){if(const auto saved=clipboard::LoadPosition(layout_path)){anchor=*saved;placed=true;}}
+        paused=clipboard::LoadPaused(layout_path);
     }
     bool SaveLayout()const{
         // Tests only persist when given an explicit isolated path; never resolve personal settings.
@@ -555,7 +586,7 @@ struct ClipboardPanel::Impl {
             PWSTR folder{};if(SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData,0,nullptr,&folder))){layout_path=std::filesystem::path(folder)/L"LumaShot"/L"clipboard-layout.ini";CoTaskMemFree(folder);}
         }
         if(!window)LoadLayout();
-        if(!Create()){ReleaseDisabledResources();return false;}acrylic=ApplyBackdrop();
+        if(!Create()){ReleaseDisabledResources();return false;}acrylic=ApplyBackdrop();CreateStack();
         if(!test_mode&&!disk){if(layout_path.empty()){ReleaseDisabledResources();return false;}disk=std::make_unique<clipboard::SessionStore>(layout_path.parent_path()/L"clipboard-history",EventWindow(),persist_history);}
         if(!enabled){sequence=GetClipboardSequenceNumber();listening=test_mode||AddClipboardFormatListener(EventWindow())!=FALSE;if(!listening){ReleaseDisabledResources();return false;}enabled=true;expanded=false;
             hotkey=shortcut_key&&!test_mode&&!hotkeys_suspended&&RegisterShortcut(shortcut_modifiers,shortcut_key);
@@ -607,6 +638,9 @@ struct ClipboardPanel::Impl {
         // From the idle strip the D3D11 device is gone; create it on a worker while this thread renders.
         if(expanded)ClipboardComposition::Prewarm();
         if(!expanded&&strip_hidden){ParkHiddenStrip();return;}
+        // Fold -> expand continuity: the stack cards fly into the panel's card slots.
+        const bool fly_out=stack&&expanded&&stack->Visible()&&!stack->Flying()&&MotionEnabled()&&!test_mode&&enabled;
+        if(stack){if(!expanded){PlaceStack();return;}if(!fly_out)stack->Show(false);}
         StopOpening(false);
         const RECT from=VisualBodyBounds();
         animate=animate&&expanded&&window==folded_window&&IsWindowVisible(window)&&MotionEnabled()&&!liquid_failed;
@@ -623,31 +657,363 @@ struct ClipboardPanel::Impl {
         const LONG x=std::clamp(anchor.x-w,r.left+margin,std::max(r.left+margin,r.right-w-margin)),y=std::clamp(anchor.y,r.top+margin,std::max(r.top+margin,r.bottom-h-margin));
         const RECT placement=expanded&&!pinned&&summon_cursor?clipboard::PanelNearCursor(*summon_cursor,r,{w,h},scale):RECT{x,y,x+w,y+h};
         PresentAt(placement,enabled&&(!test_mode||reveal_window));
-        if(animate&&StartOpening(from,placement,GetTickCount64()))return;
+        if(animate&&StartOpening(from,placement,GetTickCount64())){if(fly_out)stack->Show(false);return;}
         if(enabled&&!test_mode)ShowWindow(window,SW_SHOWNOACTIVATE);
+        if(fly_out){stack->Fly(StackSlots(placement),true);stack->Show(false);}
+    }
+    // Screen rects (physical px) of the panel cards showing the stack's items, in stack order;
+    // empty where the card is not on screen.
+    std::vector<RECT> StackSlots(RECT panel){
+        std::vector<RECT> out;if(!stack)return out;
+        BuildBlocks();const float px=ScrollPx();
+        for(size_t k=0;k<stack_ids.size()&&k<static_cast<size_t>(clipboard::stack::MaxCards);++k){
+            RECT slot{};const auto it=std::find(visible.begin(),visible.end(),stack_ids[k]);
+            if(it!=visible.end()){
+                const size_t i=static_cast<size_t>(it-visible.begin());
+                if(i<block_tops.size())if(const auto* e=history.Find(*it)){
+                    const float top=ListTop+block_tops[i]-px+(block_header[i]?clipboard::cards::GroupHeaderHeight:0.f),bottom=top+CardHeightFor(*e);
+                    if(bottom>ListTop&&top<ListBottom)slot={panel.left+std::lround(clipboard::cards::ListInset*scale),panel.top+std::lround(std::max(top,ListTop)*scale),
+                        panel.left+std::lround((W-clipboard::cards::ListInset)*scale),panel.top+std::lround(std::min(bottom,ListBottom)*scale)};
+                }
+            }
+            out.push_back(slot);
+        }
+        return out;
+    }
+    // ---- Card stack ---------------------------------------------------------
+    // 最多保留 (settings): lowering it drops the oldest ordinary entries right away.
+    void SetHistoryLimit(size_t value){
+        history.SetLimit(value);const size_t before=history.entries.size();history.TrimOrdinary();
+        if(history.entries.size()==before)return;
+        if(disk)disk->Commit(history.entries,history.groups);
+        Filter();QueueStackRefresh();Invalidate();
+    }
+    // 侧边条样式 (settings). Mirrored into clipboard-layout.ini so both stay in step;
+    // while enabled the folded form is rebuilt in place.
+    void SetStripStyle(bool classic){
+        classic_override=classic;ResolveLayoutPath();
+        if(test_mode)stack_style=!classic;
+        else if(!layout_path.empty()&&(clipboard::LoadStripStyle(layout_path)==clipboard::StripStyle::Classic)!=classic)
+            clipboard::SaveStripStyle(layout_path,classic?clipboard::StripStyle::Classic:clipboard::StripStyle::Stack);
+        if(!enabled)return;
+        if(classic&&stack){stack.reset();stack_ids.clear();stack_has_thumb.clear();stack_thumbs.clear();stack_total=0;stack_moving=false;stack_first=0;if(!expanded)Place();}
+        else if(!classic&&!stack){CreateStack();if(stack&&!expanded)Place();}
+    }
+    void SetCardPreview(bool show){
+        if(card_preview==show)return;
+        card_preview=show;if(!show)stack_thumbs.clear();
+        stack_ids.clear();RefreshStack();
+    }
+    void CreateStack(){
+        if(!test_mode)stack_style=classic_override?!*classic_override:clipboard::LoadStripStyle(layout_path)==clipboard::StripStyle::Stack;
+        if(stack||!stack_style)return;
+        clipboard::StackEvents events;
+        events.activate=[this](size_t index){StackPaste(index);};
+        events.open_panel=[this]{Show(false);};
+        events.moved=[this](RECT){StackMoved();};
+        events.dragging=[this](POINT at){StackDragging(at);};
+        events.move_cancelled=[this]{stack_moving=false;CancelDismiss();};
+        events.drag=[this](size_t index,POINT at){return StackDrag(index,at);};
+        events.scroll=[this](int steps){StackScroll(steps);};
+        events.folded=[this]{StackFolded();};
+        stack=std::make_unique<clipboard::StackWindow>(owner,std::move(events));
+        // Without Windows.UI.Composition the classic strip stays.
+        if(!stack->Create()){stack.reset();return;}
+        stack->SetPaused(paused);
+        stack->SetBadgePrefix(L"");stack_ids.clear();stack_has_thumb.clear();stack_total=0;stack_first=0;
+    }
+    void PlaceStack(){
+        // The liquid strip and its renderer are never shown in stack mode.
+        StopOpening(false);StopLiquidDrag(false);
+        if(window){SelectWindow();reveal_window=false;if(GetCapture()==window)ReleaseCapture();ShowWindow(window,SW_HIDE);}
+        HideIdleStrip();if(search)ShowWindow(search,SW_HIDE);
+        MONITORINFO monitor{sizeof(monitor)};
+        if(!placed){POINT cursor{};GetCursorPos(&cursor);GetMonitorInfoW(MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST),&monitor);anchor={monitor.rcWork.right-6,monitor.rcWork.top+70};placed=true;}
+        GetMonitorInfoW(MonitorFromPoint(POINT{anchor.x-1,anchor.y},MONITOR_DEFAULTTONEAREST),&monitor);
+        const auto side=clipboard::stack::NearestSide(anchor.x-1,monitor.rcWork);
+        const auto dpi=[&]{const UINT value=GetDpiForWindow(stack->VisualWindow());return value?value/96.f:1.f;};
+        const float first=dpi();stack->Place(side,anchor.y,monitor.rcWork,first);
+        // Moving onto another monitor updates the window DPI; place once more at it.
+        if(const float actual=dpi();std::abs(actual-first)>.001f)stack->Place(side,anchor.y,monitor.rcWork,actual);
+        stack->SetMotion(MotionEnabled());
+        RefreshStack();
+        stack->Show(enabled);
+    }
+    static std::shared_ptr<const Frame> StackThumbnail(const Frame& source){
+        // Area-average down to cover the 46x40 DIP tile at up to ~2x scale.
+        const int w=source.Width(),h=source.Height();
+        if(w<=0||h<=0||source.pixels.size()<static_cast<size_t>(w)*static_cast<size_t>(h))return nullptr;
+        const float s=std::min(1.f,std::max(96.f/w,84.f/h));
+        const int dw=std::max(1,static_cast<int>(std::lround(w*s))),dh=std::max(1,static_cast<int>(std::lround(h*s)));
+        auto out=std::make_shared<Frame>();out->bounds={0,0,dw,dh};out->pixels.resize(static_cast<size_t>(dw)*static_cast<size_t>(dh));
+        for(int y=0;y<dh;++y){
+            const int y0=y*h/dh,y1=std::max(y0+1,(y+1)*h/dh);
+            for(int x=0;x<dw;++x){
+                const int x0=x*w/dw,x1=std::max(x0+1,(x+1)*w/dw);uint64_t sum[4]{};
+                for(int sy=y0;sy<y1;++sy)for(int sx=x0;sx<x1;++sx){const uint32_t c=source.pixels[static_cast<size_t>(sy)*w+sx];for(int k=0;k<4;++k)sum[k]+=(c>>(8*k))&255u;}
+                const uint64_t n=static_cast<uint64_t>(x1-x0)*static_cast<uint64_t>(y1-y0);uint32_t c=0;
+                for(int k=0;k<4;++k)c|=static_cast<uint32_t>((sum[k]+n/2)/n)<<(8*k);
+                out->pixels[static_cast<size_t>(y)*dw+x]=c;
+            }
+        }
+        return out;
+    }
+    // A burst of copies must cost one redraw: composition only commits (and WARP
+    // only frees replaced surfaces) between message-loop turns.
+    static constexpr UINT StackRefreshMessage=WM_APP+185;
+    bool stack_refresh_queued{};
+    size_t stack_first{};  // wheel paging: history index of the first card (0 = newest)
+    void QueueStackRefresh(){
+        if(!stack||expanded||stack_refresh_queued)return;
+        stack_refresh_queued=PostMessageW(EventWindow(),StackRefreshMessage,0,0)!=FALSE;
+        if(!stack_refresh_queued)RefreshStack();
+    }
+    // Cheap when nothing changed: ids, total, theme and thumbnail presence are compared first.
+    void RefreshStack(){
+        if(!stack||expanded)return;
+        std::vector<const clipboard::Entry*> top;
+        const size_t entry_count=history.entries.size(),stack_cap=static_cast<size_t>(clipboard::stack::MaxCards);
+        stack_first=std::min(stack_first,entry_count>stack_cap?entry_count-stack_cap:0);
+        size_t stack_skip=stack_first;
+        for(const auto& e:history.entries){if(top.size()==stack_cap)break;if(stack_skip){--stack_skip;continue;}top.push_back(&e);}
+        std::vector<uint64_t> ids;std::vector<bool> has;
+        for(const auto* e:top){
+            ids.push_back(e->id);
+            if(card_preview&&e->kind==clipboard::Kind::Image&&!stack_thumbs.contains(e->id)){
+                if(auto frame=thumbnail_cache.Find(e->id)){if(auto reduced=StackThumbnail(*frame))stack_thumbs[e->id]=std::move(reduced);}
+                else if(e->payload&&disk&&!thumbnail_pending.contains(e->id)&&!thumbnail_failed.contains(e->id)&&disk->Load(*e,image_token,true))thumbnail_pending.insert(e->id);
+            }
+            has.push_back(stack_thumbs.contains(e->id));
+        }
+        std::erase_if(stack_thumbs,[&](const auto& item){return std::find(ids.begin(),ids.end(),item.first)==ids.end();});
+        // Folded, only the stack asked for these; it keeps its own reduced copies.
+        if(thumbnail_cache.Bytes())thumbnail_cache.Clear();
+        const size_t total=history.entries.size();
+        if(ids==stack_ids&&has==stack_has_thumb&&total==stack_total&&dark==stack_dark)return;
+        // Ids only grow: a larger unseen first id is a new copy, also once history is full.
+        const bool incoming=stack_first==0&&stack->Visible()&&!ids.empty()&&!stack_ids.empty()&&ids.front()>stack_ids.front()&&
+            std::find(stack_ids.begin(),stack_ids.end(),ids.front())==stack_ids.end();
+        std::vector<clipboard::StackItem> items;items.reserve(top.size());
+        for(const auto* e:top){
+            const auto thumb=stack_thumbs.find(e->id);
+            auto item=clipboard::MakeStackItem(*e,thumb==stack_thumbs.end()?nullptr:thumb->second.get(),e->file_names[0],e->file_count);
+            items.push_back(card_preview?std::move(item):clipboard::Concealed(std::move(item)));
+        }
+        stack->SetTheme(dark);stack->SetItems(std::move(items),total,incoming,stack_first);
+        stack_ids=std::move(ids);stack_has_thumb=std::move(has);stack_total=total;stack_dark=dark;
+    }
+    // Wheel over the open stack: one history entry per notch (+ older), clamped to the oldest five.
+    void StackScroll(int steps){
+        if(!stack||expanded||steps==0)return;
+        const size_t entry_count=history.entries.size(),stack_cap=static_cast<size_t>(clipboard::stack::MaxCards);
+        const size_t oldest_first=entry_count>stack_cap?entry_count-stack_cap:0,notches=static_cast<size_t>(steps<0?-steps:steps);
+        const size_t goal=steps<0?(stack_first>notches?stack_first-notches:0):std::min(oldest_first,stack_first+notches);
+        if(goal==stack_first)return;
+        stack_first=goal;RefreshStack();
+    }
+    // Folded again: the minis always show the newest entries.
+    void StackFolded(){if(stack_first){stack_first=0;RefreshStack();}}
+    // Card click: copy and paste into the window that still has focus (the stack never activates).
+    void StackPaste(size_t index){
+        if(index>=stack_ids.size()||copy_pending||paste_inflight)return;
+        const auto* e=history.Find(stack_ids[index]);if(!e)return;
+        const HWND foreground=GetForegroundWindow();RememberTarget(foreground);
+        const bool paste=previous&&foreground&&GetAncestor(foreground,GA_ROOT)==previous;
+        copy_target=paste?previous:nullptr;copy_process=paste?previous_process:0;copy_focus=paste?previous_focus:nullptr;
+        copy_remove_whitespace=copy_plain=copy_keyboard=copy_quick=false;copy_stack=true;
+        if(e->payload&&disk){copy_paste=paste;copy_pending=true;const auto token=++copy_token;
+            if(!disk->Load(*e,token)){copy_pending=false;copy_stack=false;}return;}
+        FinishCopy(*e,paste,copy_target,copy_process);
+    }
+    void StackDragging(POINT at){
+        if(!stack_moving){stack_moving=true;drag_anchor=anchor;dismiss_tracker.Begin(at);}
+        MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint(at,MONITOR_DEFAULTTONEAREST),&monitor);
+        UpdateDismiss(at,monitor.rcWork,stack->VisualWindow());
+    }
+    // ---- Card drag-out (docs/clipboard-card-stack.md 3.5) --------------------
+    // Formats are read before DoDragDrop: OLE calls GetData on this thread, so it
+    // can never wait for a store result that DrainStore would deliver.
+    uint64_t drag_token{1ull<<62},drag_id{};bool drag_waiting{},drag_failed{},drag_running{};
+    struct RowPress{uint64_t id{};POINT at{};};std::optional<RowPress> row_press;  // panel card pressed, drag not yet started
+    std::unique_ptr<clipboard::Entry> drag_loaded;
+    std::function<bool(std::shared_ptr<const Frame>,POINT)> pin_request;
+    // Optional host hooks for image cards (OCR, annotate-then-pin); buttons hide without them.
+    std::function<bool(ClipboardImageAction,std::shared_ptr<const Frame>,POINT)> image_action;
+    std::wstring last_copied_text,last_shell_target;   // test-mode observations; never written to the system
+    // .item / .acts transitions (.12s): values move only while a transition runs (timer 13).
+    struct CardFx{float hover{},active{},acts{},hover_to{},active_to{},acts_to{};};std::map<uint64_t,CardFx> card_fx;
+    bool fx_running{},fx_enabled{true};ULONGLONG fx_tick{};
+    uint64_t new_id{};ULONGLONG new_tick{};   // .item.new: slidein .45s on the card that just arrived
+    // Multi-select (full.html msel): Ctrl toggles, Shift adds a range, the bulk bar shows at 2+.
+    std::set<uint64_t> msel;std::optional<size_t> last_click;WPARAM click_mods{};
+    // Bulk delete is undoable: rows hide at once and are erased after 6 s, on fold, or before the next bulk delete.
+    std::vector<uint64_t> pending_delete;
+    // OCR text of image cards recognised this session (bounded), shown in Quick Look's OCR area.
+    std::map<uint64_t,std::wstring> ocr_texts;uint64_t ocr_pending_id{};bool swallow_char{};
+    std::filesystem::path drag_save_folder;  // tests: never the real desktop
+    std::function<clipboard::CardDragResult(clipboard::CardDragPayload,clipboard::CardDragOptions)> drag_runner;  // tests: no DoDragDrop
+    std::unique_ptr<clipboard::Entry> LoadForDrag(const clipboard::Entry& e){
+        if(!e.payload||!disk)return std::make_unique<clipboard::Entry>(e);
+        drag_loaded.reset();drag_failed=false;drag_waiting=true;const auto token=++drag_token;
+        if(!disk->Load(e,token)){drag_waiting=false;return nullptr;}
+        // Store reads of one entry take a few ms; bounded so a stuck disk cannot freeze the drag.
+        for(int i=0;i<8&&!drag_loaded&&!drag_failed;++i){disk->WaitIdle(100);DrainStore();}
+        drag_waiting=false;
+        return std::move(drag_loaded);
+    }
+    bool OverStack(POINT at)const{
+        if(!stack||!stack->Visible())return false;
+        const RECT r=stack->WindowRect();return PtInRect(&r,at)!=FALSE;
+    }
+    bool StackDrag(size_t index,POINT){
+        if(index>=stack_ids.size())return false;
+        return DragEntry(stack_ids[index],false);
+    }
+    // Over the place the card came from: the stack, or the open panel.
+    bool OverSource(POINT at,bool from_panel)const{
+        if(from_panel){RECT r{};return expanded&&window&&GetWindowRect(window,&r)&&PtInRect(&r,at);}
+        return OverStack(at);
+    }
+    static std::wstring WindowTitle(HWND root){
+        // InternalGetWindowText never sends WM_GETTEXT, so a hung target cannot stall the drag.
+        wchar_t title[128]{};if(root)InternalGetWindowText(root,title,128);return title;
+    }
+    bool DragEntry(uint64_t id,bool from_panel){
+        if(drag_running||copy_pending||paste_inflight)return false;
+        const auto* e=history.Find(id);if(!e)return false;
+        auto loaded=LoadForDrag(*e);
+        if(!loaded){status=L"读取记录失败，请重试";Invalidate();return false;}
+        e=history.Find(id);if(!e)return false;  // draining the store may have reallocated the history
+        if(from_panel&&msel.size()>1&&msel.count(id))if(auto merged=MergedSelection(id)){loaded=std::make_unique<clipboard::Entry>(std::move(*merged));e=history.Find(id);if(!e)return false;}
+        if(loaded->kind==clipboard::Kind::Files){
+            std::error_code ec;bool any=false;
+            for(const auto& path:clipboard::FilePaths(*loaded))if(std::filesystem::exists(path,ec)){any=true;break;}
+            if(!any){status=L"文件已不存在";Invalidate();return false;}
+        }
+        clipboard::CardDragPayload payload;payload.formats=loaded->formats;
+        if(loaded->kind==clipboard::Kind::Image){
+            auto copy=std::make_shared<const clipboard::Entry>(*loaded);
+            payload.file=[copy]{auto path=clipboard::WriteImageFile(*copy);return path?*path:std::filesystem::path{};};
+        }
+        clipboard::HintContext hint;hint.kind=loaded->kind;hint.pin_available=static_cast<bool>(pin_request);
+        if(loaded->kind==clipboard::Kind::Text){
+            // Same rule as the stack's link tile: one http(s) URL and nothing else.
+            const auto text=clipboard::EntryText(*loaded);
+            if(clipboard::LooksLikeLink(text)){payload.url=clipboard::Trimmed(text);hint.link=true;}
+        }
+        clipboard::ReleaseContext context;context.kind=loaded->kind;context.pin_available=hint.pin_available;
+        POINT released{},start{};GetCursorPos(&start);
+        // Ghost: drawn by the stack renderer (also while the stack is hidden behind the open panel).
+        bool ghost=false;
+        if(stack){
+            const auto thumb=stack_thumbs.find(id);
+            std::shared_ptr<const Frame> reduced;
+            if(thumb!=stack_thumbs.end())reduced=thumb->second;
+            else if(auto frame=thumbnail_cache.Find(id))reduced=StackThumbnail(*frame);
+            ghost=stack->BeginGhost(clipboard::MakeStackItem(*e,reduced.get(),e->file_names[0],e->file_count),start);
+        }
+        clipboard::CardDragOptions options;
+        HWND hint_root{};
+        options.moved=[&](POINT at,bool over,bool alt){
+            if(!ghost)return;
+            clipboard::DragZone zone=clipboard::DragZone::None;
+            if(OverSource(at,from_panel))zone=clipboard::DragZone::Stack;
+            else if(clipboard::IsDesktopAt(at))zone=clipboard::DragZone::Desktop;
+            else if(over){
+                zone=clipboard::DragZone::App;
+                const HWND hit=WindowFromPoint(at),root=hit?GetAncestor(hit,GA_ROOT):nullptr;
+                if(root!=hint_root){hint_root=root;hint.app=WindowTitle(root);}
+            }
+            hint.alt=alt;
+            stack->MoveGhost(at,clipboard::ZonePose(zone),clipboard::ZoneHint(zone,hint));
+        };
+        options.on_release=[&](POINT at,DWORD keys){
+            released=at;context.over_stack=OverSource(at,from_panel);context.desktop=!context.over_stack&&clipboard::IsDesktopAt(at);context.alt=(keys&MK_ALT)!=0;
+            return clipboard::DecideRelease(context);
+        };
+        drag_running=true;drag_id=from_panel?id:0;if(from_panel)Invalidate();
+        const auto result=drag_runner?drag_runner(std::move(payload),std::move(options)):clipboard::DragCard(std::move(payload),std::move(options));
+        drag_running=false;drag_id=0;
+        if(ghost)stack->EndGhost();
+        ApplyRelease(clipboard::ResolveRelease(context,result),*loaded,id,released);
+        return true;
+    }
+    // Whole-card drag from the open panel: starts past the system drag threshold.
+    // No mouse capture here: releasing it would send WM_CAPTURECHANGED, which
+    // cancels the pinned panel's pending click-to-paste.
+    bool RowDragMove(){
+        if(!(GetKeyState(VK_LBUTTON)&0x8000)){row_press.reset();return false;}
+        POINT at{};GetCursorPos(&at);
+        if(std::abs(at.x-row_press->at.x)<GetSystemMetrics(SM_CXDRAG)&&std::abs(at.y-row_press->at.y)<GetSystemMetrics(SM_CYDRAG))return true;
+        const uint64_t id=row_press->id;row_press.reset();paste_click.reset();
+        DragEntry(id,true);Invalidate();return true;
+    }
+    std::filesystem::path DragSaveFolder()const{
+        if(!drag_save_folder.empty())return drag_save_folder;
+        PWSTR path{};std::filesystem::path out;
+        if(SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop,0,nullptr,&path)))out=path;
+        CoTaskMemFree(path);return out;
+    }
+    void ApplyRelease(clipboard::ReleaseAction action,const clipboard::Entry& loaded,uint64_t id,POINT at){
+        switch(action){
+        case clipboard::ReleaseAction::Pin:{
+            const auto frame=clipboard::DecodeFrame(loaded);
+            if(!frame){status=L"图片无法读取，未能钉到桌面";break;}
+            if(!pin_request||!pin_request(frame,at))status=L"钉图失败";
+            else status=L"已钉到桌面";
+            break;}
+        case clipboard::ReleaseAction::SaveText:{
+            const auto text=clipboard::EntryText(loaded);const bool link=loaded.kind==clipboard::Kind::Text&&clipboard::LooksLikeLink(text);
+            const auto saved=clipboard::SaveTextFile(loaded,DragSaveFolder(),link?clipboard::LinkTitle(text):text,link);
+            status=saved?L"已保存到桌面："+saved->filename().wstring():L"无法保存到桌面";
+            break;}
+        case clipboard::ReleaseAction::MoveToTop:MoveToTop(id);break;
+        case clipboard::ReleaseAction::CopyFallback:
+            if(test_mode){last_read_id=loaded.id;status=L"目标不接受拖放，已复制，可按 Ctrl+V";break;}
+            if(!clipboard::Write(window,loaded,false,false)){status=L"剪贴板正忙或内容不可用，请重试";break;}
+            sequence=GetClipboardSequenceNumber();status=L"目标不接受拖放，已复制，可按 Ctrl+V";
+            break;
+        case clipboard::ReleaseAction::Insert:case clipboard::ReleaseAction::None:default:break;
+        }
+        Invalidate();
+    }
+    bool MoveToTop(uint64_t id){
+        auto it=std::find_if(history.entries.begin(),history.entries.end(),[&](const clipboard::Entry& e){return e.id==id;});
+        if(it==history.entries.end())return false;
+        if(it!=history.entries.begin())std::rotate(history.entries.begin(),it,std::next(it));
+        CommitHistory();Filter(false);status=L"已移到最前";RefreshStack();return true;
+    }
+    void StackMoved(){
+        const bool was_moving=stack_moving;stack_moving=false;
+        if(was_moving&&dismiss_tracker.Armed()){DismissStrip();return;}
+        dismiss_tracker.Reset();if(dismiss_target)dismiss_target->Hide();
+        const RECT r=stack->WindowRect();MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromRect(&r,MONITOR_DEFAULTTONEAREST),&monitor);
+        const UINT dpi=GetDpiForWindow(stack->VisualWindow());const float s=dpi?dpi/96.f:1.f;
+        // Same anchor as the classic strip (right edge x, top y), so both styles share it.
+        anchor={stack->Side()==clipboard::stack::Side::Right?monitor.rcWork.right-6:monitor.rcWork.left+static_cast<LONG>(CW*s),clipboard::stack::GripTop(r,s)};
+        placed=true;if(!SaveLayout())status=L"位置保存失败，下次启动可能无法恢复";
     }
     void LayoutSearch(){
         SelectWindow();
         const HFONT next=CreateFontW(-static_cast<int>(13*scale),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
         if(!next)return;SendMessageW(search,WM_SETFONT,reinterpret_cast<WPARAM>(next),FALSE);if(font)DeleteObject(font);font=next;
         HDC dc=GetDC(search);if(!dc)return;const auto old=SelectObject(dc,font);TEXTMETRICW metrics{};GetTextMetricsW(dc,&metrics);SelectObject(dc,old);ReleaseDC(search,dc);
-        const int x=static_cast<int>(59*scale),w=static_cast<int>((W-159)*scale),h=metrics.tmHeight+4;
+        const int x=static_cast<int>(44*scale),w=static_cast<int>((W-124)*scale),h=metrics.tmHeight+4;
         SendMessageW(search,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,0);
         SetWindowPos(search,nullptr,x,0,w,h,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
         RECT format{};SendMessageW(search,EM_GETRECT,0,reinterpret_cast<LPARAM>(&format));
         // A borderless single-line EDIT paints at its formatting-rect top, not
         // vertically centered in an arbitrarily tall child window.
-        const int y=static_cast<int>(std::lround(98.5f*scale-format.top-metrics.tmHeight/2.f));
+        const int y=static_cast<int>(std::lround((clipboard::cards::SearchTop+clipboard::cards::SearchBottom)/2.f*scale-format.top-metrics.tmHeight/2.f));
         SetWindowPos(search,nullptr,x,y,w,h,SWP_NOZORDER|SWP_NOACTIVATE);InvalidateRect(search,nullptr,TRUE);
     }
-    float ScrollThumb()const{return (ListBottom-ListTop)*PageRows()/static_cast<float>(std::max(static_cast<size_t>(PageRows()),visible.size()));}
+    float ScrollThumb(){const float track=ViewHeight(),content=ContentHeight();return content<=track?track:std::max(24.f,track*track/content);}
     void ScrollAt(float y){
-        const float travel=ListBottom-ListTop-ScrollThumb();if(travel<=0)return;
-        const auto max_scroll=static_cast<int>(visible.size())-PageRows();
-        scroll=std::clamp(static_cast<int>(std::lround((y-ListTop-scroll_grab)*max_scroll/travel)),0,max_scroll);Invalidate();
+        StopScrollAnim();const float travel=ViewHeight()-ScrollThumb();if(travel<=0)return;
+        SetScrollPx((y-ListTop-scroll_grab)*MaxScrollPx()/travel);Invalidate();
     }
     void BeginScroll(float y){
-        const float thumb=ScrollThumb(),top=ListTop+(ListBottom-ListTop-thumb)*scroll/static_cast<float>(visible.size()-static_cast<size_t>(PageRows()));
+        const float thumb=ScrollThumb(),limit_px=MaxScrollPx(),top=ListTop+(ViewHeight()-thumb)*(limit_px>0?ScrollPx()/limit_px:0.f);
         scroll_grab=y>=top&&y<=top+thumb?y-top:thumb/2;scroll_drag=true;SetCapture(window);ScrollAt(y);
     }
     void BeginDrag(POINT point){if(expanded&&summon_cursor){const RECT body=VisualBodyBounds();anchor={body.right,body.top};summon_cursor.reset();}StopLiquidDrag(false);drag_anchor=anchor;if(expanded)dismiss_tracker.Reset();else dismiss_tracker.Begin(point);snap_x=snap_y=0;drag_monitor=nullptr;drag_start=point;drag_rect=VisualBodyBounds();drag_pending=true;dragged=false;SetCapture(window);}
@@ -725,7 +1091,7 @@ struct ClipboardPanel::Impl {
         if(copy_pending||paste_inflight||quick_selection>=quick_ids.size())return;
         const auto* entry=history.Find(quick_ids[quick_selection]);if(!entry)return;
         if(plain&&entry->kind!=clipboard::Kind::Text){status=L"纯文本仅支持文本记录";UpdateQuick();return;}
-        copy_quick=true;copy_remove_whitespace=false;copy_plain=plain;copy_keyboard=false;copy_paste=true;
+        copy_quick=true;copy_stack=false;copy_remove_whitespace=false;copy_plain=plain;copy_keyboard=false;copy_paste=true;
         copy_target=quick_target;copy_focus=quick_focus;copy_process=quick_process;
         if(entry->payload&&disk){
             copy_pending=true;const auto token=++copy_token;
@@ -813,17 +1179,24 @@ struct ClipboardPanel::Impl {
         }
         SetTimer(EventWindow(),7,100,nullptr);
     }
-    void Show(bool near_cursor=true){CloseQuick();if(!enabled)return;if(near_cursor&&!pinned){POINT cursor{};if(GetCursorPos(&cursor))summon_cursor=cursor;}KillTimer(EventWindow(),4);KillTimer(EventWindow(),11);ClosePreview();const HWND foreground=GetForegroundWindow();RememberTarget(foreground);expanded=true;SetWindowTextW(search,L"");query.clear();scroll=0;Filter();selected=visible.empty()?0:visible.front();Place(true);if(opening){SetForegroundWindow(folded_window);SetFocus(folded_window);}else{SetForegroundWindow(window);SetFocus(window);}}
-    void Fold(){summon_cursor.reset();StopOpening(false);paste_click.reset();paste_inflight=false;scroll_drag=false;if(GetCapture()==window)ReleaseCapture();CloseMore();ClosePopup();CancelNaming();CancelReads();ClearFileIcons();app_icon.Reset();brush.Reset();target.Reset();surface.reset();search_text_glyphs=0;ime_active=false;ime_original.clear();ime_text.clear();expanded=false;KillTimer(EventWindow(),2);KillTimer(EventWindow(),3);Place();SetTimer(EventWindow(),4,10000,nullptr);}
+    void Show(bool near_cursor=true){CloseQuick();if(!enabled)return;if(near_cursor&&!pinned){POINT cursor{};if(GetCursorPos(&cursor))summon_cursor=cursor;}KillTimer(EventWindow(),4);KillTimer(EventWindow(),11);ClosePreview();const HWND foreground=GetForegroundWindow();RememberTarget(foreground);expanded=true;SetWindowTextW(search,L"");query.clear();scroll=0;scroll_offset=0;Filter();selected=visible.empty()?0:visible.front();Place(true);if(opening){SetForegroundWindow(folded_window);SetFocus(folded_window);}else{SetForegroundWindow(window);SetFocus(window);}}
+    void Fold(){
+        // Expand -> fold continuity: remember where the cards are before the panel goes away.
+        std::vector<RECT> fly_back;
+        if(stack&&expanded&&enabled&&!test_mode&&MotionEnabled()&&window&&IsWindowVisible(window)){RECT panel{};GetWindowRect(window,&panel);fly_back=StackSlots(panel);}
+        FoldNow();
+        if(stack&&!fly_back.empty()&&!expanded)stack->Fly(fly_back,false);
+    }
+    void FoldNow(){summon_cursor.reset();StopFx();StopScrollAnim();CommitPendingDelete();msel.clear();last_click.reset();StopOpening(false);paste_click.reset();paste_inflight=false;scroll_drag=false;if(GetCapture()==window)ReleaseCapture();CloseMore();ClosePopup();CancelNaming();CancelReads();ClearFileIcons();app_icon.Reset();brush.Reset();checker.Reset();target.Reset();surface.reset();search_text_glyphs=0;ime_active=false;ime_original.clear();ime_text.clear();expanded=false;KillTimer(EventWindow(),2);KillTimer(EventWindow(),3);Place();SetTimer(EventWindow(),4,10000,nullptr);}
     // ---- Custom groups ----------------------------------------------------
     int TabCount()const{return clipboard::History::GroupTabBase+static_cast<int>(history.groups.size());}
     uint32_t TabGroup()const{return tab>=clipboard::History::GroupTabBase&&tab<TabCount()?history.groups[static_cast<size_t>(tab-clipboard::History::GroupTabBase)].id:0;}
     std::wstring GroupName(uint32_t id)const{const auto* g=history.FindGroup(id);return g?g->name:std::wstring{};}
     // The software D2D factory accumulates rasterizer caches (tens of MB) with use.
     // Render() recreates it on demand, so the folded idle state never keeps them.
-    void ReleaseRenderer(){images.clear();file_bitmaps.clear();app_icon.Reset();brush.Reset();target.Reset();factory.Reset();}
+    void ReleaseRenderer(){images.clear();file_bitmaps.clear();app_icon.Reset();brush.Reset();checker.Reset();target.Reset();factory.Reset();}
     void CommitHistory(){if(disk)disk->Commit(history.entries,history.groups);}
-    void SelectTab(int value){tab=std::clamp(value,0,std::max(0,TabCount()-1));scroll=0;reveal_tab=true;Filter();RevealSelection();Invalidate();}
+    void SelectTab(int value){flavor.reset();tab=std::clamp(value,0,std::max(0,TabCount()-1));scroll=0;scroll_offset=0;reveal_tab=true;Filter();RevealSelection();Invalidate();}
     float Measure(const std::wstring& s,int size){
         ComPtr<IDWriteTextLayout> layout;DWRITE_TEXT_METRICS metrics{};
         if(!writer||FAILED(writer->CreateTextLayout(s.data(),static_cast<UINT32>(s.size()),Format(size),4096,64,&layout))||FAILED(layout->GetMetrics(&metrics)))return static_cast<float>(s.size()*static_cast<size_t>(size));
@@ -843,7 +1216,7 @@ struct ClipboardPanel::Impl {
         const int index=history.GroupIndex(group);if(index<0)return;const auto name=GroupName(group);
         const int group_tab=clipboard::History::GroupTabBase+index;
         history.RemoveGroup(group);if(tab==group_tab)tab=0;else if(tab>group_tab)--tab;
-        CommitHistory();scroll=0;reveal_tab=true;Filter();status=L"已删除分组“"+name+L"”，记录仍保留在“全部”";Invalidate();
+        CommitHistory();scroll=0;scroll_offset=0;reveal_tab=true;Filter();status=L"已删除分组“"+name+L"”，记录仍保留在“全部”";Invalidate();
     }
     bool PopupSelectable(int i)const{return i>=0&&i<static_cast<int>(popup_items.size())&&popup_items[static_cast<size_t>(i)].command&&popup_items[static_cast<size_t>(i)].enabled;}
     int NextPopupRow(int from,int step)const{
@@ -1003,6 +1376,8 @@ struct ClipboardPanel::Impl {
     }
     void Read(){
         if(!enabled||test_mode)return;const DWORD current=GetClipboardSequenceNumber();if(current==sequence)return;
+        // Paused: existing history stays searchable and pasteable; nothing new is recorded.
+        if(paused){sequence=current;status=L"记录已暂停，本次复制没有加入历史";Invalidate();return;}
         bool busy=false;auto entry=clipboard::Read(window,busy);
         if(busy&&retry++<5){SetTimer(EventWindow(),1,50,nullptr);return;}
         KillTimer(EventWindow(),1);retry=0;sequence=current;
@@ -1048,10 +1423,13 @@ struct ClipboardPanel::Impl {
     }
     void Box(D2D1_RECT_F r,UINT32 fill,UINT32 border,float radius=10){Color(fill);target->FillRoundedRectangle(D2D1::RoundedRect(r,radius,radius),brush.Get());Color(border);target->DrawRoundedRectangle(D2D1::RoundedRect(r,radius,radius),brush.Get());}
     void ClipboardIcon(float x,float y,float size){app_icon.Draw(target.Get(),{x,y,x+size,y+size});}
-    void Icon(wchar_t glyph,float x,float y,int action,uint64_t id=0,bool active=false,bool on_accent=false){
-        D2D1_RECT_F r{x,y,x+32,y+32};if(action)hits.push_back({r,action,id});
+    // `box` < 32 draws the same 32 DIP icon scaled down (header 30, card action bar 28).
+    void Icon(wchar_t glyph,float x,float y,int action,uint64_t id=0,bool active=false,bool on_accent=false,float box=32){
+        if(action)PushHit({x,y,x+box,y+box},action,id);
+        D2D1_MATRIX_3X2_F outer_transform{};target->GetTransform(&outer_transform);
+        const D2D1_MATRIX_3X2_F previous_transform=box==32?outer_transform:D2D1::Matrix3x2F::Scale(box/32,box/32,{x,y})*outer_transform;target->SetTransform(previous_transform);
+        const D2D1_RECT_F r{x,y,x+32,y+32};
         if(hover>=0&&hover<static_cast<int>(hits.size())&&action&&hits[static_cast<size_t>(hover)].action==action&&hits[static_cast<size_t>(hover)].id==id)Box(r,on_accent?0x1769d9:dark?0x34435a:0xe6efff,on_accent?0x1769d9:dark?0x34435a:0xe6efff,6);
-        D2D1_MATRIX_3X2_F previous_transform{};target->GetTransform(&previous_transform);
         const float icon_scale=action==14?.65f:(action==31||action==34)?.72f:.80f;
         target->SetTransform(D2D1::Matrix3x2F::Scale(icon_scale,icon_scale,{x+16,y+16})*previous_transform);
         if(glyph==L'\xE8C8'||glyph==L'\xE77F'||glyph==L'\xE74D'){
@@ -1081,7 +1459,7 @@ struct ClipboardPanel::Impl {
             target->DrawLine({x+11,y+13},{x+17,y+11},brush.Get(),weight);target->DrawLine({x+21,y+23},{x+23,y+17},brush.Get(),weight);
             target->DrawLine({x+17,y+11},{x+20,y+7},brush.Get(),weight);target->DrawLine({x+23,y+17},{x+27,y+14},brush.Get(),weight);target->DrawLine({x+20,y+7},{x+27,y+14},brush.Get(),weight);
         }else Center(std::wstring(1,glyph),{x,y,x+32,y+32},16,on_accent?0xffffff:active?0x2580ff:dark?0xaabbd1:0x748198,true);
-        target->SetTransform(previous_transform);
+        target->SetTransform(outer_transform);
     }
     void Image(const clipboard::Entry& e,D2D1_RECT_F r){
         auto found=images.find(e.id);
@@ -1119,7 +1497,6 @@ struct ClipboardPanel::Impl {
         const auto size=found->second->GetSize();const float factor=std::min((rect.right-rect.left)/size.width,(rect.bottom-rect.top)/size.height),w=size.width*factor,h=size.height*factor;
         rect.left+=(rect.right-rect.left-w)/2;rect.top+=(rect.bottom-rect.top-h)/2;rect.right=rect.left+w;rect.bottom=rect.top+h;target->DrawBitmap(found->second.Get(),rect,1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
-    static bool Code(const std::wstring& text){return text.find(L"=>")!=std::wstring::npos||text.starts_with(L"const ")||text.starts_with(L"function ")||text.starts_with(L"def ");}
     void DrawMore(){
         const float left=W-264;const UINT32 ink=dark?0xe7effb:0x35445b,muted=dark?0x91a4bf:0x95a3b7;
         for(int i=5;i>=1;--i){const float inset=static_cast<float>(i);brush->SetColor(D2D1::ColorF(0x274568,dark?.025f:.012f));target->FillRoundedRectangle(D2D1::RoundedRect({left-inset,64-inset/2,W-16+inset,252+inset},12+inset,12+inset),brush.Get());}
@@ -1142,7 +1519,7 @@ struct ClipboardPanel::Impl {
         RECT r{};GetWindowRect(search,&r);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&r),2);
         const D2D1_RECT_F bounds{r.left/scale,r.top/scale,r.right/scale,r.bottom/scale};
         wchar_t buffer[513]{};GetWindowTextW(search,buffer,513);std::wstring value=buffer;if(ime_active&&!ime_text.empty())value=ime_original.substr(0,ime_first)+ime_text+ime_original.substr(ime_last);
-        if(value.empty()){Text(naming?L"输入分组名称（最多 12 字）":L"搜索剪贴内容",bounds,13,dark?0x95a7bf:0x7e899a);if(GetFocus()==search&&caret_on){Color(dark?0xe7effb:0x223248);target->FillRectangle({bounds.left,bounds.top+2,bounds.left+1,bounds.bottom-2},brush.Get());}return;}
+        if(value.empty()){Text(naming?L"输入分组名称（最多 12 字）":L"搜索文本、OCR 文字、文件名…",bounds,13,dark?0x95a7bf:0x7e899a);if(GetFocus()==search&&caret_on){Color(dark?0xe7effb:0x223248);target->FillRectangle({bounds.left,bounds.top+2,bounds.left+1,bounds.bottom-2},brush.Get());}return;}
         ComPtr<IDWriteTextLayout> layout;if(FAILED(writer->CreateTextLayout(value.data(),static_cast<UINT32>(value.size()),Format(13),100000,bounds.bottom-bounds.top,&layout)))return;
         layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         const auto first_visible=std::min(static_cast<UINT32>(LOWORD(SendMessageW(search,EM_CHARFROMPOS,0,0))),static_cast<UINT32>(value.size()));
@@ -1167,7 +1544,7 @@ struct ClipboardPanel::Impl {
     }
     void Present(){
         if(opening||liquid_drag_active||!enabled)return;
-        if(!expanded&&strip_hidden)return;
+        if(!expanded&&(strip_hidden||stack))return;
         SelectWindow();
         struct Reveal {Impl& p;int exceptions=std::uncaught_exceptions();~Reveal(){if(p.reveal_window&&std::uncaught_exceptions()==exceptions){p.reveal_window=false;ShowWindow(p.window,SW_SHOWNOACTIVATE);}}} reveal{*this};
         if(!expanded&&!liquid_failed){const RECT body=VisualBodyBounds();try{PresentFolded();return;}catch(...){
@@ -1179,8 +1556,510 @@ struct ClipboardPanel::Impl {
         composition->Present(window,static_cast<UINT>(width),static_cast<UINT>(height),surface->Pixels());
         HideIdleStrip();
     }
+    // ---- Expanded panel, S3 (full.html #panel; geometry in panel_cards.h) ----
+    std::optional<clipboard::Flavor> flavor;bool paused{};uint64_t hover_card{};
+    // Per-entry caches carry a content fingerprint: ids can be reused after the
+    // history is cleared, and a stale height/flavour/snippet must never survive that.
+    struct CardMetric{float width{},height{};uint64_t fingerprint{};};std::map<uint64_t,CardMetric> card_metrics;
+    struct FlavorEntry{clipboard::Flavor flavor{};uint64_t fingerprint{};};std::map<uint64_t,FlavorEntry> flavor_cache;
+    struct CodeSnippet{std::wstring text;clipboard::HighlightResult highlight;uint64_t fingerprint{};};std::map<uint64_t,CodeSnippet> code_cache;
+    // Cheap (bounded) FNV-1a over kind, sizes and up to 80 characters; never the whole 16 MB text.
+    static uint64_t Fingerprint(const clipboard::Entry& e){
+        uint64_t h=1469598103934665603ull;const auto mix=[&](uint64_t v){h^=v;h*=1099511628211ull;};
+        mix(static_cast<uint64_t>(e.kind));mix(e.text.size());mix(e.formats.size());
+        const size_t n=e.text.size();for(size_t i=0;i<std::min<size_t>(n,64);++i)mix(e.text[i]);for(size_t i=n>80?n-16:std::min<size_t>(n,64);i<n;++i)mix(e.text[i]);
+        return h;
+    }
+    std::map<std::pair<int,int>,ComPtr<IDWriteTextFormat>> weighted_fonts;const wchar_t* mono_family{};
+    ComPtr<ID2D1BitmapBrush> checker;
+    void EnsureWriter(){if(!writer)CheckWin32(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(writer.GetAddressOf()))),"Clipboard text");}
+    // Flavour of an entry; text entries are classified once (history text can be 16 MB).
+    clipboard::Flavor FlavorFor(const clipboard::Entry& e){
+        if(e.kind!=clipboard::Kind::Text)return clipboard::FlavorOf(e);
+        if(flavor_cache.size()>2*clipboard::History::MaxTotal)flavor_cache.clear();
+        const uint64_t fingerprint=Fingerprint(e);auto [it,inserted]=flavor_cache.try_emplace(e.id);
+        if(inserted||it->second.fingerprint!=fingerprint)it->second={clipboard::TextFlavor(e.text),fingerprint};return it->second.flavor;
+    }
+    IDWriteTextFormat* Weighted(int size,DWRITE_FONT_WEIGHT weight,bool mono=false){
+        EnsureWriter();
+        if(mono&&!mono_family){mono_family=L"Consolas";ComPtr<IDWriteFontCollection> system;UINT32 index{};BOOL exists{};
+            if(SUCCEEDED(writer->GetSystemFontCollection(&system,FALSE))&&SUCCEEDED(system->FindFamilyName(L"Cascadia Code",&index,&exists))&&exists)mono_family=L"Cascadia Code";}
+        auto& f=weighted_fonts[{size*2+(mono?1:0),static_cast<int>(weight)}];
+        if(!f){CheckWin32(SUCCEEDED(writer->CreateTextFormat(mono?mono_family:L"Microsoft YaHei UI",nullptr,weight,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,static_cast<float>(size),L"zh-CN",&f)),"Clipboard font");
+            f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);}
+        return f.Get();
+    }
+    float MeasureWith(const std::wstring& s,IDWriteTextFormat* f){
+        ComPtr<IDWriteTextLayout> layout;DWRITE_TEXT_METRICS metrics{};
+        if(!writer||!f||FAILED(writer->CreateTextLayout(s.data(),static_cast<UINT32>(s.size()),f,4096,64,&layout))||FAILED(layout->GetMetrics(&metrics)))return static_cast<float>(s.size()*8);
+        return metrics.widthIncludingTrailingWhitespace;
+    }
+    // One line through LumaText; trailing ellipsis unless `clip_only`.
+    void Label(const std::wstring& text,D2D1_RECT_F rect,IDWriteTextFormat* f,UINT32 color,float alpha=1.f,DWRITE_TEXT_ALIGNMENT align=DWRITE_TEXT_ALIGNMENT_LEADING,bool clip_only=false){
+        if(text.empty()||!f||rect.right<=rect.left||rect.bottom<=rect.top)return;
+        ComPtr<IDWriteTextLayout> layout;if(FAILED(writer->CreateTextLayout(text.data(),static_cast<UINT32>(text.size()),f,rect.right-rect.left,rect.bottom-rect.top,&layout)))return;
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);layout->SetTextAlignment(align);layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        ComPtr<IDWriteInlineObject> sign;if(!clip_only&&SUCCEEDED(writer->CreateEllipsisTrimmingSign(f,&sign))){const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};layout->SetTrimming(&trimming,sign.Get());}
+        text_glyphs+=text_renderer.DrawLayout(target.Get(),writer.Get(),layout.Get(),{rect.left,rect.top},rect,D2D1::ColorF(color,alpha)).freetype_glyphs;
+    }
+    void Fill(D2D1_RECT_F r,UINT32 c,float a,float radius){brush->SetColor(D2D1::ColorF(c,a));target->FillRoundedRectangle(D2D1::RoundedRect(r,radius,radius),brush.Get());}
+    void Stroke(D2D1_RECT_F r,UINT32 c,float a,float radius,float weight=1.f){brush->SetColor(D2D1::ColorF(c,a));const float h=weight/2;target->DrawRoundedRectangle(D2D1::RoundedRect({r.left+h,r.top+h,r.right-h,r.bottom-h},radius,radius),brush.Get(),weight);}
+    bool PushHit(D2D1_RECT_F r,int action,uint64_t id){
+        // Partially scrolled cards must not claim clicks above or below the list.
+        if(hit_clip){r.left=std::max(r.left,hit_clip->left);r.top=std::max(r.top,hit_clip->top);r.right=std::min(r.right,hit_clip->right);r.bottom=std::min(r.bottom,hit_clip->bottom);if(r.right<=r.left||r.bottom<=r.top)return false;}
+        hits.push_back({r,action,id});return hover==static_cast<int>(hits.size())-1;}
+    // Hits that belong to one card: the card itself and every button of its action bar
+    // (31-35 common, 36-38 image pin / OCR / annotate, 39 link, 42-45 file / colour / plain).
+    static constexpr bool IsCardAction(int action){return (action>=30&&action<=39)||(action>=42&&action<=45);}
+    // The bar is only hit-testable on the hovered card, so a bar button must keep its card
+    // hovered; otherwise the next paint drops the bar and the stale index lands on the next card.
+    uint64_t HoverCard()const{if(hover<0||hover>=static_cast<int>(hits.size()))return 0;const auto& h=hits[static_cast<size_t>(hover)];return IsCardAction(h.action)?h.id:0;}
+    // .txt: whitespace collapsed like HTML white-space:normal, bounded for layout cost.
+    static std::wstring CardText(const std::wstring& text,size_t limit=400){
+        std::wstring out;out.reserve(std::min(text.size(),limit));bool gap=false;
+        for(wchar_t c:text){if(out.size()>=limit)break;if(c==L' '||c==L'\t'||c==L'\r'||c==L'\n'||c==L'\x3000'){gap=!out.empty();continue;}if(gap){out+=L' ';gap=false;}out+=c;}
+        return out;
+    }
+    // -webkit-line-clamp: wraps at `width`, keeps `max_lines` and ends the last with an ellipsis.
+    ComPtr<IDWriteTextLayout> ClampLayout(const std::wstring& text,float wrap_width,IDWriteTextFormat* f,float line,int max_lines,int* lines_out){
+        ComPtr<IDWriteTextLayout> layout;if(lines_out)*lines_out=1;
+        if(!writer||text.empty()||FAILED(writer->CreateTextLayout(text.data(),static_cast<UINT32>(text.size()),f,wrap_width,line*static_cast<float>(max_lines+1),&layout)))return nullptr;
+        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        layout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,line,line*.78f);
+        UINT32 count{};layout->GetLineMetrics(nullptr,0,&count);
+        if(lines_out)*lines_out=static_cast<int>(std::clamp<UINT32>(count,1,static_cast<UINT32>(max_lines)));
+        if(count<=static_cast<UINT32>(max_lines))return layout;
+        std::vector<DWRITE_LINE_METRICS> metrics(count);if(FAILED(layout->GetLineMetrics(metrics.data(),count,&count)))return layout;
+        std::wstring shown;size_t offset=0;
+        for(int i=0;i<max_lines;++i){if(i)shown+=L'\n';shown+=text.substr(offset,metrics[static_cast<size_t>(i)].length-metrics[static_cast<size_t>(i)].newlineLength);offset+=metrics[static_cast<size_t>(i)].length;}
+        while(!shown.empty()&&shown.back()==L' ')shown.pop_back();shown+=L"…";
+        // Half a line of slack: with trimming on, DirectWrite drops a last line that
+        // only fails to fit by float rounding (3 × 19.5 showed 2 lines).
+        ComPtr<IDWriteTextLayout> clamped;if(FAILED(writer->CreateTextLayout(shown.data(),static_cast<UINT32>(shown.size()),f,wrap_width,line*(static_cast<float>(max_lines)+.5f),&clamped)))return layout;
+        clamped->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);clamped->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);clamped->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,line,line*.78f);
+        ComPtr<IDWriteInlineObject> sign;if(SUCCEEDED(writer->CreateEllipsisTrimmingSign(f,&sign))){const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};clamped->SetTrimming(&trimming,sign.Get());}
+        return clamped;
+    }
+    float CardWidth()const{return W-2*clipboard::cards::ListInset;}
+    std::pair<float,float> NaturalImageSize(const clipboard::Entry& e){
+        auto size=clipboard::cards::ImageSize(e);
+        if(size.first<=0)if(auto frame=thumbnail_cache.Find(e.id))size={static_cast<float>(frame->Width()),static_cast<float>(frame->Height())};
+        if(size.first<=0){const auto found=images.find(e.id);if(found!=images.end()&&found->second){const auto s=found->second->GetPixelSize();size={static_cast<float>(s.width),static_cast<float>(s.height)};}}
+        return size;
+    }
+    // Card height at the current width; cached once the content is known.
+    float CardHeightFor(const clipboard::Entry& e){
+        namespace cards=clipboard::cards;const float card_width=CardWidth();
+        const uint64_t fingerprint=Fingerprint(e);
+        if(const auto it=card_metrics.find(e.id);it!=card_metrics.end()&&it->second.width==card_width&&it->second.fingerprint==fingerprint)return it->second.height;
+        const auto kind=FlavorFor(e);cards::Measure m;bool stable=true;
+        if(kind==clipboard::Flavor::Image){const auto size=NaturalImageSize(e);m.image_width=size.first;m.image_height=size.second;stable=size.first>0;}
+        else if(kind==clipboard::Flavor::Code)m.code_lines=cards::CodeLines(e.text.substr(0,4096));
+        else if(kind==clipboard::Flavor::Text){EnsureWriter();ClampLayout(CardText(e.text),cards::ContentWidth(card_width),Format(13),cards::TextLineHeight,cards::TextMaxLines,&m.text_lines);}
+        const float h=cards::CardHeight(kind,m,card_width);
+        if(stable){if(card_metrics.size()>2*clipboard::History::MaxTotal)card_metrics.clear();card_metrics[e.id]={card_width,h,fingerprint};}
+        return h;
+    }
+    std::vector<const clipboard::Entry*> VisibleEntries()const{
+        std::map<uint64_t,const clipboard::Entry*> by_id;for(const auto& e:history.entries)by_id[e.id]=&e;
+        std::vector<const clipboard::Entry*> out;out.reserve(visible.size());for(const auto id:visible){const auto it=by_id.find(id);out.push_back(it==by_id.end()?nullptr:it->second);}
+        return out;
+    }
+    // ---- Pixel scrolling (S3 part 2). Block = optional time-group heading + card + gap.
+    static constexpr float ListEndPad=10;   // full.html #list padding-bottom
+    void BuildBlocks(){
+        namespace cards=clipboard::cards;const int n=static_cast<int>(visible.size());
+        block_tops.assign(static_cast<size_t>(n)+1,0.f);block_header.assign(static_cast<size_t>(n),0);if(n==0)return;
+        SYSTEMTIME now{};GetLocalTime(&now);const auto entries=VisibleEntries();std::optional<cards::TimeGroup> previous_group;float y=0;
+        for(int i=0;i<n;++i){
+            const auto* e=entries[static_cast<size_t>(i)];const auto group=e?cards::GroupOf(*e,now):cards::TimeGroup::Earlier;
+            const bool heading=!previous_group||*previous_group!=group;previous_group=group;
+            block_header[static_cast<size_t>(i)]=heading;block_tops[static_cast<size_t>(i)]=y;
+            y+=(heading?cards::GroupHeaderHeight:0.f)+(e?CardHeightFor(*e):0.f)+cards::Gap;
+        }
+        block_tops[static_cast<size_t>(n)]=y;
+    }
+    float ViewHeight()const{return ListBottom-ListTop;}
+    float Offset()const{return offset_index==scroll?scroll_offset:0.f;}
+    float ScrollPx(){
+        BuildBlocks();const int n=static_cast<int>(visible.size());if(n==0)return 0;
+        const int i=std::clamp(scroll,0,n-1);return block_tops[static_cast<size_t>(i)]+(i==scroll?Offset():0.f);
+    }
+    float ContentHeight(){BuildBlocks();return visible.empty()?0.f:block_tops.back()-clipboard::cards::Gap+ListEndPad;}
+    float MaxScrollPx(){return std::max(0.f,ContentHeight()-ViewHeight());}
+    void SetScrollPx(float px){
+        const int n=static_cast<int>(visible.size());if(n==0){scroll=0;scroll_offset=0;offset_index=-1;return;}
+        px=std::clamp(std::round(px*scale)/scale,0.f,MaxScrollPx());   // whole device pixels keep text crisp; the ends stay exact
+        const int i=std::clamp(static_cast<int>(std::upper_bound(block_tops.begin(),block_tops.begin()+n,px)-block_tops.begin())-1,0,n-1);
+        scroll=i;scroll_offset=std::max(0.f,px-block_tops[static_cast<size_t>(i)]);offset_index=i;
+    }
+    void ClampScroll(){SetScrollPx(ScrollPx());}
+    void ScrollToIndex(int index,float offset=0){
+        BuildBlocks();const int n=static_cast<int>(visible.size());if(n==0){SetScrollPx(0);return;}
+        SetScrollPx(block_tops[static_cast<size_t>(std::clamp(index,0,n-1))]+offset);
+    }
+    // Like full.html: going up shows the card with its heading, going down keeps 10 px below it.
+    void RevealIndex(int index){
+        StopScrollAnim();BuildBlocks();const int n=static_cast<int>(visible.size());if(index<0||index>=n)return;
+        const float top=block_tops[static_cast<size_t>(index)],bottom=block_tops[static_cast<size_t>(index)+1]-clipboard::cards::Gap,px=ScrollPx();
+        if(top<px)SetScrollPx(top);else if(bottom>px+ViewHeight())SetScrollPx(bottom+ListEndPad-ViewHeight());
+    }
+    // Cards whose block intersects the list viewport (partial cards included).
+    std::pair<int,int> DrawnRange(){
+        const int n=static_cast<int>(visible.size());if(n==0)return {0,0};
+        const float px=ScrollPx(),limit=px+ViewHeight();int first=std::clamp(scroll,0,n-1);
+        while(first<n-1&&block_tops[static_cast<size_t>(first)+1]-clipboard::cards::Gap<=px)++first;
+        auto card_top=[&](int i){return block_tops[static_cast<size_t>(i)]+(block_header[static_cast<size_t>(i)]?clipboard::cards::GroupHeaderHeight:0.f);};
+        int end=first;while(end<n&&card_top(end)<limit)++end;
+        return {first,std::max(end,first+1)};
+    }
+    // Cards (with their headings) fully visible from `start`; at least one.
+    int FitCount(int start){
+        const int n=static_cast<int>(visible.size());if(n==0||start<0||start>=n)return 1;
+        float px=0;if(start==std::clamp(scroll,0,n-1))px=ScrollPx();else{BuildBlocks();px=block_tops[static_cast<size_t>(start)];}
+        const float limit=px+ViewHeight()+.5f;int count=0;
+        for(int i=start;i<n;++i){if(count>0&&block_tops[static_cast<size_t>(i)+1]-clipboard::cards::Gap>limit)break;++count;}
+        return std::max(1,count);
+    }
+    // Index of the top block at the end of the list.
+    int MaxScroll(){
+        const float limit_px=MaxScrollPx();const int n=static_cast<int>(visible.size());if(n<=1)return 0;
+        return std::clamp(static_cast<int>(std::upper_bound(block_tops.begin(),block_tops.begin()+n,limit_px)-block_tops.begin())-1,0,n-1);
+    }
+    // Wheel: animated toward a target while moving only (timer 12); immediate
+    // when client-area animation is off and in tests.
+    void WheelScroll(int delta){
+        UINT lines=3;SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&lines,0);
+        const float step=lines==WHEEL_PAGESCROLL?ViewHeight()*.9f:static_cast<float>(lines)*33.f;   // ~100 DIP per notch, as in browsers
+        const float base=scroll_target>=0?scroll_target:ScrollPx();
+        const float goal=std::clamp(base-static_cast<float>(delta)/WHEEL_DELTA*step,0.f,MaxScrollPx());
+        BOOL animate=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);hover=-1;
+        if(test_mode||!animate||!window){StopScrollAnim();SetScrollPx(goal);Invalidate();return;}
+        if(scroll_target<0)scroll_tick=GetTickCount64();
+        scroll_target=goal;SetTimer(EventWindow(),12,USER_TIMER_MINIMUM,nullptr);
+    }
+    void ScrollAnimTick(){
+        if(scroll_target<0||!expanded){StopScrollAnim();return;}
+        const ULONGLONG tick=GetTickCount64();const float dt=static_cast<float>(std::max<ULONGLONG>(1,tick-scroll_tick));scroll_tick=tick;
+        const float current=ScrollPx(),k=1.f-std::exp(-dt/60.f);float next=current+(scroll_target-current)*k;
+        const bool done=std::abs(scroll_target-next)*scale<.75f;if(done)next=scroll_target;
+        SetScrollPx(next);Invalidate();
+        if(done){StopScrollAnim();RefreshHover();}
+    }
+    void StopScrollAnim(){scroll_target=-1;if(window)KillTimer(EventWindow(),12);}
+    void RefreshHover(){
+        if(!window||!expanded||test_mode)return;POINT point{};GetCursorPos(&point);ScreenToClient(window,&point);Render();
+        const float x=static_cast<float>(point.x)/scale,y=static_cast<float>(point.y)/scale;int hit=-1;
+        for(size_t i=0;i<hits.size();++i){const auto r=hits[i].rect;if(x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom)hit=static_cast<int>(i);}
+        if(hit!=hover){hover=hit;Invalidate();}
+    }
+    void SelectFlavor(clipboard::Flavor value){tab=1;flavor=value;scroll=0;scroll_offset=0;reveal_tab=true;Filter();RevealSelection();Invalidate();}
+    void SetPaused(bool value){
+        paused=value;if(stack)stack->SetPaused(paused);
+        // Resuming never imports what was copied while paused.
+        sequence=GetClipboardSequenceNumber();
+        status=!layout_path.empty()&&!clipboard::SavePaused(layout_path,paused)?L"暂停状态保存失败，重启后会恢复记录":paused?L"已暂停记录 · 已有历史仍可搜索和粘贴":L"已恢复记录";
+        Invalidate();
+    }
+    ID2D1BitmapBrush* Checker(){
+        if(!checker&&target){
+            // .thumb: repeating-conic-gradient(#0000000d 0 25%,#0000 0 50%) 0 0/14px 14px
+            uint32_t pixels[14*14]{};for(int y=0;y<14;++y)for(int x=0;x<14;++x)if(((x/7)+(y/7))%2==0)pixels[y*14+x]=0x0d000000u;
+            ComPtr<ID2D1Bitmap> tile;const auto props=D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96);
+            if(SUCCEEDED(target->CreateBitmap(D2D1::SizeU(14,14),pixels,14*4,props,&tile)))
+                target->CreateBitmapBrush(tile.Get(),D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_WRAP,D2D1_EXTEND_MODE_WRAP,D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR),&checker);
+        }
+        return checker.Get();
+    }
+    void DrawThumb(const clipboard::Entry& e,D2D1_RECT_F box,UINT32 edge,float edge_alpha){
+        const auto rounded=D2D1::RoundedRect(box,7,7);
+        if(auto* pattern=Checker()){pattern->SetTransform(D2D1::Matrix3x2F::Translation(box.left,box.top));target->FillRoundedRectangle(rounded,pattern);}
+        ComPtr<ID2D1RoundedRectangleGeometry> shape;ComPtr<ID2D1Layer> layer;
+        const bool masked=SUCCEEDED(factory->CreateRoundedRectangleGeometry(rounded,&shape))&&SUCCEEDED(target->CreateLayer(&layer));
+        if(masked)target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),shape.Get()),layer.Get());
+        Image(e,{box.left+1,box.top+1,box.right-1,box.bottom-1});
+        if(masked)target->PopLayer();
+        Stroke(box,edge,edge_alpha,7);
+    }
+    static const wchar_t* ShortLanguage(clipboard::CodeLanguage language){
+        using L=clipboard::CodeLanguage;
+        switch(language){case L::Cpp:return L"C++";case L::Python:return L"PY";case L::JavaScript:return L"JS";case L::TypeScript:return L"TS";case L::Json:return L"JSON";
+            case L::Bash:return L"SH";case L::PowerShell:return L"PS";case L::Sql:return L"SQL";case L::CSharp:return L"C#";case L::Markdown:return L"MD";default:return L"TXT";}
+    }
+    CodeSnippet& SnippetFor(const clipboard::Entry& e){
+        if(code_cache.size()>64)code_cache.clear();
+        const uint64_t fingerprint=Fingerprint(e);auto [it,inserted]=code_cache.try_emplace(e.id);
+        if(!inserted&&it->second.fingerprint!=fingerprint){it->second=CodeSnippet{};inserted=true;}
+        if(inserted){it->second.fingerprint=fingerprint;
+            // pre.code shows at most four 18.6 DIP lines; keep five, each bounded.
+            std::wstring& out=it->second.text;int lines=0;size_t column=0;
+            for(size_t i=0;i<e.text.size()&&i<4096&&lines<5;++i){const wchar_t c=e.text[i];
+                if(c==L'\r')continue;if(c==L'\n'){if(++lines<5)out+=L'\n';column=0;continue;}
+                if(column>=160)continue;if(c==L'\t'){out+=L"    ";column+=4;continue;}out+=c;++column;}
+            while(!out.empty()&&(out.back()==L'\n'||out.back()==L' '))out.pop_back();
+            it->second.highlight=clipboard::HighlightCode(out);
+        }
+        return it->second;
+    }
+    void DrawCode(const clipboard::Entry& e,D2D1_RECT_F box,UINT32 ink){
+        namespace cards=clipboard::cards;
+        Fill(box,dark?0x0a0e14:0xf0f3f8,dark?.55f:.9f,7);
+        const auto& snippet=SnippetFor(e);if(snippet.text.empty())return;
+        // .kw .str .cm .nb .fn of full.html (light / dark).
+        auto color=[&](clipboard::CodeColor c)->UINT32{using C=clipboard::CodeColor;
+            switch(c){case C::Keyword:case C::Preprocessor:return dark?0xfb923c:0xc2410c;case C::String:return dark?0x86efac:0x15803d;case C::Comment:return 0x8a94a3;
+                case C::Number:return dark?0xd8b4fe:0x9333ea;case C::Type:return dark?0x7cb4ff:0x2563eb;default:return ink;}};
+        auto* mono=Weighted(12,DWRITE_FONT_WEIGHT_NORMAL,true);
+        const D2D1_RECT_F inner{box.left+cards::CodePadX,box.top+cards::CodePadY,box.right-cards::CodePadX,box.bottom};
+        target->PushAxisAlignedClip({box.left,box.top,box.right,box.bottom},D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        size_t start=0;float y=inner.top;
+        while(start<=snippet.text.size()&&y<box.bottom){
+            const size_t end=std::min(snippet.text.find(L'\n',start),snippet.text.size());const std::wstring line=snippet.text.substr(start,end-start);
+            ComPtr<IDWriteTextLayout> layout;
+            if(!line.empty()&&SUCCEEDED(writer->CreateTextLayout(line.data(),static_cast<UINT32>(line.size()),mono,4096,cards::CodeLineHeight,&layout))){
+                // Segments in token colours, positioned by the line's own layout.
+                size_t at=0;
+                auto emit=[&](size_t from,size_t to,UINT32 c){if(to<=from)return;FLOAT x{},yy{};DWRITE_HIT_TEST_METRICS hit{};layout->HitTestTextPosition(static_cast<UINT32>(from),FALSE,&x,&yy,&hit);
+                    if(inner.left+x<inner.right)Label(line.substr(from,to-from),{inner.left+x,y,inner.right,y+cards::CodeLineHeight},mono,c,1.f,DWRITE_TEXT_ALIGNMENT_LEADING,true);};
+                for(const auto& span:snippet.highlight.spans){
+                    const size_t s0=std::max<size_t>(span.start,start),s1=std::min<size_t>(static_cast<size_t>(span.start)+span.length,end);if(s1<=s0)continue;
+                    emit(at,s0-start,ink);emit(s0-start,s1-start,color(span.color));at=s1-start;
+                }
+                emit(at,line.size(),ink);
+            }
+            y+=cards::CodeLineHeight;start=end+1;
+        }
+        target->PopAxisAlignedClip();
+    }
+    void DrawExpanded(UINT32 bg){
+        namespace cards=clipboard::cards;
+        const UINT32 ink=glass::Pick(glass::Ink1,dark),ink2=glass::Pick(glass::Ink2,dark),ink3=glass::Pick(glass::Ink3,dark),accent=glass::Accent,edge=glass::Pick(glass::Edge,dark);
+        const UINT32 white=0xffffff,solid=dark?0x1c2532u:0xf5f8fcu,warn=0xf5a524,ok=0x2fb36d;
+        const float edge_a=dark?glass::EdgeAlphaDark:glass::EdgeAlphaLight,card_a=dark?glass::CardAlphaDark:glass::CardAlphaLight,hover_a=dark?glass::CardHoverAlphaDark:glass::CardHoverAlphaLight;
+        auto* f11=Weighted(11,DWRITE_FONT_WEIGHT_NORMAL);auto* f11s=Weighted(11,DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        auto* f12=Weighted(12,DWRITE_FONT_WEIGHT_NORMAL);auto* f13=Weighted(13,DWRITE_FONT_WEIGHT_NORMAL);
+        // .ph: logo, title + shortcut line, 记录中 pill, pin / settings / more.
+        ClipboardIcon(14,12,30);
+        const bool narrow=W<330;const std::wstring rec_label=paused?L"已暂停":L"记录中";
+        const float rec_right=W-110,rec_left=rec_right-(narrow?26.f:29.f+MeasureWith(rec_label,f12)+10.f);
+        {const D2D1_RECT_F rec{rec_left,15,rec_right,39};const bool hot=PushHit(rec,15,0);Fill(rec,white,hot?hover_a:card_a,12);
+            const D2D1_POINT_2F dot{rec_left+13.5f,27};brush->SetColor(D2D1::ColorF(paused?warn:ok,paused?.22f:.2f));target->FillEllipse(D2D1::Ellipse(dot,6.5f,6.5f),brush.Get());
+            brush->SetColor(D2D1::ColorF(paused?warn:ok));target->FillEllipse(D2D1::Ellipse(dot,3.5f,3.5f),brush.Get());
+            if(!narrow)Label(rec_label,{rec_left+23.5f,15,rec_right-6,39},f12,ink2);}
+        Label(L"剪贴板",{54,12,rec_left-8,31},Weighted(15,DWRITE_FONT_WEIGHT_BOLD),ink);
+        Label((hotkey?ShortcutLabel(shortcut_modifiers,shortcut_key):std::wstring(L"侧边栏打开"))+L" · Alt+1–9 快速粘贴",{54,31,rec_left-8,45},f11,ink3);
+        Icon(L'\xE718',W-106,12,10,0,pinned,false,30);Icon(L'\xE713',W-74,12,11,0,false,false,30);Icon(L'\xE712',W-42,12,12,0,menu_open,false,30);
+        // .search
+        {const D2D1_RECT_F sr{cards::SearchInset,cards::SearchTop,W-cards::SearchInset,cards::SearchBottom};const bool focused=naming||GetFocus()==search;
+            if(focused)Fill({sr.left-3,sr.top-3,sr.right+3,sr.bottom+3},accent,dark?.24f:.14f,13);
+            Fill(sr,white,card_a,cards::SearchRadius);if(focused)Fill(sr,solid,.5f,cards::SearchRadius);Stroke(sr,focused?accent:edge,focused?1.f:edge_a,cards::SearchRadius);
+            Center(naming?L"\xE8F4":L"\xE721",{20,sr.top,40,sr.bottom},13,naming?accent:ink3,true);
+            if(!IsWindowVisible(search)||menu_open)Label(query.empty()?std::wstring(naming?L"输入分组名称（最多 12 字）":L"搜索文本、OCR 文字、文件名…"):query,{44,sr.top,W-80,sr.bottom},f13,query.empty()?ink3:ink);
+            const std::wstring key=naming?L"Esc 取消":L"Ctrl F";const float kw=MeasureWith(key,Weighted(10,DWRITE_FONT_WEIGHT_NORMAL))+10;
+            const D2D1_RECT_F kr{sr.right-10-kw,sr.top+9,sr.right-10,sr.bottom-9};Stroke(kr,edge,dark?.16f:.18f,5);Label(key,kr,Weighted(10,DWRITE_FONT_WEIGHT_NORMAL),ink3,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);}
+        // .chips: type chips (empty 代码/链接/颜色 hidden), a separator, custom groups; scrolled horizontally.
+        const auto chips=cards::Chips(history,tab,flavor,[&](const clipboard::Entry& e){return FlavorFor(e);});
+        const float strip_left=cards::ChipInset-2,strip_right=W-70,top=cards::ChipTop,bottom=cards::ChipBottom,radius=(bottom-top)/2;
+        struct Span{float left,right;};std::vector<Span> spans;float x=cards::ChipInset;int reveal=-1;
+        for(size_t i=0;i<chips.size();++i){const float w=cards::ChipPadX*2+MeasureWith(chips[i].label,f12)+4+MeasureWith(std::to_wstring(chips[i].count),f11s);spans.push_back({x,x+w});if(chips[i].selected)reveal=static_cast<int>(i);x+=w+cards::ChipGap;}
+        const float separator_x=x+2;if(!history.groups.empty())x+=9;
+        for(size_t i=0;i<history.groups.size();++i){const float w=std::clamp(MeasureWith(history.groups[i].name,f12)+30.f,44.f,132.f);spans.push_back({x,x+w});
+            if(tab==clipboard::History::GroupTabBase+static_cast<int>(i))reveal=static_cast<int>(chips.size()+i);x+=w+cards::ChipGap;}
+        tab_scroll_max=std::max(0.f,x-cards::ChipGap-strip_right);
+        if(reveal_tab&&reveal>=0){const auto span=spans[static_cast<size_t>(reveal)];if(span.left-tab_scroll<strip_left+4)tab_scroll=span.left-cards::ChipInset;if(span.right-tab_scroll>strip_right-4)tab_scroll=span.right-strip_right+6;}
+        reveal_tab=false;tab_scroll=std::clamp(tab_scroll,0.f,tab_scroll_max);
+        target->PushAxisAlignedClip({strip_left,top-2,strip_right,bottom+2},D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        for(size_t i=0;i<spans.size();++i){
+            const D2D1_RECT_F r{spans[i].left-tab_scroll,top,spans[i].right-tab_scroll,bottom};if(r.right<strip_left||r.left>strip_right)continue;
+            D2D1_RECT_F hit_rect=r;hit_rect.left=std::max(r.left,strip_left);hit_rect.right=std::min(r.right,strip_right);
+            if(i<chips.size()){
+                const auto& c=chips[i];const bool hot=PushHit(hit_rect,c.flavor?26:20+c.tab,c.flavor?1+static_cast<uint64_t>(*c.flavor):0);
+                if(c.selected)Fill(r,ink,1,radius);else if(hot)Fill(r,white,card_a,radius);
+                const float lw=MeasureWith(c.label,f12);Label(c.label,{r.left+cards::ChipPadX,top,r.left+cards::ChipPadX+lw+1,bottom},f12,c.selected?solid:ink2);
+                Label(std::to_wstring(c.count),{r.left+cards::ChipPadX+lw+4,top+1,r.right,bottom},f11s,c.selected?solid:ink3,c.selected?.65f:1.f);
+            }else{
+                const auto& g=history.groups[i-chips.size()];const bool chosen=tab==clipboard::History::GroupTabBase+static_cast<int>(i-chips.size());
+                const bool hot=PushHit(hit_rect,40,g.id);if(chosen)Fill(r,ink,1,radius);else if(hot)Fill(r,white,card_a,radius);
+                brush->SetColor(D2D1::ColorF(g.color));target->FillEllipse(D2D1::Ellipse({r.left+13,(top+bottom)/2},3.5f,3.5f),brush.Get());
+                Label(g.name,{r.left+21,top,r.right-8,bottom},f12,chosen?solid:ink2);
+            }
+        }
+        if(!history.groups.empty()&&separator_x-tab_scroll>strip_left&&separator_x-tab_scroll<strip_right){brush->SetColor(D2D1::ColorF(edge,edge_a*1.6f));target->DrawLine({separator_x-tab_scroll,top+5},{separator_x-tab_scroll,bottom-5},brush.Get());}
+        // Soft fades mark edges with more chips; wheel, Alt+←/→ and auto-reveal reach them.
+        for(int i=0;i<14;++i){const float alpha=static_cast<float>(i+1)/14.f*.9f;brush->SetColor(D2D1::ColorF(bg,alpha));
+            if(tab_scroll<tab_scroll_max-.5f)target->FillRectangle({strip_right-14+static_cast<float>(i),top-2,strip_right-13+static_cast<float>(i),bottom+2},brush.Get());
+            if(tab_scroll>.5f)target->FillRectangle({strip_left+13-static_cast<float>(i),top-2,strip_left+14-static_cast<float>(i),bottom+2},brush.Get());}
+        target->PopAxisAlignedClip();
+        {const D2D1_RECT_F r{W-66,top,W-44,bottom};const bool hot=PushHit(r,41,0);Fill(r,white,hot?hover_a:card_a,7);
+            Center(L"\xE710",r,9,history.groups.size()<clipboard::History::MaxGroups?ink2:ink3,true);}
+        Icon(L'\xE8CB',W-40,top-2.5f,13,0,oldest,false,28);
+        // #list: time-group headings and flavour cards.
+        SYSTEMTIME now{};GetLocalTime(&now);
+        target->PushAxisAlignedClip({0,ListTop,W,ListBottom},D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        {const auto [first,end]=DrawnRange();const float px=ScrollPx();hit_clip=D2D1_RECT_F{0,ListTop,W,ListBottom};
+            for(int i=first;i<end;++i){
+                const auto* e=history.Find(visible[static_cast<size_t>(i)]);if(!e)continue;
+                float card_y=ListTop+block_tops[static_cast<size_t>(i)]-px;
+                if(block_header[static_cast<size_t>(i)]){Label(cards::GroupLabel(cards::GroupOf(*e,now)),{cards::ListInset+6,card_y+10,W-cards::ListInset-6,card_y+25},f11s,ink3);card_y+=cards::GroupHeaderHeight;}
+                const float h=CardHeightFor(*e);
+                DrawCard(*e,i,{cards::ListInset,card_y,W-cards::ListInset,card_y+h},now);
+            }
+            // A heading may peek in below the last card before its card does.
+            if(end<static_cast<int>(visible.size())&&block_header[static_cast<size_t>(end)])if(const float heading_y=ListTop+block_tops[static_cast<size_t>(end)]-px;heading_y<ListBottom)
+                if(const auto* e=history.Find(visible[static_cast<size_t>(end)]))Label(cards::GroupLabel(cards::GroupOf(*e,now)),{cards::ListInset+6,heading_y+10,W-cards::ListInset-6,heading_y+25},f11s,ink3);
+            hit_clip.reset();}
+        if(visible.empty()){const float mid=(ListTop+ListBottom)/2;
+            Center(query.empty()?L"\xE77F":L"\xE721",{0,mid-74,W,mid-18},40,ink3,true);
+            Label(query.empty()?(TabGroup()?L"这个分组还是空的":tab==4?L"还没有收藏":L"这里还没有内容"):L"没有找到“"+query+L"”",{20,mid-12,W-20,mid+8},f13,ink3,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);
+            Label(query.empty()?(TabGroup()?(tab-4<=9?L"在其他标签选中记录按 Ctrl+"+std::to_wstring(tab-4)+L" 移入":std::wstring(L"右键记录，选择“移到分组”")):std::wstring(tab==4?L"点击记录上的星标，或按 Ctrl+D 收藏":L"复制任意内容，或截图后按 Enter")):std::wstring(L"试试其他关键词或文件名"),
+                  {20,mid+10,W-20,mid+28},f12,ink3,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);}
+        target->PopAxisAlignedClip();
+        if(const float limit_px=MaxScrollPx();limit_px>0){const float track=ViewHeight(),thumb=ScrollThumb(),y0=ListTop+(track-thumb)*ScrollPx()/limit_px;
+            Fill({W-7,y0,W-4,y0+thumb},0x808080,.35f,1.5f);}
+        // #bulk: accent bar between the chips and the list while 2+ cards are selected.
+        if(msel.size()>1){
+            const D2D1_RECT_F bar{cards::ListInset,cards::ListTop,W-cards::ListInset,cards::ListTop+BulkHeight};auto* f12b=Weighted(12,DWRITE_FONT_WEIGHT_NORMAL);
+            Fill(bar,accent,1,10);
+            struct Button{const wchar_t* label;int action;};const Button buttons[]{{L"\xE711",53},{L"删除",52},{L"收藏",51},{L"合并复制",50}};
+            float right=bar.right-6;
+            for(const auto& b:buttons){
+                const bool glyph=b.action==53;const float bw=glyph?26.f:MeasureWith(b.label,f12b)+18;const D2D1_RECT_F br{right-bw,bar.top+6,right,bar.bottom-6};
+                const bool hot=PushHit(br,b.action,0);Fill(br,white,hot?.3f:.18f,7);
+                if(glyph)Center(b.label,br,9,white,true);else Label(b.label,br,f12b,white,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);
+                right-=bw+6;
+            }
+            Label(L"已选 "+std::to_wstring(msel.size())+L" 项",{bar.left+12,bar.top,right,bar.bottom},f12b,white);
+        }
+        // .pfoot: capacity text, hints (or status), 4 px capacity bar.
+        brush->SetColor(D2D1::ColorF(edge,edge_a));target->DrawLine({0,H-cards::FooterHeight+.5f},{W,H-cards::FooterHeight+.5f},brush.Get());
+        const size_t bytes=history.Bytes();const std::wstring capacity=cards::CapacityText(history.entries.size(),bytes,history.Limit());const float cw=std::min(MeasureWith(capacity,f11)+2,W-28);
+        Label(capacity,{14,H-38,14+cw,H-22},f11,ink3);
+        float status_right=W-14;
+        if(!pending_delete.empty()){   // toast action: 撤销 (Ctrl+Z)
+            const float uw=MeasureWith(L"撤销",f11)+16;const D2D1_RECT_F ur{W-14-uw,H-40,W-14,H-20};
+            const bool hot=PushHit(ur,54,0);Fill(ur,accent,hot?.22f:.12f,6);Label(L"撤销",ur,f11,accent,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);status_right=ur.left-6;
+        }
+        Label(status.empty()?std::wstring(paused?L"记录已暂停 · Enter 粘贴":L"↑↓ · Enter 粘贴 · 空格预览"):status,{14+cw+8,H-38,status_right,H-22},f11,status.empty()?ink3:ink2,1.f,DWRITE_TEXT_ALIGNMENT_TRAILING);
+        Fill({14,H-16,W-14,H-12},white,dark?.12f:.7f,2);Fill({14,H-16,14+(W-28)*cards::CapacityRatio(bytes),H-12},accent,1,2);
+    }
+    void DrawCard(const clipboard::Entry& e,int index,D2D1_RECT_F r,const SYSTEMTIME& now){
+        namespace cards=clipboard::cards;
+        const UINT32 ink=glass::Pick(glass::Ink1,dark),ink2=glass::Pick(glass::Ink2,dark),ink3=glass::Pick(glass::Ink3,dark),accent=glass::Accent,edge=glass::Pick(glass::Edge,dark),white=0xffffff;
+        const float edge_a=dark?glass::EdgeAlphaDark:glass::EdgeAlphaLight,card_a=dark?glass::CardAlphaDark:glass::CardAlphaLight,hover_a=dark?glass::CardHoverAlphaDark:glass::CardHoverAlphaLight;
+        auto* f11=Weighted(11,DWRITE_FONT_WEIGHT_NORMAL);auto* f11s=Weighted(11,DWRITE_FONT_WEIGHT_SEMI_BOLD);auto* f12=Weighted(12,DWRITE_FONT_WEIGHT_NORMAL);auto* f13s=Weighted(13,DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        const auto kind=FlavorFor(e);const bool active=e.id==selected,hot=e.id==hover_card;
+        // .item.new: from translateY(-12px) scale(.96) opacity 0, spring easing.
+        ComPtr<ID2D1Layer> arriving;D2D1_MATRIX_3X2_F arrive_outer{};bool arrive=false;
+        if(new_id==e.id)if(const ULONGLONG age=GetTickCount64()-new_tick;age<NewMs){
+            const float k=SpringEase(static_cast<float>(age)/NewMs),sc=.96f+.04f*k;arrive=true;target->GetTransform(&arrive_outer);
+            target->SetTransform(D2D1::Matrix3x2F::Scale(sc,sc,{(r.left+r.right)/2,(r.top+r.bottom)/2})*D2D1::Matrix3x2F::Translation(0,-12.f*(1.f-k))*(*D2D1::Matrix3x2F::ReinterpretBaseType(&arrive_outer)));
+            if(SUCCEEDED(target->CreateLayer(&arriving)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),std::clamp(k,0.f,1.f)),arriving.Get());
+        }
+        ComPtr<ID2D1Layer> lifted;if(drag_id&&e.id==drag_id&&SUCCEEDED(target->CreateLayer(&lifted)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),.25f),lifted.Get());  // .lifted
+        const auto& fx=FxFor(e.id,hot,active,active||hot);   // .item transition: background .12s, border-color .12s
+        Fill(r,white,card_a+(hover_a-card_a)*Ease(fx.hover),cards::Radius);
+        const bool marked=msel.size()>1&&msel.count(e.id)>0;   // .item.msel: accent-soft fill, accent border
+        if(marked){Fill(r,accent,dark?.24f:.14f,cards::Radius);Stroke(r,accent,std::max(.45f,Ease(fx.active)),cards::Radius);}
+        else if(fx.active>0)Stroke(r,accent,Ease(fx.active),cards::Radius);
+        PushHit(r,30,e.id);
+        // .idx: Alt+1–9 slot.
+        {const D2D1_RECT_F ir{r.left+cards::IndexX,r.top+cards::IndexY,r.left+cards::IndexX+cards::IndexSize,r.top+cards::IndexY+cards::IndexSize};
+            if(index<9||marked){Fill(ir,accent,1,cards::IndexRadius);if(index<9)Label(std::to_wstring(index+1),ir,Weighted(10,DWRITE_FONT_WEIGHT_BOLD),white,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);}
+            else Stroke(ir,edge,edge_a*1.5f,cards::IndexRadius);}
+        const float x0=r.left+cards::PadLeft,x1=r.right-cards::PadRight,y0=r.top+cards::PadTop;
+        const float body_h=(r.bottom-r.top)-cards::PadTop-cards::MetaGap-cards::MetaLine-cards::FootGap-cards::MetaLine-cards::PadBottom;
+        const D2D1_RECT_F body{x0,y0,x1,y0+body_h};
+        std::wstring detail;wchar_t glyph=L'\xE8D2';std::wstring kind_label=clipboard::FlavorName(kind);bool language_badge=false;std::wstring language;
+        switch(kind){
+        case clipboard::Flavor::Image:{
+            DrawThumb(e,body,edge,edge_a);glyph=L'\xE8B9';const auto size=NaturalImageSize(e);
+            detail=size.first>0?std::to_wstring(static_cast<int>(size.first))+L" × "+std::to_wstring(static_cast<int>(size.second)):std::to_wstring((e.Bytes()+1023)/1024)+L" KB";
+            break;}
+        case clipboard::Flavor::Code:{
+            DrawCode(e,body,ink);language=ShortLanguage(SnippetFor(e).highlight.language);language_badge=true;
+            detail=std::to_wstring(cards::CodeLines(e.text.substr(0,1<<16)))+L" 行";break;}
+        case clipboard::Flavor::Link:{
+            const std::wstring host=clipboard::LinkHost(e.text.substr(0,2048));const D2D1_RECT_F badge{x0,y0,x0+cards::BadgeSize,y0+cards::BadgeSize};
+            const UINT32 base=clipboard::HostColor(host);
+            ComPtr<ID2D1GradientStopCollection> stops;ComPtr<ID2D1LinearGradientBrush> gradient;
+            const auto shade=[](UINT32 c,float k){return static_cast<UINT32>(std::lround(((c>>16)&255)*k))<<16|static_cast<UINT32>(std::lround(((c>>8)&255)*k))<<8|static_cast<UINT32>(std::lround((c&255)*k));};
+            const D2D1_GRADIENT_STOP stop[2]={{0,D2D1::ColorF(base)},{1,D2D1::ColorF(shade(base,.78f))}};
+            if(SUCCEEDED(target->CreateGradientStopCollection(stop,2,&stops))&&SUCCEEDED(target->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({badge.left,badge.top},{badge.right,badge.bottom}),stops.Get(),&gradient)))
+                target->FillRoundedRectangle(D2D1::RoundedRect(badge,9,9),gradient.Get());else Fill(badge,base,1,9);
+            Label(host.empty()?L"?":std::wstring(1,static_cast<wchar_t>(std::towupper(host[0]))),badge,Weighted(16,DWRITE_FONT_WEIGHT_EXTRA_BOLD),white,1.f,DWRITE_TEXT_ALIGNMENT_CENTER);
+            Label(host.empty()?L"链接":host,{x0+48,y0+1,x1-4,y0+19},f13s,ink);
+            Label(clipboard::Trimmed(e.text.substr(0,2048)),{x0+48,y0+20,x1-4,y0+37},f12,accent);
+            glyph=L'\xE71B';detail=host;break;}
+        case clipboard::Flavor::Color:{
+            const uint32_t value=clipboard::ParseHexColor(e.text).value_or(0);const D2D1_RECT_F swatch{x0,y0,x0+cards::BadgeSize,y0+cards::BadgeSize};
+            Fill(swatch,value,1,9);Stroke(swatch,0x000000,.12f,9);
+            wchar_t hex[16]{},rgb[48]{};swprintf_s(hex,L"#%06X",value);swprintf_s(rgb,L"rgb(%u, %u, %u)",(value>>16)&255u,(value>>8)&255u,value&255u);
+            Label(hex,{x0+48,y0+2,x1,y0+19},Weighted(13,DWRITE_FONT_WEIGHT_BOLD,true),ink);Label(rgb,{x0+48,y0+19,x1,y0+36},Weighted(12,DWRITE_FONT_WEIGHT_NORMAL,true),ink3);
+            glyph=L'\xE790';detail=L"自动识别";break;}
+        case clipboard::Flavor::Files:{
+            const auto names=FileNames(e);const auto count=FileCount(e);const std::wstring first=names.empty()?std::wstring(L"文件"):names.front();
+            // .fileic slot: the real shell icon (folders, executables), stacked for several files.
+            {const size_t shown=std::min<size_t>(3,names.size());
+                if(shown<=1)FileImage(clipboard::FirstFilePath(e.text),{x0+1,y0+1,x0+37,y0+37},ink3);
+                else for(size_t k=0;k<shown;++k){const float o=static_cast<float>(k)*6;FileImage(names[k],{x0+o,y0+o,x0+26+o,y0+26+o},ink3);}}
+            Label(count>1?first+L" 等 "+std::to_wstring(count)+L" 个":first,{x0+45,y0+1,x1-4,y0+19},f13s,ink);
+            std::wstring path=clipboard::FirstFilePath(e.text);const auto slash=path.find_last_of(L"\\/");if(slash!=std::wstring::npos)path.resize(slash+1);
+            Label(path,{x0+45,y0+20,x1-4,y0+37},f12,ink3);
+            glyph=L'\xE8A5';detail=std::to_wstring(std::max<uint32_t>(1,count))+L" 个";break;}
+        case clipboard::Flavor::Text:
+        default:{
+            int lines=1;if(auto layout=ClampLayout(CardText(e.text),body.right-body.left,Format(13),cards::TextLineHeight,cards::TextMaxLines,&lines))
+                text_glyphs+=text_renderer.DrawLayout(target.Get(),writer.Get(),layout.Get(),{body.left,body.top},body,D2D1::ColorF(ink)).freetype_glyphs;
+            detail=std::to_wstring(e.text.size())+L" 字";break;}
+        }
+        // .meta: kind (or language badge) and detail.
+        float mx=x0,my=body.bottom+cards::MetaGap;
+        if(language_badge){auto* f10b=Weighted(10,DWRITE_FONT_WEIGHT_EXTRA_BOLD);const float lw=MeasureWith(language,f10b)+10;const D2D1_RECT_F badge{mx,my+1.5f,mx+lw,my+13.5f};
+            const UINT32 fill=language==L"JS"?0xf7df1e:language==L"TS"?0x3178c6:language==L"PY"?0x3776ab:0x8a94a3;Fill(badge,fill,1,4);Label(language,badge,f10b,language==L"JS"?0x222222:white,1.f,DWRITE_TEXT_ALIGNMENT_CENTER,true);mx+=lw+6;}
+        else{Center(std::wstring(1,glyph),{mx,my,mx+12,my+cards::MetaLine},9,ink2,true);mx+=16;const float kw=MeasureWith(kind_label,f11s);Label(kind_label,{mx,my,mx+kw+1,my+cards::MetaLine},f11s,ink2);mx+=kw+6;}
+        Label(detail,{mx,my,x1,my+cards::MetaLine},f11,ink3);
+        // second .meta: ★, time, group.
+        mx=x0;my+=cards::MetaLine+cards::FootGap;
+        if(e.favorite){Label(L"★",{mx,my,mx+12,my+cards::MetaLine},f11,0xf5a524);mx+=14;}
+        const std::wstring when=clipboard::cards::TimeLabel(e.time,now);const float tw=MeasureWith(when,f11);Label(when,{mx,my,mx+tw+1,my+cards::MetaLine},f11,ink3);mx+=tw+6;
+        if(e.group&&tab<clipboard::History::GroupTabBase)if(const auto* g=history.FindGroup(e.group)){
+            Label(L"·",{mx,my,mx+6,my+cards::MetaLine},f11,ink3);mx+=10;brush->SetColor(D2D1::ColorF(g->color));target->FillEllipse(D2D1::Ellipse({mx+3,my+cards::MetaLine/2},3.f,3.f),brush.Get());
+            Label(g->name,{mx+10,my,x1,my+cards::MetaLine},f11,ink3);}
+        // .acts (full.html actsFor): type actions, then group / star / delete.
+        // Fades and slides 3 DIP (.12s); only a shown bar takes clicks (pointer-events).
+        if(fx.acts>0){
+            struct Act{wchar_t glyph;int action;bool on;};std::vector<Act> acts;acts.reserve(8);
+            switch(kind){
+            case clipboard::Flavor::Image:
+                if(pin_request)acts.push_back({L'\xE718',36,false});
+                if(image_action){acts.push_back({L'\xE8D2',37,false});acts.push_back({L'\xE70F',38,false});}
+                acts.push_back({L'\xE8C8',32,false});break;
+            case clipboard::Flavor::Link:acts.push_back({L'\xE8A7',39,false});acts.push_back({L'\xE8C8',32,false});break;
+            case clipboard::Flavor::Files:acts.push_back({L'\xE838',42,false});acts.push_back({L'\xE8C8',43,false});break;
+            case clipboard::Flavor::Color:acts.push_back({L'\xE8C8',44,false});break;
+            default:acts.push_back({L'\xE8C8',32,false});acts.push_back({L'\xE77F',45,false});break;
+            }
+            acts.push_back({L'\xE8F4',35,e.group!=0});acts.push_back({L'\xE734',31,e.favorite});acts.push_back({L'\xE74D',34,false});
+            const float n=static_cast<float>(acts.size()),w=cards::ActsPad*2+n*cards::ActButton+(n-1)*cards::ActGap;
+            const D2D1_RECT_F bar{r.right-cards::ActsRight-w,r.top+cards::ActsTop,r.right-cards::ActsRight,r.top+cards::ActsTop+cards::ActsPad*2+cards::ActButton};
+            const float t=Ease(fx.acts);const bool live=active||hot;
+            ComPtr<ID2D1Layer> fade;if(t<.999f&&SUCCEEDED(target->CreateLayer(&fade)))target->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::IdentityMatrix(),t),fade.Get());
+            D2D1_MATRIX_3X2_F outer{};target->GetTransform(&outer);
+            if(t<.999f)target->SetTransform(D2D1::Matrix3x2F::Translation(0,-3.f*(1.f-t))*(*D2D1::Matrix3x2F::ReinterpretBaseType(&outer)));
+            const UINT32 shadow=dark?0x000000:0x0a192e;
+            for(int i=3;i>=1;--i){const float k=static_cast<float>(i)*1.6f;brush->SetColor(D2D1::ColorF(shadow,dark?.08f:.035f));target->FillRoundedRectangle(D2D1::RoundedRect({bar.left-k,bar.top-k+3,bar.right+k,bar.bottom+k+3},cards::ActsRadius+k,cards::ActsRadius+k),brush.Get());}
+            Fill(bar,glass::Pick(glass::CardGlass,dark),dark?.96f:.97f,cards::ActsRadius);Stroke(bar,edge,edge_a,cards::ActsRadius);
+            float bx=bar.left+cards::ActsPad;const float by=bar.top+cards::ActsPad;
+            for(const auto& act:acts){Icon(act.glyph,bx,by,live?act.action:0,e.id,act.on,false,cards::ActButton);bx+=cards::ActButton+cards::ActGap;}
+            target->SetTransform(outer);if(fade)target->PopLayer();
+        }
+        if(lifted)target->PopLayer();
+        if(arriving)target->PopLayer();if(arrive)target->SetTransform(arrive_outer);
+    }
     void Render(int requested_width=0,int requested_height=0,bool content_only=false){
         if(!enabled||!window)return;
+        {BOOL animate=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);fx_enabled=animate!=FALSE;}
+        SyncBulk();
         if(!content_only)SelectWindow();
         std::erase_if(images,[&](const auto& item){return !ImageNeeded(item.first);});
         RECT client{};GetClientRect(window,&client);if(requested_width&&requested_height)client={0,0,requested_width,requested_height};if(!client.right||!client.bottom)return;
@@ -1192,12 +2071,12 @@ struct ClipboardPanel::Impl {
         // (failures are re-created lazily); brush-holding icon geometry is rebuilt.
         if(!target){target=CreateMemoryRenderTarget(factory.Get(),surface->Pixels(),width,height,width);
             std::erase_if(images,[&](auto& item){return !ShareBitmap(target.Get(),item.second);});std::erase_if(file_bitmaps,[&](auto& item){return !ShareBitmap(target.Get(),item.second);});
-            app_icon.Reset();brush.Reset();CheckWin32(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0),&brush)),"Clipboard brush");}
+            app_icon.Reset();brush.Reset();checker.Reset();CheckWin32(SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0),&brush)),"Clipboard brush");}
         target->SetDpi(96*scale,96*scale);target->BeginDraw();target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        const UINT32 bg=dark?0x192330:0xf5f8fc,card=dark?0x222e40:0xffffff,ink=dark?0xe7effb:0x223248,muted=dark?0x95a7bf:0x7e899a,border=dark?0x334358:0xe9edf3,accent=0x267aff;
+        const UINT32 bg=dark?0x192330:0xf5f8fc,accent=0x267aff;
         if(content_only)target->Clear(D2D1::ColorF(0,0.f));
         else if(custom_outline)target->Clear(D2D1::ColorF(bg,PanelOpacity(dark,expanded&&acrylic)));
-        else {target->Clear(D2D1::ColorF(0,0.f));const float radius=expanded?22.f:8.f;Color(bg);target->FillRoundedRectangle(D2D1::RoundedRect({0,0,width/scale,height/scale},radius,radius),brush.Get());}hits.clear();
+        else {target->Clear(D2D1::ColorF(0,0.f));const float radius=expanded?22.f:8.f;Color(bg);target->FillRoundedRectangle(D2D1::RoundedRect({0,0,width/scale,height/scale},radius,radius),brush.Get());}hover_card=HoverCard();hits.clear();
         if(!expanded){
 
             ClipboardIcon((CW-26)/2,6,26);
@@ -1206,100 +2085,23 @@ struct ClipboardPanel::Impl {
             Color(dark?0x9aabc3:0x7c91ae);target->DrawLine({12,73},{16,77},brush.Get(),1.4f);target->DrawLine({16,77},{12,81},brush.Get(),1.4f);
 
         }else{
-            ClipboardIcon(17,19,43);Text(L"剪贴板",{64,20,148,46},19,ink);Text(L"L U M A S H O T",{65,44,156,59},9,muted);
-            if(W>=368)TextLine(hotkey?ShortcutLabel(shortcut_modifiers,shortcut_key):L"侧边栏打开",{175,28,W-133,52},10,muted);
-            Icon(L'\xE718',W-118,24,10,0,pinned);Icon(L'\xE713',W-84,24,11);Icon(L'\xE712',W-50,24,12,0,menu_open);
-            Card({22,HeaderBottom,W-22,121},card,naming?0x6595f1:border);Text(naming?L"\xE8F4":L"\xE721",{34,81,54,115},16,naming?0x3975ef:muted,true);if(!IsWindowVisible(search)||menu_open)Text(query.empty()?L"搜索剪贴内容":query,{59,81,W-104,115},13,query.empty()?muted:ink);Text(naming?L"Esc 取消":L"Ctrl F",{W-69,81,W-28,115},10,muted);
-            const wchar_t* tabs[]={L"全部",L"文本",L"图片",L"文件",L"收藏"};
-            const float tab_width=std::min(history.groups.empty()?46.f:40.f,(W-100.f)/5.f),tab_gap=history.groups.empty()?5.f:3.f;
-            // Fixed categories, a separator, custom groups and "+", scrolled horizontally when they overflow.
-            const float strip_left=18,strip_right=W-92;std::vector<std::pair<float,float>> spans;float strip_x=22;
-            for(int i=0;i<5;++i){spans.push_back({strip_x,strip_x+tab_width});strip_x+=tab_width+tab_gap;}
-            const float separator_x=strip_x+2;strip_x+=9;
-            for(const auto& g:history.groups){const float w=std::clamp(Measure(g.name,12)+30.f,44.f,132.f);spans.push_back({strip_x,strip_x+w});strip_x+=w+5;}
-            tab_scroll_max=std::max(0.f,strip_x-1-strip_right);
-            if(reveal_tab&&tab>=0&&tab<static_cast<int>(spans.size())){const auto span=spans[static_cast<size_t>(tab)];if(span.first-tab_scroll<strip_left+4)tab_scroll=span.first-22;if(span.second-tab_scroll>strip_right-4)tab_scroll=span.second-strip_right+6;}
-            reveal_tab=false;tab_scroll=std::clamp(tab_scroll,0.f,tab_scroll_max);
-            auto strip_hit=[&](D2D1_RECT_F r,int action,uint64_t id){r.left=std::max(r.left,strip_left);r.right=std::min(r.right,strip_right);if(r.right>r.left)hits.push_back({r,action,id});};
-            target->PushAxisAlignedClip({strip_left,130,strip_right,168},D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            for(int i=0;i<static_cast<int>(spans.size());++i){
-                const float x=spans[static_cast<size_t>(i)].first-tab_scroll,w=spans[static_cast<size_t>(i)].second-spans[static_cast<size_t>(i)].first;const D2D1_RECT_F r{x,134,x+w,165};
-                if(r.right<strip_left||r.left>strip_right)continue;
-                if(tab==i){Box(r,dark?0x344257:0xffffff,dark?0x344257:0xffffff,8);Color(0x6595f1);target->FillRoundedRectangle(D2D1::RoundedRect({x+w/2-7,162,x+w/2+7,164},1,1),brush.Get());}
-                if(i<5){Center(tabs[i],r,12,tab==i?0x3975ef:muted);strip_hit(r,20+i,0);}
-                else{const auto& g=history.groups[static_cast<size_t>(i-5)];Color(g.color);target->FillEllipse(D2D1::Ellipse({x+13,149.5f},3.5f,3.5f),brush.Get());TextLine(g.name,{x+21,134,x+w-7,165},12,tab==i?0x3975ef:muted);strip_hit(r,40,g.id);}
-            }
-            if(separator_x-tab_scroll>strip_left&&separator_x-tab_scroll<strip_right){Color(dark?0x3a4a60:0xdfe6f0);target->DrawLine({separator_x-tab_scroll,140},{separator_x-tab_scroll,159},brush.Get());}
-            // Soft fades mark edges with more tabs; wheel, Alt+←/→ and auto-reveal reach them.
-            for(int i=0;i<18;++i){const float alpha=static_cast<float>(i+1)/18.f*.95f;brush->SetColor(D2D1::ColorF(bg,alpha));
-                if(tab_scroll<tab_scroll_max-.5f)target->FillRectangle({strip_right-18+static_cast<float>(i),130,strip_right-17+static_cast<float>(i),168},brush.Get());
-                if(tab_scroll>.5f)target->FillRectangle({strip_left+17-static_cast<float>(i),130,strip_left+18-static_cast<float>(i),168},brush.Get());}
-            target->PopAxisAlignedClip();
-            // "+" stays pinned beside the sort button so group creation is always reachable.
-            {const D2D1_RECT_F r{W-88,137,W-62,162};Box(r,dark?0x243246:0xf6f8fb,dark?0x3a4a60:0xd5deea,7);Center(L"\xE710",r,10,history.groups.size()<clipboard::History::MaxGroups?muted:(dark?0x4c5b70:0xc7d0dc),true);hits.push_back({r,41,0});}
-            Icon(L'\xE8CB',W-52,134,13,0,oldest);
-            {std::wstring heading=query.empty()?L"最近复制":L"搜索结果";if(query.empty()&&TabGroup())heading=L"分组 · "+GroupName(TabGroup());TextLine(heading,{24,172,W-90,193},10,muted);}Text(std::to_wstring(visible.size())+L" 条内容",{W-77,172,W-20,193},10,muted);
-            target->PushAxisAlignedClip({12,ListTop,W-12,ListBottom},D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            float y=ListTop;
-            for(int i=scroll;i<std::min(scroll+PageRows(),static_cast<int>(visible.size()));++i){
-                const auto* e=history.Find(visible[static_cast<size_t>(i)]);if(!e)continue;
-                const bool code=Code(e->text),image=e->kind==clipboard::Kind::Image,link=e->text.starts_with(L"http"),file=e->kind==clipboard::Kind::Files,active=e->id==selected;
-                // Allocate the available five-card column by content, not uniform blocks.
-                float desired=code?116.f:92.f,total=0;
-                for(int j=scroll;j<std::min(scroll+PageRows(),static_cast<int>(visible.size()));++j){const auto* row=history.Find(visible[static_cast<size_t>(j)]);if(row)total+=Code(row->text)?126.f:102.f;}
-                const float ratio=std::min(1.f,(ListBottom-ListTop)/std::max(1.f,total));const float h=(desired+10)*ratio-10;
-                const D2D1_RECT_F r{17,y,W-17,y+h};Card(r,active?(dark?0x304058:0xf4f8ff):card,active?0xa8c4f4:border,active);hits.push_back({r,30,e->id});
-                const float actions=y+h-36,content_bottom=actions-4;const bool compact=W<380;
-                const float badge_size=compact?std::min(48.f,std::max(0.f,content_bottom-y-14)):48.f,badge_scale=badge_size/48.f;
-                const float tx=image?126.f:(file||link)?40.f+badge_size:33.f;const UINT32 row_muted=muted;
-                if(image){const float bottom=compact?std::min(y+h-13,content_bottom):y+h-13;Box({24,y+13,116,bottom},dark?0x334054:0xe7eff7,dark?0x334054:0xe7eff7,7);Image(*e,{25,y+14,115,bottom-1});}
-                else if(file||link){const D2D1_RECT_F badge{30,y+14,30+badge_size,y+14+badge_size};Box(badge,dark?0x334054:0xedf1f6,dark?0x334054:0xedf1f6,7);
-                    if(file){
-                        const auto names=FileNames(*e);const size_t n=std::min(size_t(3),names.size());
-                        for(size_t k=0;k<n;++k){const float offset=static_cast<float>(k)*7;FileImage(n==1?clipboard::FirstFilePath(e->text):names[k],n==1?D2D1::RectF(30+8*badge_scale,y+14+8*badge_scale,30+40*badge_scale,y+14+40*badge_scale):D2D1::RectF(30+(2+offset)*badge_scale,y+14+(3+offset)*badge_scale,30+(27+offset)*badge_scale,y+14+(28+offset)*badge_scale),muted);}
-                    }
-                    else if(code)Center(L"</>",badge,std::max(10,static_cast<int>(19*badge_scale)),muted);
-                    else if(!file&&!link)Center(L"T",badge,std::max(10,static_cast<int>(25*badge_scale)),muted);
-                    else Center(file?L"\xE8A5":L"\xE71B",badge,std::max(10,static_cast<int>(21*badge_scale)),muted,true);
-                }
-                std::wstring label=e->text;const auto names=file?FileNames(*e):std::vector<std::wstring>{};const auto count=file?FileCount(*e):0;
-                if(file)label=count>1?std::to_wstring(count)+L" 个文件":names.empty()?L"文件":names.front();
-                const auto* chip_group=tab<clipboard::History::GroupTabBase&&e->group?history.FindGroup(e->group):nullptr;
-                const float chip_width=chip_group?std::min(104.f,Measure(chip_group->name,10)+26.f):0.f,text_right=chip_group&&(image||file||link)?W-36-chip_width:W-32;
-                // Content and thumbnails stay above the full-size action hit row.
-                if(!image&&!file&&!link)Text(code?L"</>  代码文本":L"T  文本",{tx,y+5,W-32,y+24},10,muted);
-                TextBlock(label,{tx,y+((image||file||link)?9:25),text_right,(image||count>1)?std::min(y+35,content_bottom):content_bottom},13,link?accent:ink);
-                if(chip_group){const D2D1_RECT_F chip{W-30-chip_width,y+7,W-30,y+25};Box(chip,dark?0x2b3a50:0xeef3fa,dark?0x3a4c66:0xdde6f2,9);Color(chip_group->color);target->FillEllipse(D2D1::Ellipse({chip.left+10,y+16},3.f,3.f),brush.Get());TextLine(chip_group->name,{chip.left+17,chip.top,chip.right-7,chip.bottom},10,muted);}
-                if(count>1){std::wstring detail;for(size_t k=0;k<std::min(size_t(2),names.size());++k){if(k)detail+=L"、";detail+=names[k];}if(count>2)detail+=L" 等";Text(detail,{tx,y+33,W-24,content_bottom},11,row_muted);}
-                if(image){const auto bytes=e->Bytes();Text(L"图片 · "+std::to_wstring((bytes+1023)/1024)+L" KB",{tx,y+35,W-24,std::min(y+55,content_bottom)},11,row_muted);}
-                SYSTEMTIME now{};GetLocalTime(&now);wchar_t time[64]{};
-                if(e->time.wYear==now.wYear&&e->time.wMonth==now.wMonth&&e->time.wDay==now.wDay)swprintf_s(time,L"今天 %02u:%02u",e->time.wHour,e->time.wMinute);
-                else swprintf_s(time,L"%02u/%02u %02u:%02u",e->time.wMonth,e->time.wDay,e->time.wHour,e->time.wMinute);
-                TextLine(time,{compact?33.f:tx,actions+9,W-221,actions+32},11,row_muted);
-                Box({W-95,actions+3,W-65,actions+29},dark?0x30435c:0xe7effb,dark?0x30435c:0xe7effb,6);
-                Icon(L'\xE8F4',W-216,actions,35,e->id,e->group!=0);Icon(L'\xE734',W-176,actions,31,e->id,e->favorite);Icon(L'\xE8C8',W-136,actions,32,e->id);Icon(L'\xE77F',W-96,actions,33,e->id);Icon(L'\xE74D',W-56,actions,34,e->id);
-                y+=h+10;
-            }
-            if(visible.empty()){Center(query.empty()?(TabGroup()?L"这个分组还是空的":tab==4?L"还没有收藏":L"还没有剪贴记录"):L"没有匹配的内容",{24,330+(H-744)/2,W-24,366+(H-744)/2},19,ink);Center(TabGroup()?(tab-4<=9?L"在其他标签选中记录按 Ctrl+"+std::to_wstring(tab-4)+L" 移入":std::wstring(L"右键记录，选择“移到分组”")):std::wstring(tab==4?L"点击记录上的星标，或按 Ctrl+D 收藏":L"复制文本、图片或文件后将在这里显示"),{24,373+(H-744)/2,W-24,417+(H-744)/2},14,muted);}
-            target->PopAxisAlignedClip();
-            if(visible.size()>static_cast<size_t>(PageRows())){const float track=ListBottom-ListTop;const float thumb=track*PageRows()/static_cast<float>(visible.size());const float top=ListTop+(track-thumb)*scroll/static_cast<float>(visible.size()-static_cast<size_t>(PageRows()));Box({W-8,top,W-5,top+thumb},0xb7c8df,0xb7c8df,2);}
-            Color(dark?0x3a4a60:0xe2e9f2);target->DrawLine({22,H-44},{W-22,H-44},brush.Get());Color(0x73b69b);target->FillEllipse(D2D1::Ellipse({27,H-24},2.5f,2.5f),brush.Get());TextLine(status.empty()?(history.groups.empty()?L"↑↓ 选择 · Enter 粘贴 · Shift+Enter 纯文本":L"↑↓ 选择 · Enter 粘贴 · Ctrl+1–9 移入分组 · Alt+←→ 切换"):status,{39,H-43,W-51,H-25},10,muted);TextLine(L"Ctrl+Shift+Enter 去除全部空白（含换行）",{39,H-25,W-22,H-8},10,muted);Icon(L'\xE76C',W-48,H-42,14);
+            DrawExpanded(bg);
         }
         if(menu_open&&expanded)DrawMore();if(popup_open&&expanded)DrawPopup();
         PaintSearch();
-        const auto hr=target->EndDraw();if(hr==D2DERR_RECREATE_TARGET){CancelReads();images.clear();file_bitmaps.clear();app_icon.Reset();brush.Reset();target.Reset();Invalidate();}else {CheckWin32(SUCCEEDED(hr),"Render clipboard");}
+        const auto hr=target->EndDraw();if(hr==D2DERR_RECREATE_TARGET){CancelReads();images.clear();file_bitmaps.clear();app_icon.Reset();brush.Reset();checker.Reset();target.Reset();Invalidate();}else {CheckWin32(SUCCEEDED(hr),"Render clipboard");}
     }
     void FinishCopy(const clipboard::Entry& entry,bool paste,HWND destination,DWORD process){
         if(test_mode){last_read_id=entry.id;status=L"测试模式：未改动系统剪贴板";return;}
         if(copy_quick&&!QuickDestinationValid()){CloseQuick();return;}
         const HWND foreground=GetForegroundWindow();
-        if(foreground!=window&&!IsChild(window,foreground)&&!((pinned||copy_quick)&&foreground==destination)){status=L"已取消：输入焦点已改变";Invalidate();return;}
+        if(foreground!=window&&!IsChild(window,foreground)&&!((pinned||copy_quick)&&foreground==destination)&&!(copy_stack&&(foreground==destination||!paste))){status=L"已取消：输入焦点已改变";Invalidate();return;}
         DWORD current_process{};if(paste&&(!IsWindow(destination)||destination==window||!GetWindowThreadProcessId(destination,&current_process)||current_process!=process)){status=L"原输入窗口已失效，请重新选择目标窗口";Invalidate();return;}
         if(!clipboard::Write(window,entry,copy_plain,copy_remove_whitespace)){status=L"剪贴板正忙或内容不可用，请重试";Invalidate();return;}
         sequence=GetClipboardSequenceNumber();status=L"已复制";Invalidate();
-        if(paste){ClosePreview();previous=destination;paste_target=destination;paste_focus=copy_focus;paste_process=process;paste_sequence=sequence;paste_wait=0;paste_keyboard=copy_keyboard;paste_quick=copy_quick;paste_activated=paste_returning=false;paste_inflight=true;SetTimer(EventWindow(),2,40,nullptr);}
+        if(paste){ClosePreview();previous=destination;paste_target=destination;paste_focus=copy_focus;paste_process=process;paste_sequence=sequence;paste_wait=0;paste_keyboard=copy_keyboard;paste_quick=copy_quick;paste_stack=copy_stack;paste_activated=paste_returning=false;paste_inflight=true;SetTimer(EventWindow(),2,40,nullptr);}
     }
-    void StopPaste(const wchar_t* message){KillTimer(EventWindow(),2);paste_inflight=paste_returning=paste_quick=false;status=message;UpdateQuick();Invalidate();}
+    void StopPaste(const wchar_t* message){KillTimer(EventWindow(),2);paste_inflight=paste_returning=paste_quick=paste_stack=false;status=message;UpdateQuick();Invalidate();}
     static bool PasteKeysHeld(){
         // Keep the triggering Enter (including its key-up/repeat) in our window.
         for(int key:{VK_RETURN,VK_LBUTTON,VK_RBUTTON,VK_CONTROL,VK_SHIFT,VK_MENU,VK_LWIN,VK_RWIN})if(GetAsyncKeyState(key)&0x8000)return true;
@@ -1331,6 +2133,8 @@ struct ClipboardPanel::Impl {
             // application and its input control must still own it throughout.
             paste_activated=true;
         }
+        // Stack pastes never activate anything either: the target kept focus.
+        if(paste_stack)paste_activated=true;
         if(paste_returning){
             // SendInput queues input; leave time for the target to consume it.
             // Never resend or claim that the receiving application accepted it.
@@ -1357,7 +2161,7 @@ struct ClipboardPanel::Impl {
             StopPaste(L"已取消：输入窗口已切换");return;
         }
         if(PasteKeysHeld())return;
-        if(!paste_quick&&!RestoreInputFocus()){StopPaste(L"无法恢复原输入位置，内容已复制，请手动粘贴");return;}
+        if(!paste_quick&&!paste_stack&&!RestoreInputFocus()){StopPaste(L"无法恢复原输入位置，内容已复制，请手动粘贴");return;}
         INPUT input[4]{};for(auto& i:input)i.type=INPUT_KEYBOARD;
         input[0].ki.wVk=VK_CONTROL;input[1].ki.wVk='V';input[2].ki.wVk='V';input[2].ki.dwFlags=KEYEVENTF_KEYUP;input[3].ki.wVk=VK_CONTROL;input[3].ki.dwFlags=KEYEVENTF_KEYUP;
         if(SendInput(4,input,sizeof(INPUT))!=4){StopPaste(L"目标不允许自动粘贴，请手动 Ctrl+V");return;}
@@ -1365,19 +2169,197 @@ struct ClipboardPanel::Impl {
         else if(pinned&&paste_keyboard){paste_returning=true;paste_return_at=GetTickCount64()+200;status=L"已发送粘贴请求…";Invalidate();}
         else StopPaste(pinned?L"已发送粘贴，可继续点击下一条":L"已发送粘贴请求");
     }
+    static float Ease(float t){return t*t*(3.f-2.f*t);}   // close to CSS `ease` for 120 ms
+    // full.html --ease-spring: cubic-bezier(.25,1.2,.4,1), slight overshoot.
+    static float SpringEase(float t){
+        const auto bezier=[](float a,float b,float u){const float v=1-u;return 3*v*v*u*a+3*v*u*u*b+u*u*u;};
+        float lo=0,hi=1,u=t;for(int i=0;i<24;++i){u=(lo+hi)/2;if(bezier(.25f,.4f,u)<t)lo=u;else hi=u;}
+        return bezier(1.2f,1.f,u);
+    }
+    static constexpr ULONGLONG NewMs=450;
+    void MarkNew(uint64_t id){if(!expanded||!fx_enabled||test_mode)return;new_id=id;new_tick=GetTickCount64();StartFx();}
+    CardFx& FxFor(uint64_t id,bool hot,bool active,bool acts){
+        auto& fx=card_fx[id];fx.hover_to=hot?1.f:0.f;fx.active_to=active?1.f:0.f;fx.acts_to=acts?1.f:0.f;
+        if(!fx_enabled||test_mode){fx.hover=fx.hover_to;fx.active=fx.active_to;fx.acts=fx.acts_to;}
+        else if(fx.hover!=fx.hover_to||fx.active!=fx.active_to||fx.acts!=fx.acts_to)StartFx();
+        return fx;
+    }
+    void StartFx(){if(fx_running||!window)return;fx_running=true;fx_tick=GetTickCount64();SetTimer(EventWindow(),13,USER_TIMER_MINIMUM,nullptr);}
+    void StopFx(){card_fx.clear();new_id=0;if(fx_running&&window)KillTimer(EventWindow(),13);fx_running=false;}
+    void FxTick(){
+        const ULONGLONG tick=GetTickCount64();const float step=std::min(1.f,static_cast<float>(tick-fx_tick)/120.f);fx_tick=tick;bool moving=false;
+        const auto toward=[&](float& v,float to){v=v<to?std::min(to,v+step):std::max(to,v-step);moving|=v!=to;};
+        for(auto it=card_fx.begin();it!=card_fx.end();){auto& fx=it->second;toward(fx.hover,fx.hover_to);toward(fx.active,fx.active_to);toward(fx.acts,fx.acts_to);
+            if(fx.hover==0&&fx.active==0&&fx.acts==0&&fx.hover_to==0&&fx.active_to==0&&fx.acts_to==0)it=card_fx.erase(it);else ++it;}
+        if(new_id){if(tick-new_tick>=NewMs)new_id=0;else moving=true;}
+        Invalidate();if(!moving){fx_running=false;if(window)KillTimer(EventWindow(),13);}
+    }
+    void SyncPreviewDetails(){
+        if(!preview.IsOpen())return;const auto* e=history.Find(preview.CurrentId());if(!e||e->kind!=clipboard::Kind::Image)return;
+        const auto size=NaturalImageSize(*e);const auto text=ocr_texts.find(e->id);
+        preview.SetImageDetails(e->id,{static_cast<LONG>(size.first),static_cast<LONG>(size.second)},text!=ocr_texts.end()?text->second:std::wstring{},static_cast<bool>(image_action),ocr_pending_id==e->id);
+    }
+    void ImageOcrResult(std::wstring text){
+        const uint64_t id=std::exchange(ocr_pending_id,uint64_t{});
+        if(id&&!text.empty()){ocr_texts[id]=std::move(text);while(ocr_texts.size()>32)ocr_texts.erase(ocr_texts.begin());}
+        status=id&&ocr_texts.count(id)?L"已识别文字并复制":L"未识别到文字";SyncPreviewDetails();Invalidate();
+    }
+    void SyncBulk(){const float want=clipboard::cards::ListTop+(msel.size()>1?BulkHeight+BulkGap:0.f);if(want!=ListTop){ListTop=want;BuildBlocks();ClampScroll();}}
+    std::vector<uint64_t> Marked()const{std::vector<uint64_t> out;for(const auto id:visible)if(msel.count(id))out.push_back(id);return out;}   // list order
+    void SelectRow(uint64_t id,bool ctrl,bool shift){
+        const auto it=std::find(visible.begin(),visible.end(),id);if(it==visible.end())return;const size_t i=static_cast<size_t>(it-visible.begin());
+        const auto current=std::find(visible.begin(),visible.end(),selected);
+        if(ctrl){
+            if(msel.empty()&&current!=visible.end()&&*current!=id)msel.insert(*current);   // like Explorer, the current card joins
+            if(!msel.erase(id))msel.insert(id);last_click=i;
+        }else if(shift){
+            size_t pivot=last_click.value_or(current!=visible.end()?static_cast<size_t>(current-visible.begin()):i);pivot=std::min(pivot,visible.size()-1);
+            for(size_t k=std::min(pivot,i);k<=std::max(pivot,i);++k)msel.insert(visible[k]);
+        }
+        selected=id;SyncBulk();if(preview.IsOpen())ShowPreview();Invalidate();
+    }
+    static std::vector<unsigned char> HdropBytes(const std::vector<std::filesystem::path>& paths){
+        std::wstring list;for(const auto& path:paths){list+=path.wstring();list.push_back(L'\0');}list.push_back(L'\0');
+        std::vector<unsigned char> bytes(sizeof(DROPFILES)+list.size()*sizeof(wchar_t));DROPFILES header{};header.pFiles=sizeof(DROPFILES);header.fWide=TRUE;
+        std::memcpy(bytes.data(),&header,sizeof(header));std::memcpy(bytes.data()+sizeof(header),list.data(),list.size()*sizeof(wchar_t));return bytes;
+    }
+    std::vector<std::filesystem::path> PathsOf(uint64_t id){
+        const auto* e=history.Find(id);if(!e)return {};std::vector<std::filesystem::path> paths;
+        if(auto loaded=LoadForDrag(*e))paths=clipboard::FilePaths(*loaded);
+        if(paths.empty())if(const auto* again=history.Find(id)){size_t start=0;const std::wstring& t=again->text;   // older entries may only carry the path text
+            while(start<t.size()){size_t end=t.find_first_of(L"\r\n",start);if(end==std::wstring::npos)end=t.size();
+                if(const auto line=clipboard::Trimmed(t.substr(start,end-start));!line.empty())paths.emplace_back(line);start=end+1;}}
+        return paths;
+    }
+    // Multi-drag: texts merge, files merge into one multi-file CF_HDROP; images only travel alone.
+    std::optional<clipboard::Entry> MergedSelection(uint64_t pressed){
+        const auto ids=Marked();bool files=false,texts=false;
+        for(const auto id:ids)if(const auto* e=history.Find(id)){if(e->kind==clipboard::Kind::Files)files=true;else if(e->kind==clipboard::Kind::Text)texts=true;}
+        if(!files&&!texts)return std::nullopt;
+        clipboard::Entry merged;merged.id=pressed;GetLocalTime(&merged.time);
+        if(files&&!texts){
+            std::vector<std::filesystem::path> paths;
+            for(const auto id:ids){const auto* e=history.Find(id);if(!e||e->kind!=clipboard::Kind::Files)continue;for(auto& path:PathsOf(id))if(std::find(paths.begin(),paths.end(),path)==paths.end())paths.push_back(std::move(path));}
+            if(paths.empty())return std::nullopt;
+            merged.kind=clipboard::Kind::Files;for(const auto& path:paths){if(!merged.text.empty())merged.text+=L"\r\n";merged.text+=path.wstring();}
+            merged.formats.push_back({CF_HDROP,HdropBytes(paths)});return merged;
+        }
+        merged.kind=clipboard::Kind::Text;merged.text=MergedText(ids);if(merged.text.empty())return std::nullopt;
+        const auto* b=reinterpret_cast<const unsigned char*>(merged.text.c_str());merged.formats.push_back({CF_UNICODETEXT,{b,b+(merged.text.size()+1)*sizeof(wchar_t)}});
+        return merged;
+    }
+    std::wstring MergedText(const std::vector<uint64_t>& ids){
+        std::wstring text;for(const auto id:ids){const auto* e=history.Find(id);if(!e||e->kind==clipboard::Kind::Image)continue;if(!text.empty())text+=L"\r\n";text+=e->text;}return text;
+    }
+    void CommitPendingDelete(){
+        if(pending_delete.empty())return;if(window)KillTimer(EventWindow(),14);
+        CancelReads();for(const auto id:pending_delete){history.Erase(id);images.erase(id);}pending_delete.clear();
+        if(disk)disk->Commit(history.entries,history.groups);ClearFileIcons();Filter();Invalidate();
+    }
+    void UndoDelete(){
+        if(pending_delete.empty())return;if(window)KillTimer(EventWindow(),14);
+        const size_t n=pending_delete.size();pending_delete.clear();Filter();status=L"已恢复 "+std::to_wstring(n)+L" 项";Invalidate();
+    }
+    // #bulk: 合并复制 50 · 收藏 51 · 删除 52 · ✕ 53; 撤销 54 (footer).
+    void BulkAction(int action){
+        if(action==54){UndoDelete();return;}
+        const auto ids=Marked();
+        if(action==53||ids.empty()){msel.clear();last_click.reset();SyncBulk();Invalidate();return;}
+        const std::wstring n=std::to_wstring(ids.size());
+        if(action==50){
+            const auto text=MergedText(ids);
+            if(text.empty()){status=L"图片不能合并复制";Invalidate();return;}
+            CopyText(text,(L"已合并复制 "+n+L" 项").c_str(),true);   // the merged text joins the history, as in full.html
+        }else if(action==51){
+            size_t done=0,blocked=0;
+            for(const auto id:ids){auto* e=history.Find(id);if(!e||e->favorite)continue;if(!history.CanProtect(*e)){++blocked;continue;}e->favorite=true;++done;}
+            if(disk)disk->Commit(history.entries,history.groups);
+            status=blocked?L"收藏和分组最多 200 条，已收藏 "+std::to_wstring(done)+L" 项":L"已收藏 "+n+L" 项";
+        }else if(action==52){
+            CommitPendingDelete();
+            if(std::find(ids.begin(),ids.end(),selected)!=ids.end()){
+                const auto it=std::find(visible.begin(),visible.end(),selected);uint64_t next=0;
+                for(auto k=it;k!=visible.end();++k)if(!msel.count(*k)){next=*k;break;}
+                if(!next)for(auto k=visible.begin();k!=it;++k)if(!msel.count(*k))next=*k;
+                selected=next;
+            }
+            pending_delete=ids;status=L"已删除 "+n+L" 项";
+            if(window&&!test_mode)SetTimer(EventWindow(),14,6000,nullptr);
+        }
+        msel.clear();last_click.reset();Filter(action!=50);SyncBulk();Invalidate();
+    }
+    // Copies derived text (paths, HEX) without recording it again as a new history entry.
+    void CopyText(const std::wstring& text,const wchar_t* done,bool record=false){
+        if(text.empty())return;
+        if(test_mode){last_copied_text=text;status=done;Invalidate();return;}
+        clipboard::Entry temp;temp.kind=clipboard::Kind::Text;temp.text=text;const auto* b=reinterpret_cast<const unsigned char*>(text.c_str());
+        temp.formats.push_back({CF_UNICODETEXT,{b,b+(text.size()+1)*sizeof(wchar_t)}});
+        if(!clipboard::Write(window,temp,false,false)){status=L"剪贴板正忙或内容不可用，请重试";Invalidate();return;}
+        if(!record)sequence=GetClipboardSequenceNumber();
+        status=done;Invalidate();
+    }
+    // New pins open beside the panel (left, else right), inside the work area.
+    POINT PinPointFor(const Frame& frame){
+        RECT panel_rect{};GetWindowRect(window,&panel_rect);MONITORINFO info{};info.cbSize=sizeof(info);GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&info);
+        const LONG w=static_cast<LONG>(frame.Width()),h=static_cast<LONG>(frame.Height());const RECT work=info.rcWork;
+        LONG x=panel_rect.left-w-16;if(x<work.left)x=panel_rect.right+16;if(x+w>work.right)x=std::max(work.left,work.right-w);
+        const LONG y=std::clamp<LONG>(panel_rect.top+static_cast<LONG>(ListTop*scale),work.top,std::max(work.top,work.bottom-h));
+        return {x,y};
+    }
+    // full.html actsFor(): type-specific card actions.
+    void CardAction(int action,uint64_t id){
+        const auto* e=history.Find(id);if(!e)return;selected=id;
+        if(action==45){Copy(id,true,true);return;}
+        if(action==44){if(const auto rgb=clipboard::ParseHexColor(e->text)){wchar_t hex[8]{};swprintf_s(hex,L"#%06X",*rgb&0xffffffu);CopyText(hex,L"已复制 HEX");}return;}
+        if(action==39){
+            std::wstring url=clipboard::Trimmed(e->text);if(!clipboard::LooksLikeLink(url)){status=L"不是有效的链接";Invalidate();return;}
+            if(url.rfind(L"http://",0)!=0&&url.rfind(L"https://",0)!=0)url=L"https://"+url;
+            if(test_mode)last_shell_target=url;else ShellExecuteW(nullptr,L"open",url.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+            status=L"已在默认浏览器中打开";Invalidate();return;}
+        auto loaded=LoadForDrag(*e);if(!loaded){status=L"读取记录失败，请重试";Invalidate();return;}
+        if(action==42||action==43){
+            auto paths=clipboard::FilePaths(*loaded);
+            if(paths.empty()){size_t start=0;const std::wstring& t=loaded->text;   // older entries may only carry the path text
+                while(start<t.size()){size_t end=t.find_first_of(L"\r\n",start);if(end==std::wstring::npos)end=t.size();
+                    if(const auto line=clipboard::Trimmed(t.substr(start,end-start));!line.empty())paths.emplace_back(line);start=end+1;}}
+            if(paths.empty()){status=L"文件已不存在";Invalidate();return;}
+            if(action==43){std::wstring text;for(const auto& path:paths){if(!text.empty())text+=L"\r\n";text+=path.wstring();}CopyText(text,L"已复制路径");return;}
+            std::error_code ec;if(!std::filesystem::exists(paths.front(),ec)){status=L"文件已不存在";Invalidate();return;}
+            if(test_mode)last_shell_target=paths.front().wstring();
+            else if(PIDLIST_ABSOLUTE item=ILCreateFromPathW(paths.front().c_str())){SHOpenFolderAndSelectItems(item,0,nullptr,0);ILFree(item);}
+            status=L"已在资源管理器中定位";Invalidate();return;}
+        if(action==36||action==37||action==38){
+            const auto frame=clipboard::DecodeFrame(*loaded);if(!frame){status=L"图片无法读取";Invalidate();return;}
+            const POINT at=PinPointFor(*frame);   // top-left; the pin handler takes the pin centre
+            if(action==36){status=pin_request&&pin_request(frame,{at.x+frame->Width()/2,at.y+frame->Height()/2})?L"已钉到桌面":L"钉图失败";Invalidate();return;}
+            const auto kind=action==37?ClipboardImageAction::Ocr:ClipboardImageAction::Annotate;
+            const bool ok=image_action&&image_action(kind,frame,at);
+            if(ok&&action==37){ocr_pending_id=e->id;SyncPreviewDetails();}
+            status=ok?(action==37?L"正在识别文字…":L"已打开标注"):(action==37?L"文字识别当前不可用":L"正在截图或标注，请稍后再试");
+            if(ok&&action==38&&!test_mode){Fold();return;}   // the edit session covers the screen
+            Invalidate();return;}
+    }
     void Copy(uint64_t id,bool paste,bool plain=false,bool keyboard=false,bool remove_whitespace=false){
         const auto* e=history.Find(id);if(!e||copy_pending||paste_inflight)return;
         if(plain&&e->kind!=clipboard::Kind::Text){status=L"纯文本粘贴仅支持文本记录";Invalidate();return;}
         if(pinned)RememberTarget(GetForegroundWindow());
-        copy_target=previous;copy_process=previous_process;copy_focus=previous_focus;copy_remove_whitespace=remove_whitespace;copy_plain=plain;copy_keyboard=keyboard;copy_quick=false;
+        copy_target=previous;copy_process=previous_process;copy_focus=previous_focus;copy_remove_whitespace=remove_whitespace;copy_plain=plain;copy_keyboard=keyboard;copy_quick=false;copy_stack=false;
         if(e->payload&&disk){copy_paste=paste;copy_pending=true;const auto token=++copy_token;
             if(!disk->Load(*e,token)){copy_pending=false;status=L"读取队列已满，请重试";}else status=paste?L"正在准备粘贴…（Esc 取消）":L"正在准备复制…（Esc 取消）";Invalidate();return;}
         FinishCopy(*e,paste,copy_target,copy_process);
     }
     void Action(int action,uint64_t id,bool keep_focus=false){
         if(action>=20&&action<25){SelectTab(action-20);return;}
+        if(action==26&&id>=1&&id<=6){SelectFlavor(static_cast<clipboard::Flavor>(id-1));return;}
+        if(action==15){SetPaused(!paused);return;}
         if(action==40){const int index=history.GroupIndex(static_cast<uint32_t>(id));if(index>=0)SelectTab(clipboard::History::GroupTabBase+index);return;}
         if(action==41){BeginNaming(1,0,0);return;}
+        if((action>=36&&action<=39)||(action>=42&&action<=45)){CardAction(action,id);return;}
+        if(action>=50&&action<=54){BulkAction(action);return;}
+        if(action==30){const WPARAM mods=std::exchange(click_mods,WPARAM{});
+            if(mods&(MK_CONTROL|MK_SHIFT)){SelectRow(id,(mods&MK_CONTROL)!=0,(mods&MK_SHIFT)!=0);return;}
+            if(!msel.empty()){msel.clear();SyncBulk();}
+            if(const auto it=std::find(visible.begin(),visible.end(),id);it!=visible.end())last_click=static_cast<size_t>(it-visible.begin());}
         if(action==35){OpenEntryPopupAtButton(id,false);return;}
         if(action==10){RememberTarget(GetForegroundWindow());pinned=!pinned;if(pinned&&summon_cursor){const RECT body=VisualBodyBounds();anchor={body.right,body.top};summon_cursor.reset();}UpdateActivationPolicy();
             DWORD process{};if(pinned&&!keep_focus&&IsWindow(previous)&&GetWindowThreadProcessId(previous,&process)&&process==previous_process)SetForegroundWindow(previous);
@@ -1400,13 +2382,13 @@ struct ClipboardPanel::Impl {
             // Deletion preserves the browsing viewport, even when the selected
             // row was scrolled offscreen. Only keyboard navigation reveals it.
             const auto top=std::find(visible.begin(),visible.end(),viewport_top);
-            scroll=std::clamp(top!=visible.end()?static_cast<int>(top-visible.begin()):previous_scroll,0,std::max(0,static_cast<int>(visible.size())-PageRows()));
+            if(top!=visible.end())ScrollToIndex(static_cast<int>(top-visible.begin()),Offset());else ScrollToIndex(previous_scroll);
             Invalidate();
         }
     }
     void RevealSelection(){
         const auto it=std::find(visible.begin(),visible.end(),selected);if(it==visible.end())return;
-        const int index=static_cast<int>(it-visible.begin());if(index<scroll)scroll=index;if(index>=scroll+PageRows())scroll=index-PageRows()+1;Invalidate();
+        const int index=static_cast<int>(it-visible.begin());RevealIndex(index);Invalidate();
     }
     void TogglePreview(){
         if(preview.IsOpen()){preview.Hide();return;}
@@ -1448,9 +2430,10 @@ struct ClipboardPanel::Impl {
         RECT rect{};GetWindowRect(window,&rect);
         clipboard::PreviewData data;data.image=preview_cache.Find(selected);
         const bool cached=data.image!=nullptr;
-        if(!cached)data.image=thumbnail_cache.Find(selected);
+        if(!cached){data.image=thumbnail_cache.Find(selected);data.interim=data.image!=nullptr;}
         preview.SetCopyAction([this,id=entry->id]{Copy(id,false);});
-        preview.Show(window,*entry,rect,dark,scale,std::move(data));
+        preview.SetOcrAction([this]{if(const uint64_t id=preview.CurrentId())CardAction(37,id);});
+        preview.Show(window,*entry,rect,dark,scale,std::move(data));SyncPreviewDetails();
         if(cached){PrefetchPreview();return;}
         if(entry->payload&&disk){
             if(!RequestPreview(*entry)){
@@ -1472,8 +2455,10 @@ struct ClipboardPanel::Impl {
         if(menu_open){MenuKey(key);return;}
         if(popup_open&&PopupKey(key))return;
         if(naming){if(key==VK_ESCAPE)CancelNaming();else if(key==VK_RETURN)CommitNaming();return;}
+        if(key==VK_ESCAPE&&!msel.empty()){BulkAction(53);return;}
         if(key==VK_ESCAPE){if(preview.IsOpen()){preview.Hide();return;}const HWND destination=previous;Fold();if(!test_mode&&IsWindow(destination))SetForegroundWindow(destination);return;}
         const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+        if(key=='O'&&!ctrl&&preview.IsOpen()&&image_action)if(const auto* e=history.Find(preview.CurrentId());e&&e->kind==clipboard::Kind::Image){swallow_char=true;CardAction(37,e->id);return;}
         if(key==VK_TAB){SetFocus(search);return;}
         if(ctrl&&key=='F'){SetFocus(search);SendMessageW(search,EM_SETSEL,0,-1);return;}
         if(ctrl&&key=='D'){Action(31,selected);return;}
@@ -1486,6 +2471,9 @@ struct ClipboardPanel::Impl {
             AssignGroup(selected,history.groups[index].id);return;
         }
         if(ctrl&&key=='G'){if(history.Find(selected))OpenEntryPopupAtButton(selected,true);else{status=L"请先选择一条记录";Invalidate();}return;}
+        if(ctrl&&key=='A'&&visible.size()>1){msel.insert(visible.begin(),visible.end());SyncBulk();Invalidate();return;}
+        if(ctrl&&key=='Z'&&!pending_delete.empty()){UndoDelete();return;}
+        if(msel.size()>1&&((ctrl&&key=='C')||key==VK_DELETE)){BulkAction(key==VK_DELETE?52:50);return;}
         if(ctrl&&key=='C'){Copy(selected,false);return;}if(key==VK_RETURN){Copy(selected,true,(GetKeyState(VK_SHIFT)&0x8000)!=0,true,ctrl&&(GetKeyState(VK_SHIFT)&0x8000)!=0);return;}
         if(key==VK_DELETE){Action(34,selected);return;}
         if(key==VK_SPACE){SetFocus(window);TogglePreview();return;}
@@ -1497,7 +2485,7 @@ struct ClipboardPanel::Impl {
             const int next=key==VK_HOME?0:key==VK_END?static_cast<int>(visible.size())-1:std::clamp(index+(key==VK_NEXT?PageRows():-PageRows()),0,static_cast<int>(visible.size())-1);
             ++copy_token;copy_pending=false;selected=visible[static_cast<size_t>(next)];RevealSelection();if(preview.IsOpen())ShowPreview();else PrefetchPreview();Invalidate();return;
         }
-        if(key==VK_UP||key==VK_DOWN){SetFocus(window);++copy_token;copy_pending=false;if(visible.empty())return;const auto it=std::find(visible.begin(),visible.end(),selected);int index=static_cast<int>(it-visible.begin());index=std::clamp(index+(key==VK_DOWN?1:-1),0,static_cast<int>(visible.size())-1);selected=visible[static_cast<size_t>(index)];if(index<scroll)scroll=index;if(index>=scroll+PageRows())scroll=index-PageRows()+1;if(preview.IsOpen())ShowPreview();else PrefetchPreview();Invalidate();}
+        if(key==VK_UP||key==VK_DOWN){SetFocus(window);++copy_token;copy_pending=false;if(visible.empty())return;const auto it=std::find(visible.begin(),visible.end(),selected);int index=static_cast<int>(it-visible.begin());index=std::clamp(index+(key==VK_DOWN?1:-1),0,static_cast<int>(visible.size())-1);selected=visible[static_cast<size_t>(index)];RevealIndex(index);if(preview.IsOpen())ShowPreview();else PrefetchPreview();Invalidate();}
     }
     static LRESULT CALLBACK SearchProc(HWND w,UINT m,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data){
         auto* p=reinterpret_cast<Impl*>(data);
@@ -1546,7 +2534,7 @@ struct ClipboardPanel::Impl {
         }
         // Parked native HWND remains the stable async/controller endpoint.
         if(p->switching_window||(w!=p->window&&m!=WM_NCCREATE)){
-            const bool service=m==clipboard::SessionStoreReady||m==clipboard::FileIconReady||m==WM_CLIPBOARDUPDATE||m==WM_HOTKEY||m==WM_TIMER||m==clipboard::QuickKeyMessage||m==clipboard::QuickWheelMessage||m==clipboard::QuickDismissMessage||m==WM_COMMAND||m==WM_CTLCOLOREDIT||(m==WM_SETTINGCHANGE&&w==p->EventWindow());
+            const bool service=m==StackRefreshMessage||m==clipboard::SessionStoreReady||m==clipboard::FileIconReady||m==WM_CLIPBOARDUPDATE||m==WM_HOTKEY||m==WM_TIMER||m==clipboard::QuickKeyMessage||m==clipboard::QuickWheelMessage||m==clipboard::QuickDismissMessage||m==WM_COMMAND||m==WM_CTLCOLOREDIT||(m==WM_SETTINGCHANGE&&w==p->EventWindow());
             if(!service){
                 if(m==WM_NCCALCSIZE&&wp)return 0;
                 if(m==WM_ERASEBKGND)return 1;
@@ -1576,27 +2564,28 @@ struct ClipboardPanel::Impl {
         case clipboard::QuickKeyMessage:if(p->quick_active)p->QuickKey(wp,(lp&1)!=0);return 0;
         case clipboard::QuickWheelMessage:if(p->quick_active&&p->quick&&p->QuickDestinationValid())SendMessageW(p->quick->Window(),WM_MOUSEWHEEL,wp,lp);return 0;
         case clipboard::QuickDismissMessage:p->CloseQuick();return 0;
-        case WM_TIMER:if(wp==10){p->OpeningTick(GetTickCount64());return 0;}if(wp==9){p->LiquidDragTick(GetTickCount64());return 0;}if(wp==8){p->ShortcutFocusTick();return 0;}if(wp==7){if(p->quick_active&&(!p->QuickDestinationValid()||p->hotkeys_suspended||(p->hotkey_allowed&&!p->hotkey_allowed())))p->CloseQuick();return 0;}if(wp==6){KillTimer(w,6);if(p->status==L"已固定 · F2 取消固定"||p->status==L"已取消固定 · F2 固定面板"){p->status.clear();p->Invalidate();}return 0;}if(wp==5){KillTimer(w,5);return 0;}if(wp==4){KillTimer(w,4);if(!p->expanded&&!p->opening&&!p->liquid_drag_active){if(p->composition)p->composition->TrimIdle();p->parked_composition.reset();p->ReleaseRenderer();if(p->idle_layered)ClipboardComposition::DropPrewarm();else SetTimer(w,11,IdleStripDelayMs,nullptr);}return 0;}if(wp==11){KillTimer(w,11);if(!p->expanded&&!p->opening&&!p->liquid_drag_active){p->ReleaseRenderer();p->EnterIdleStrip();if(p->idle_layered)ClipboardComposition::DropPrewarm();}return 0;}if(wp==3){if(GetFocus()==p->search){p->caret_on=!p->caret_on;p->Invalidate();}else KillTimer(w,3);return 0;}if(wp==1)p->Read();if(wp==2)p->PasteTick();return 0;
-        case WM_LBUTTONDOWN:p->RememberTarget(GetForegroundWindow());p->paste_click.reset();if(p->popup_open){const float mx=GET_X_LPARAM(lp)/p->scale,my=GET_Y_LPARAM(lp)/p->scale;if(p->InsidePopup(mx,my)){const int row=p->PopupHit(mx,my);if(row>=0)p->ChoosePopup(row);}else p->ClosePopup();return 0;}if(p->menu_open){const float mx=GET_X_LPARAM(lp)/p->scale,my=GET_Y_LPARAM(lp)/p->scale;const int row=p->MenuHit(mx,my);if(row>=0)p->ChooseMore(row);else if(mx<p->W-264||mx>p->W-16||my<64||my>252)p->CloseMore();return 0;}{const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;if(p->expanded&&p->visible.size()>static_cast<size_t>(p->PageRows())&&x>=p->W-12&&y>=p->ListTop&&y<=p->ListBottom){p->BeginScroll(y);return 0;}if(!p->expanded||p->HeaderDragHit(x,y)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ClientToScreen(w,&point);p->BeginDrag(point);return 0;}}if(!p->pinned||GetForegroundWindow()==w)SetFocus(w);for(auto it=p->hits.rbegin();it!=p->hits.rend();++it){const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;const auto r=it->rect;if(x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom){const auto h=*it;if(p->pinned&&(h.action==30||h.action==33)&&!p->preview.IsOpen())p->paste_click=h;else p->Action(h.action,h.id);break;}}return 0;
-        case WM_LBUTTONUP:if(p->paste_click){const auto hit=*p->paste_click;p->paste_click.reset();const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;if(x>=hit.rect.left&&x<hit.rect.right&&y>=hit.rect.top&&y<hit.rect.bottom)p->Action(hit.action,hit.id);return 0;}if(p->scroll_drag){p->ScrollAt(GET_Y_LPARAM(lp)/p->scale);p->scroll_drag=false;ReleaseCapture();return 0;}if(p->drag_pending){p->EndDrag();return 0;}break;
+        case WM_TIMER:if(wp==13){p->FxTick();return 0;}if(wp==14){KillTimer(w,14);p->CommitPendingDelete();return 0;}if(wp==12){p->ScrollAnimTick();return 0;}if(wp==10){p->OpeningTick(GetTickCount64());return 0;}if(wp==9){p->LiquidDragTick(GetTickCount64());return 0;}if(wp==8){p->ShortcutFocusTick();return 0;}if(wp==7){if(p->quick_active&&(!p->QuickDestinationValid()||p->hotkeys_suspended||(p->hotkey_allowed&&!p->hotkey_allowed())))p->CloseQuick();return 0;}if(wp==6){KillTimer(w,6);if(p->status==L"已固定 · F2 取消固定"||p->status==L"已取消固定 · F2 固定面板"){p->status.clear();p->Invalidate();}return 0;}if(wp==5){KillTimer(w,5);return 0;}if(wp==4){KillTimer(w,4);if(!p->expanded&&p->stack){p->composition.reset();p->parked_composition.reset();p->ReleaseRenderer();ClipboardComposition::DropPrewarm();return 0;}if(!p->expanded&&!p->opening&&!p->liquid_drag_active){if(p->composition)p->composition->TrimIdle();p->parked_composition.reset();p->ReleaseRenderer();if(p->idle_layered)ClipboardComposition::DropPrewarm();else SetTimer(w,11,IdleStripDelayMs,nullptr);}return 0;}if(wp==11){KillTimer(w,11);if(!p->expanded&&!p->opening&&!p->liquid_drag_active){p->ReleaseRenderer();p->EnterIdleStrip();if(p->idle_layered)ClipboardComposition::DropPrewarm();}return 0;}if(wp==3){if(GetFocus()==p->search){p->caret_on=!p->caret_on;p->Invalidate();}else KillTimer(w,3);return 0;}if(wp==1)p->Read();if(wp==2)p->PasteTick();return 0;
+        case WM_LBUTTONDOWN:p->RememberTarget(GetForegroundWindow());p->paste_click.reset();if(p->popup_open){const float mx=GET_X_LPARAM(lp)/p->scale,my=GET_Y_LPARAM(lp)/p->scale;if(p->InsidePopup(mx,my)){const int row=p->PopupHit(mx,my);if(row>=0)p->ChoosePopup(row);}else p->ClosePopup();return 0;}if(p->menu_open){const float mx=GET_X_LPARAM(lp)/p->scale,my=GET_Y_LPARAM(lp)/p->scale;const int row=p->MenuHit(mx,my);if(row>=0)p->ChooseMore(row);else if(mx<p->W-264||mx>p->W-16||my<64||my>252)p->CloseMore();return 0;}{const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;if(p->expanded&&x>=p->W-9&&y>=p->ListTop&&y<=p->ListBottom&&p->MaxScrollPx()>0){p->BeginScroll(y);return 0;}if(!p->expanded||p->HeaderDragHit(x,y)){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ClientToScreen(w,&point);p->BeginDrag(point);return 0;}}if(!p->pinned||GetForegroundWindow()==w)SetFocus(w);for(auto it=p->hits.rbegin();it!=p->hits.rend();++it){const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;const auto r=it->rect;if(x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom){const auto h=*it;if(h.action==30&&p->expanded){POINT at{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ClientToScreen(w,&at);p->row_press=RowPress{h.id,at};}p->click_mods=h.action==30?(wp&(MK_CONTROL|MK_SHIFT)):0;if(p->pinned&&(h.action==30||h.action==33)&&!p->preview.IsOpen()&&!p->click_mods)p->paste_click=h;else p->Action(h.action,h.id);break;}}return 0;
+        case WM_LBUTTONUP:p->row_press.reset();if(p->paste_click){const auto hit=*p->paste_click;p->paste_click.reset();const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;if(x>=hit.rect.left&&x<hit.rect.right&&y>=hit.rect.top&&y<hit.rect.bottom)p->Action(hit.action,hit.id);return 0;}if(p->scroll_drag){p->ScrollAt(GET_Y_LPARAM(lp)/p->scale);p->scroll_drag=false;ReleaseCapture();return 0;}if(p->drag_pending){p->EndDrag();return 0;}break;
         case WM_CAPTURECHANGED:case WM_CANCELMODE:p->paste_click.reset();p->drag_pending=p->scroll_drag=false;p->ReleaseLiquidDrag();p->CancelDismiss();p->CloseMore();p->ClosePopup();return 0;
-        case WM_MOUSEMOVE:{if(w==p->folded_window&&!p->expanded){if(p->idle_layered)ClipboardComposition::Prewarm();SetTimer(p->EventWindow(),4,10000,nullptr);}if(p->scroll_drag){p->ScrollAt(GET_Y_LPARAM(lp)/p->scale);return 0;}if(p->menu_open){const int row=p->MenuHit(GET_X_LPARAM(lp)/p->scale,GET_Y_LPARAM(lp)/p->scale);if(row!=p->menu_hover){p->menu_hover=row;p->Invalidate();}return 0;}if(p->popup_open){const int row=p->PopupHit(GET_X_LPARAM(lp)/p->scale,GET_Y_LPARAM(lp)/p->scale);if(row!=p->popup_hover){p->popup_hover=row;p->Invalidate();}return 0;}if(p->drag_pending){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ClientToScreen(w,&point);p->Drag(point);return 0;}int hit=-1;const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;for(size_t i=0;i<p->hits.size();++i){const auto r=p->hits[i].rect;if(x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom)hit=static_cast<int>(i);}if(hit!=p->hover){p->hover=hit;const wchar_t* hint=L"";if(hit>=0){switch(p->hits[static_cast<size_t>(hit)].action){case 31:hint=L"收藏 / 取消收藏 · Ctrl+D";break;case 32:hint=L"复制内容 · Ctrl+C";break;case 33:hint=L"Enter 粘贴 · Shift+Enter 纯文本";break;case 34:hint=L"删除记录 · Delete";break;case 35:hint=L"移到分组 · Ctrl+G · Ctrl+1–9";break;case 40:hint=L"右键可重命名、更换颜色或删除分组";break;case 41:hint=L"新建分组 · Ctrl+Shift+N";break;case 10:hint=L"固定 / 取消固定面板 · F2";break;case 14:hint=L"折叠到屏幕边缘 · Esc";break;default:break;}}p->status=hint;p->Invalidate();}return 0;}
-        case WM_MOUSEWHEEL:if(p->preview.ForwardWheel(wp,lp))return 0;if(p->menu_open||p->popup_open)return 0;{POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(w,&point);const float x=point.x/p->scale,y=point.y/p->scale;if(p->expanded&&y>=130&&y<168&&x<p->W-92){p->tab_scroll=std::clamp(p->tab_scroll-GET_WHEEL_DELTA_WPARAM(wp)/static_cast<float>(WHEEL_DELTA)*48.f,0.f,p->tab_scroll_max);p->Invalidate();return 0;}}p->scroll=std::clamp(p->scroll-GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA,0,std::max(0,static_cast<int>(p->visible.size())-p->PageRows()));p->Invalidate();return 0;
+        case WM_MOUSEMOVE:{if(p->row_press&&p->RowDragMove())return 0;if(w==p->folded_window&&!p->expanded){if(p->idle_layered)ClipboardComposition::Prewarm();SetTimer(p->EventWindow(),4,10000,nullptr);}if(p->scroll_drag){p->ScrollAt(GET_Y_LPARAM(lp)/p->scale);return 0;}if(p->menu_open){const int row=p->MenuHit(GET_X_LPARAM(lp)/p->scale,GET_Y_LPARAM(lp)/p->scale);if(row!=p->menu_hover){p->menu_hover=row;p->Invalidate();}return 0;}if(p->popup_open){const int row=p->PopupHit(GET_X_LPARAM(lp)/p->scale,GET_Y_LPARAM(lp)/p->scale);if(row!=p->popup_hover){p->popup_hover=row;p->Invalidate();}return 0;}if(p->drag_pending){POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ClientToScreen(w,&point);p->Drag(point);return 0;}int hit=-1;const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;for(size_t i=0;i<p->hits.size();++i){const auto r=p->hits[i].rect;if(x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom)hit=static_cast<int>(i);}if(hit!=p->hover){p->hover=hit;const wchar_t* hint=L"";if(hit>=0){switch(p->hits[static_cast<size_t>(hit)].action){case 31:hint=L"收藏 / 取消收藏 · Ctrl+D";break;case 32:hint=L"复制内容 · Ctrl+C";break;case 33:hint=L"Enter 粘贴 · Shift+Enter 纯文本";break;case 34:hint=L"删除记录 · Delete";break;case 36:hint=L"钉到桌面";break;case 37:hint=L"识别图中文字并复制";break;case 38:hint=L"标注后钉到桌面";break;case 39:hint=L"用默认浏览器打开";break;case 42:hint=L"在资源管理器中显示";break;case 43:hint=L"复制文件路径";break;case 44:hint=L"复制 HEX 色值";break;case 45:hint=L"纯文本粘贴 · Shift+Enter";break;case 50:hint=L"按列表顺序合并文本并复制 · Ctrl+C";break;case 52:hint=L"删除所选 · Delete，可撤销";break;case 53:hint=L"取消多选 · Esc";break;case 54:hint=L"恢复刚删除的记录 · Ctrl+Z";break;case 35:hint=L"移到分组 · Ctrl+G · Ctrl+1–9";break;case 40:hint=L"右键可重命名、更换颜色或删除分组";break;case 41:hint=L"新建分组 · Ctrl+Shift+N";break;case 10:hint=L"固定 / 取消固定面板 · F2";break;case 15:hint=L"暂停后已有历史保留，仍可搜索和粘贴";break;case 26:hint=L"按内容类型筛选";break;case 14:hint=L"折叠到屏幕边缘 · Esc";break;default:break;}}p->status=hint;p->Invalidate();}return 0;}
+        case WM_MOUSEWHEEL:if(p->preview.ForwardWheel(wp,lp))return 0;if(p->menu_open||p->popup_open)return 0;{POINT point{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(w,&point);const float x=point.x/p->scale,y=point.y/p->scale;if(p->expanded&&y>=clipboard::cards::ChipTop-2&&y<clipboard::cards::ChipBottom+4&&x<p->W-70){p->tab_scroll=std::clamp(p->tab_scroll-GET_WHEEL_DELTA_WPARAM(wp)/static_cast<float>(WHEEL_DELTA)*48.f,0.f,p->tab_scroll_max);p->Invalidate();return 0;}}p->WheelScroll(GET_WHEEL_DELTA_WPARAM(wp));return 0;
         case WM_KEYDOWN:{const bool ctrl_key=(GetKeyState(VK_CONTROL)&0x8000)&&(wp=='D'||wp=='G'||wp=='N'||(wp>='0'&&wp<='9'));if((wp!=VK_SPACE&&wp!=VK_F2&&wp!=VK_RETURN&&!ctrl_key)||!(lp&(1LL<<30)))p->Key(wp);return 0;}
         case WM_SYSKEYDOWN:if((wp==VK_LEFT||wp==VK_RIGHT)&&p->expanded&&!p->naming){p->Key(wp);return 0;}break;
         case WM_RBUTTONUP:{const float x=GET_X_LPARAM(lp)/p->scale,y=GET_Y_LPARAM(lp)/p->scale;if(p->popup_open){p->ClosePopup();return 0;}if(p->menu_open){p->CloseMore();return 0;}if(!p->expanded)return 0;
             for(auto it=p->hits.rbegin();it!=p->hits.rend();++it){const auto r=it->rect;if(x<r.left||x>=r.right||y<r.top||y>=r.bottom)continue;
                 if(it->action==40){p->OpenGroupPopup(static_cast<uint32_t>(it->id),x-12,r.bottom+4);return 0;}
                 if(it->action==41){p->BeginNaming(1,0,0);return 0;}
-                if(it->action>=30&&it->action<=35&&it->id){p->RememberTarget(GetForegroundWindow());p->OpenEntryPopup(it->id,x-12,y+6,false,y-6);return 0;}
+                if(p->IsCardAction(it->action)&&it->id){p->RememberTarget(GetForegroundWindow());p->OpenEntryPopup(it->id,x-12,y+6,false,y-6);return 0;}
                 break;}
             return 0;}
-        case WM_CHAR:if(p->menu_open||p->popup_open||wp==L' ')return 0;if(wp>32&&!(GetKeyState(VK_CONTROL)&0x8000)){SetFocus(p->search);SendMessageW(p->search,m,wp,lp);}return 0;
-        case WM_COMMAND:if(LOWORD(wp)==201&&HIWORD(wp)==EN_CHANGE&&p->naming){p->Invalidate();return 0;}if(LOWORD(wp)==201&&HIWORD(wp)==EN_CHANGE){wchar_t text[513]{};GetWindowTextW(p->search,text,513);p->query=text;p->scroll=0;p->Filter();}return 0;
+        case WM_CHAR:if(std::exchange(p->swallow_char,false))return 0;if(p->menu_open||p->popup_open||wp==L' ')return 0;if(wp>32&&!(GetKeyState(VK_CONTROL)&0x8000)){SetFocus(p->search);SendMessageW(p->search,m,wp,lp);}return 0;
+        case WM_COMMAND:if(LOWORD(wp)==201&&HIWORD(wp)==EN_CHANGE&&p->naming){p->Invalidate();return 0;}if(LOWORD(wp)==201&&HIWORD(wp)==EN_CHANGE){wchar_t text[513]{};GetWindowTextW(p->search,text,513);p->query=text;p->scroll=0;p->scroll_offset=0;p->Filter();}return 0;
         case WM_CTLCOLOREDIT:SetTextColor(reinterpret_cast<HDC>(wp),p->dark?RGB(231,239,251):RGB(40,51,70));SetBkColor(reinterpret_cast<HDC>(wp),p->dark?RGB(31,40,55):RGB(255,255,255));return reinterpret_cast<LRESULT>(p->edit_brush);
         case WM_ACTIVATE:if(LOWORD(wp)==WA_INACTIVE){p->CloseMore();p->ClosePopup();}p->RememberTarget(GetForegroundWindow());if(LOWORD(wp)==WA_INACTIVE&&p->expanded&&!p->pinned&&!p->drag_pending&&!p->resizing&&!p->preview.OwnsWindow(reinterpret_cast<HWND>(lp)))p->Fold();return 0;
         case WM_DPICHANGED:case WM_DISPLAYCHANGE:if(p->liquid_placing){PostMessageW(w,WM_APP+184,m==WM_DPICHANGED,0);return 0;}p->ReflowLiquid(m==WM_DPICHANGED);return 0;
         case WM_APP+184:p->ReflowLiquid(wp!=0);return 0;
+        case StackRefreshMessage:p->stack_refresh_queued=false;p->RefreshStack();return 0;
         case WM_CLOSE:p->Fold();return 0;
         case WM_DESTROY:p->liquid_drag_active=p->liquid_drag_timer=false;KillTimer(w,9);KillTimer(w,5);RemoveClipboardFormatListener(w);UnregisterHotKey(w,1);KillTimer(w,1);KillTimer(w,2);KillTimer(w,3);KillTimer(w,4);return 0;
         case WM_NCDESTROY:if(w==p->window)p->window=nullptr;break;
@@ -1615,5 +2604,11 @@ bool ClipboardPanel::SetPersistent(bool persistent){return impl_->SetPersistent(
 void ClipboardPanel::Show(){impl_->Show();}
 void ClipboardPanel::SetHotkeysSuspended(bool suspended){impl_->SetHotkeysSuspended(suspended);}
 void ClipboardPanel::SetStripVisible(bool visible){impl_->SetStripVisible(visible);}
+void ClipboardPanel::SetHistoryLimit(size_t entries){impl_->SetHistoryLimit(entries);}
+void ClipboardPanel::SetStripStyle(bool classic){impl_->SetStripStyle(classic);}
+void ClipboardPanel::SetCardPreview(bool show){impl_->SetCardPreview(show);}
 void ClipboardPanel::SetStripDismissedHandler(std::function<void()> handler){impl_->strip_dismissed=std::move(handler);}
+void ClipboardPanel::SetPinHandler(std::function<bool(std::shared_ptr<const Frame>,POINT)> handler){impl_->pin_request=std::move(handler);}
+void ClipboardPanel::SetImageOcrResult(std::wstring text){impl_->ImageOcrResult(std::move(text));}
+void ClipboardPanel::SetImageActionHandler(std::function<bool(ClipboardImageAction,std::shared_ptr<const Frame>,POINT)> handler){impl_->image_action=std::move(handler);impl_->Invalidate();}
 }

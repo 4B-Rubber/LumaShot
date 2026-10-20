@@ -17,6 +17,10 @@ struct TranslationView {
     translate::Language requested{translate::Language::Auto}; // user choice for this pin (Auto = rule)
     std::vector<std::wstring> sources, results;
     bool show_translation{true}, dark{};
+    // Selection translation: no image to toggle, a pin (keep open) switch
+    // instead, Idle shows `error` as the reason nothing was read, and the
+    // height follows the content.
+    bool text_mode{}, pinned{};
 };
 
 class TranslationPanel {
@@ -25,6 +29,7 @@ public:
         std::function<void(bool)> show_translation;
         std::function<void(translate::Language)> retarget;
         std::function<void()> retry, settings, closed;
+        std::function<void(bool)> pinned;   // text mode only
     };
     TranslationPanel(HWND owner, Callbacks callbacks);
     ~TranslationPanel();
@@ -33,6 +38,10 @@ public:
     void Update(const TranslationView& view);
     // anchor = the pin's visible paper in screen pixels.
     void Place(RECT anchor);
+    // Text mode: below-right of a screen point (physical pixels), flipped to
+    // stay inside the work area. Later height changes keep this anchor until
+    // the user drags the panel by its header.
+    void PlaceNear(POINT point);
     void Show();
     void Hide();
     bool Visible() const;

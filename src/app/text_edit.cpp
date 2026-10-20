@@ -8,10 +8,12 @@
 #include <cmath>
 #include <utility>
 #include <windowsx.h>
+#include <cwctype>
 
 namespace lumashot {
 namespace {
 constexpr UINT kFinishText=WM_APP+21;
+constexpr UINT_PTR kCaretBlink=1;
 COLORREF NativeColor(uint32_t color){return RGB((color>>16)&255,(color>>8)&255,color&255);}
 std::wstring EditorText(HWND editor){
     const int length=GetWindowTextLengthW(editor);
@@ -67,7 +69,10 @@ void Application::BeginText(View& view,Point p,int existing,bool badge_label){
     edit_min_height_=std::min(edit_max_height_,mark&&!badge_label?std::max(line_height,int(std::ceil(box.bottom-box.top))):line_height);
     edit_index_=existing;edit_point_=p;edit_owner_=view.window;
     edit_previous_hint_=state_.hint;
-    state_.hint=badge_label?L"自定义标签 · Enter 确认 · Esc 取消 · 留空恢复自动序号":L"编辑文字 · Enter 完成 · Shift+Enter 换行 · Esc 取消本次修改";
+    // In-place text has no hint bar; only the toolbar label popup explains itself.
+    if(badge_label)state_.hint=L"自定义标签 · Enter 确认 · Esc 取消 · 留空恢复自动序号";
+    edit_wrap_width_=float(width);edit_base_.reset();if(mark&&!badge_label)edit_base_=*mark;
+    edit_ime_cursor_=-1;edit_anchor_=0;edit_selecting_=false;state_.text_edit={};
     edit_work_=view.bounds;
     edit_initializing_=true;edit_composing_=false;
     try{
@@ -77,17 +82,28 @@ void Application::BeginText(View& view,Point p,int existing,bool badge_label){
         CheckWin32(RegisterClassW(&wc)!=0||GetLastError()==ERROR_CLASS_ALREADY_EXISTS,"Register text editor");
         edit_backdrop_=CreateSolidBrush(NativeColor(edit_surface_color_));
         CheckWin32(edit_backdrop_!=nullptr,"Create text editor background");
-        edit_frame_=std::make_unique<TextEditorFrame>();
-        edit_frame_->Create(view.window,[this]{const HWND owner=edit_owner_;CommitText();SetFocus(owner);},badge_label);
-        const RECT editor_bounds=edit_frame_->Arrange(p,{width,edit_min_height_},edit_work_,scale,state_.dark);
-        // A separate owned HWND is essential: flip-model DXGI presentation can
-        // cover GDI child controls and their carets inside the overlay HWND.
-        edit_host_=CreateWindowExW(WS_EX_TOOLWINDOW,L"LumaShot.TextEditor",badge_label?L"自定义标签 · Enter 确认，留空恢复序号，Esc 取消":L"文字编辑 · Enter 完成，Shift+Enter 换行，Esc 取消",
-            WS_POPUP|WS_CLIPCHILDREN,editor_bounds.left,editor_bounds.top,width,edit_min_height_,edit_frame_->Window(),nullptr,instance,this);
+        const int field_height=badge_label?edit_min_height_:edit_max_height_;
+        if(badge_label){
+            edit_frame_=std::make_unique<TextEditorFrame>();
+            edit_frame_->Create(view.window,[this]{const HWND owner=edit_owner_;CommitText();SetFocus(owner);},badge_label);
+            const RECT editor_bounds=edit_frame_->Arrange(p,{width,edit_min_height_},edit_work_,scale,state_.dark);
+            // A separate owned HWND is essential: flip-model DXGI presentation can
+            // cover GDI child controls and their carets inside the overlay HWND.
+            edit_host_=CreateWindowExW(WS_EX_TOOLWINDOW,L"LumaShot.TextEditor",L"自定义标签 · Enter 确认，留空恢复序号，Esc 取消",
+                WS_POPUP|WS_CLIPCHILDREN,editor_bounds.left,editor_bounds.top,width,edit_min_height_,edit_frame_->Window(),nullptr,instance,this);
+        }else{
+            // In-place editing: the native EDIT only supplies input (IME, caret
+            // movement, clipboard, undo). Its host sits over the text with the
+            // same wrap width, is practically transparent and lets every mouse
+            // event fall through to the canvas, which paints the live text.
+            edit_host_=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TRANSPARENT,L"LumaShot.TextEditor",L"文字编辑 · Enter 完成，Shift+Enter 换行，Esc 取消",
+                WS_POPUP|WS_CLIPCHILDREN,int(std::lround(p.x)),int(std::lround(p.y)),width,field_height,view.window,nullptr,instance,this);
+            if(edit_host_)CheckWin32(SetLayeredWindowAttributes(edit_host_,0,1,LWA_ALPHA)!=FALSE,"Hide text input host");
+        }
         CheckWin32(edit_host_!=nullptr,"Create text editor host");
         const DWORD alignment=edit_align_==TextAlign::Center?ES_CENTER:(edit_align_==TextAlign::Right?ES_RIGHT:ES_LEFT);
         edit_=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|(badge_label?ES_AUTOHSCROLL:(ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN))|alignment,
-            0,0,width,edit_min_height_,edit_host_,nullptr,instance,nullptr);
+            0,0,width,field_height,edit_host_,nullptr,instance,nullptr);
         CheckWin32(edit_!=nullptr,"Create text editor");
         edit_font_=CreateFontW(-std::max(1,int(std::lround(edit_size_))),0,0,0,edit_bold_?FW_BOLD:FW_NORMAL,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,edit_family_.c_str());
@@ -96,24 +112,32 @@ void Application::BeginText(View& view,Point p,int existing,bool badge_label){
         SendMessageW(edit_,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,0);
         SendMessageW(edit_,EM_SETLIMITTEXT,badge_label?NumberLabelLimit:4096,0);
         if(badge_label)SendMessageW(edit_,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"留空使用自动序号"));
-        TEXTMETRICW metrics{};HDC dc=GetDC(edit_);const auto old=SelectObject(dc,edit_font_);GetTextMetricsW(dc,&metrics);SelectObject(dc,old);ReleaseDC(edit_,dc);
-        const int caret_width=std::max(2,int(std::lround(2*scale)));
-        // Native bitmap carets are XORed with the field. This bitmap yields a
-        // blue caret while retaining the EDIT control's movement and blinking.
-        std::vector<uint32_t> caret_pixels(static_cast<size_t>(caret_width)*metrics.tmHeight,(edit_surface_color_^0xff2684ff)&0xffffff);
-        edit_caret_=CreateBitmap(caret_width,metrics.tmHeight,1,32,caret_pixels.data());
+        if(badge_label){
+            TEXTMETRICW metrics{};HDC dc=GetDC(edit_);const auto old=SelectObject(dc,edit_font_);GetTextMetricsW(dc,&metrics);SelectObject(dc,old);ReleaseDC(edit_,dc);
+            const int caret_width=std::max(2,int(std::lround(2*scale)));
+            // Native bitmap carets are XORed with the field. This bitmap yields a
+            // blue caret while retaining the EDIT control's movement and blinking.
+            std::vector<uint32_t> caret_pixels(static_cast<size_t>(caret_width)*metrics.tmHeight,(edit_surface_color_^0xff2684ff)&0xffffff);
+            edit_caret_=CreateBitmap(caret_width,metrics.tmHeight,1,32,caret_pixels.data());
+        }
         CheckWin32(SetWindowSubclass(edit_,EditProc,1,reinterpret_cast<DWORD_PTR>(this))!=FALSE,"Subclass text editor");
         if(badge_label)SetWindowTextW(edit_,mark?mark->number_label.c_str():state_.number_label.c_str());else if(mark)SetWindowTextW(edit_,mark->text.c_str());
         edit_initializing_=false;ResizeTextEditor();Invalidate();
-        edit_frame_->Show();ShowWindow(edit_host_,SW_SHOW);SetFocus(edit_);
+        if(edit_frame_)edit_frame_->Show();
+        ShowWindow(edit_host_,SW_SHOW);SetFocus(edit_);
         // Reopening selects the existing text, just like entering a text layer.
         SendMessageW(edit_,EM_SETSEL,0,mark||badge_label?-1:0);
         SendMessageW(edit_,EM_SCROLLCARET,0,0);
+        if(!badge_label){
+            UpdateTextPreview();
+            const UINT blink=GetCaretBlinkTime();
+            if(blink!=INFINITE&&blink>0)SetTimer(edit_host_,kCaretBlink,blink,nullptr);
+        }
     }catch(...){CommitText(true);throw;}
 }
 
 void Application::ResizeTextEditor(){
-    if(!edit_||edit_initializing_)return;
+    if(!edit_||edit_initializing_||!edit_frame_)return;
     if(edit_badge_label_){SendMessageW(edit_,EM_SCROLLCARET,0,0);return;}
     RECT current{};GetClientRect(edit_,&current);
     auto text=EditorText(edit_);text+=L' '; // Measure the empty line after a trailing newline, too.
@@ -131,6 +155,144 @@ void Application::ResizeTextEditor(){
         InvalidateRect(edit_host_,nullptr,TRUE);
     }
     SendMessageW(edit_,EM_SCROLLCARET,0,0);
+}
+
+Mark Application::EditedTextMark(const std::wstring& text) const{
+    if(edit_base_){
+        Mark updated=*edit_base_;updated.text=text;
+        if(updated.tool==Tool::Text&&updated.text_auto_size){
+            // Use the wrapping width actually available in this edit session,
+            // including after a scaled object meets an edge.
+            updated.text_wrap_width=edit_wrap_width_;
+            FitTextBounds(updated);
+        }
+        return updated;
+    }
+    Mark mark;mark.tool=Tool::Text;mark.a=edit_point_;mark.b={edit_point_.x+edit_wrap_width_,edit_point_.y+float(edit_min_height_)};
+    if(IsTextTag(edit_background_)){const auto padding=TextTagMetrics(edit_size_);mark.a.x-=padding.x;mark.a.y-=padding.y;mark.b.x+=padding.x;mark.b.y+=padding.y;}
+    mark.color=edit_color_;mark.font_size=edit_size_;mark.text=text;
+    mark.text_bold=edit_bold_;mark.text_align=edit_align_;mark.text_background=edit_background_;
+    mark.font_family=edit_family_;
+    mark.text_auto_size=true;mark.text_wrap_width=edit_wrap_width_;FitTextBounds(mark);
+    return mark;
+}
+
+void Application::UpdateTextPreview(){
+    if(!edit_||edit_badge_label_||edit_initializing_)return;
+    auto value=EditorText(edit_);
+    DWORD first{},last{};SendMessageW(edit_,EM_GETSEL,reinterpret_cast<WPARAM>(&first),reinterpret_cast<LPARAM>(&last));
+    TextEditPreview next;
+    next.selection_start=static_cast<int>(first);next.selection_end=static_cast<int>(last);
+    // EM_GETSEL is ordered; the end that moved since the last update is active.
+    const auto& previous=state_.text_edit;
+    next.caret=first!=last&&previous.mark&&int(last)==previous.selection_end&&int(first)!=previous.selection_start?int(first):int(last);
+    if(edit_composing_&&!edit_ime_text_.empty()){
+        // IME implementations may expose their transient preedit through EDIT.
+        // Splice composition only into the snapshot captured before it started,
+        // so a native preedit can never be painted twice.
+        value=edit_ime_original_;
+        const size_t begin=std::min<size_t>(edit_ime_first_,value.size());
+        const size_t removed=std::min<size_t>(edit_ime_last_>edit_ime_first_?edit_ime_last_-edit_ime_first_:0,value.size()-begin);
+        value.replace(begin,removed,edit_ime_text_);
+        next.composition_start=static_cast<int>(begin);next.composition_length=static_cast<int>(edit_ime_text_.size());
+        const int cursor=edit_ime_cursor_>=0?std::min(edit_ime_cursor_,next.composition_length):next.composition_length;
+        next.selection_start=next.selection_end=next.caret=next.composition_start+cursor;
+    }
+    Mark mark=EditedTextMark(value);
+    if(value.empty()){
+        if(mark.tool==Tool::Number)mark.text=L"\u200b"; // no placeholder under the caret
+        else if(mark.text_auto_size){
+            // Collapse an empty automatic box to the insertion point, anchored
+            // exactly where FitTextBounds will grow the first characters from.
+            const auto padding=IsTextTag(mark.text_background)?TextTagMetrics(mark.font_size):TagMetrics{};
+            const auto box=Normalize(mark.a,mark.b);
+            const float alignment=mark.text_align==TextAlign::Center?.5f:mark.text_align==TextAlign::Right?1.f:0.f;
+            const float anchor=box.left+(box.right-box.left)*alignment,width=2+2*padding.x;
+            mark.a={anchor-width*alignment,box.top};mark.b={mark.a.x+width,box.top+std::ceil(mark.font_size*1.34f)+1+2*padding.y};
+        }
+    }
+    next.mark=std::move(mark);
+    if(next.SameContent(previous)){PlaceTextIme();return;}
+    next.caret_visible=true;state_.text_edit=std::move(next);
+    // Typing restarts the blink phase so the caret is never hidden mid-input.
+    const UINT blink=GetCaretBlinkTime();
+    if(edit_host_&&blink!=INFINITE&&blink>0)SetTimer(edit_host_,kCaretBlink,blink,nullptr);
+    PlaceTextIme();
+    Invalidate();
+}
+
+void Application::PlaceTextIme(){
+    if(!edit_||edit_badge_label_||!state_.text_edit.mark)return;
+    const auto& preview=state_.text_edit;const Mark& mark=*preview.mark;
+    const auto geometry=MeasureTextEdit(mark,preview.caret,preview.caret,preview.caret);
+    const auto center=MarkCenter(mark);
+    const auto top=RotatePoint({geometry.caret.left,geometry.caret.top},center,mark.rotation);
+    const auto bottom=RotatePoint({geometry.caret.left,geometry.caret.bottom},center,mark.rotation);
+    POINT caret{LONG(std::lround(top.x)),LONG(std::lround(top.y))},base{LONG(std::lround(bottom.x)),LONG(std::lround(bottom.y))};
+    ScreenToClient(edit_,&caret);ScreenToClient(edit_,&base);
+    // IMEs follow either the system caret or the IMM forms; point both at the
+    // painted caret so candidates open next to the visible text.
+    if(GetFocus()==edit_)SetCaretPos(caret.x,caret.y);
+    if(const HIMC context=ImmGetContext(edit_)){
+        COMPOSITIONFORM composition{};composition.dwStyle=CFS_POINT;composition.ptCurrentPos=caret;
+        ImmSetCompositionWindow(context,&composition);
+        CANDIDATEFORM candidate{};candidate.dwIndex=0;candidate.dwStyle=CFS_EXCLUDE;candidate.ptCurrentPos=base;
+        candidate.rcArea={std::min(caret.x,base.x)-1,std::min(caret.y,base.y),std::max(caret.x,base.x)+1,std::max(caret.y,base.y)};
+        ImmSetCandidateWindow(context,&candidate);
+        ImmReleaseContext(edit_,context);
+    }
+}
+
+bool Application::TextEditHit(Point point) const{
+    if(!edit_||edit_badge_label_||!state_.text_edit.mark)return false;
+    const Mark& mark=*state_.text_edit.mark;
+    const auto geometry=MeasureTextEdit(mark,0,0,state_.text_edit.caret);
+    return Contains(geometry.frame,RotatePoint(point,MarkCenter(mark),-mark.rotation),6*std::max(.5f,state_.toolbar.scale));
+}
+
+bool Application::TextEditPointer(Point point,int phase){
+    if(!edit_||edit_badge_label_||!state_.text_edit.mark)return false;
+    if(phase==1||phase==2){
+        if(!edit_selecting_)return false;
+        if(!edit_composing_){
+            const int index=TextEditIndex(*state_.text_edit.mark,point);
+            SendMessageW(edit_,EM_SETSEL,edit_anchor_,index);
+        }
+        if(phase==2){edit_selecting_=false;ReleaseCapture();}
+        return true;
+    }
+    if(!TextEditHit(point))return false;
+    // Clicking inside the edit box only moves the caret; the native field keeps
+    // focus and an active IME phrase is left to the IME.
+    if(GetFocus()!=edit_)SetFocus(edit_);
+    if(edit_composing_)return true;
+    const int index=TextEditIndex(*state_.text_edit.mark,point);
+    if(phase==3){
+        const auto text=EditorText(edit_);
+        const auto kind=[](wchar_t c){
+            if(c==L'\r'||c==L'\n')return 0;
+            if(iswspace(c))return 1;
+            if(c>=0x2e80)return 3;
+            if(iswalnum(c)||c==L'_')return 2;
+            return 4;
+        };
+        size_t begin=static_cast<size_t>(index),end=begin;
+        if(!text.empty()){
+            const size_t probe=begin<text.size()?begin:text.size()-1;const int k=kind(text[probe]);
+            if(k!=0){
+                begin=probe;end=probe+1;
+                if(k!=4){while(begin>0&&kind(text[begin-1])==k)--begin;while(end<text.size()&&kind(text[end])==k)++end;}
+            }
+        }
+        edit_anchor_=static_cast<DWORD>(begin);
+        SendMessageW(edit_,EM_SETSEL,static_cast<WPARAM>(begin),static_cast<LPARAM>(end));
+        return true;
+    }
+    if(!(GetKeyState(VK_SHIFT)&0x8000))edit_anchor_=static_cast<DWORD>(index);
+    SendMessageW(edit_,EM_SETSEL,edit_anchor_,index);
+    edit_selecting_=true;
+    if(edit_owner_)SetCapture(edit_owner_);
+    return true;
 }
 
 void Application::PaintTextEditor(HDC dc){
@@ -215,11 +377,18 @@ LRESULT CALLBACK Application::TextHostProc(HWND window,UINT message,WPARAM wp,LP
     }
     case WM_COMMAND:
         if(reinterpret_cast<HWND>(lp)!=app->edit_)break;
-        if(HIWORD(wp)==EN_CHANGE)app->ResizeTextEditor();
+        if(HIWORD(wp)==EN_CHANGE){if(app->edit_badge_label_)app->ResizeTextEditor();else {try{app->UpdateTextPreview();}catch(...){app->Invalidate();}}}
         // Defer destruction until the native control has completed its focus
         // notification. IME candidate windows do not end the edit session.
         if(HIWORD(wp)==EN_KILLFOCUS)PostMessageW(window,kFinishText,0,0);
         return 0;
+    case WM_TIMER:
+        if(wp==kCaretBlink){
+            // Blinking only repaints the canvas; layout and regions are unchanged.
+            if(app->state_.text_edit.mark){app->state_.text_edit.caret_visible=!app->state_.text_edit.caret_visible;for(auto& view:app->views_)InvalidateRect(view->window,nullptr,FALSE);}
+            return 0;
+        }
+        break;
     case kFinishText:
         if(app->edit_&&GetFocus()!=app->edit_&&!app->edit_composing_)app->CommitText();
         return 0;
@@ -229,9 +398,20 @@ LRESULT CALLBACK Application::TextHostProc(HWND window,UINT message,WPARAM wp,LP
     return DefWindowProcW(window,message,wp,lp);
 }
 
+LPARAM Application::TextImeContext(LPARAM flags,bool canvas_preedit){
+    return canvas_preedit?flags&~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW):flags;
+}
+
 LRESULT CALLBACK Application::EditProc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data){
     auto* app=reinterpret_cast<Application*>(data);
     if(message==WM_ERASEBKGND)return 1;
+    // Without this the IME draws the same preedit a second time in its own window.
+    if(message==WM_IME_SETCONTEXT)lp=TextImeContext(lp,!app->edit_badge_label_);
+    if(!app->edit_badge_label_&&(message==WM_PAINT||message==WM_PRINTCLIENT||message==WM_PRINT)){
+        // The invisible in-place field never paints; the canvas shows the text.
+        if(message==WM_PAINT){PAINTSTRUCT ps{};BeginPaint(window,&ps);EndPaint(window,&ps);}
+        return 0;
+    }
     if(message==WM_PAINT||message==WM_PRINTCLIENT||message==WM_PRINT){
         PAINTSTRUCT ps{};const HDC dc=message==WM_PAINT?BeginPaint(window,&ps):reinterpret_cast<HDC>(wp);
         try{app->PaintTextEditor(dc);}catch(...){RECT client{};GetClientRect(window,&client);FillRect(dc,&client,app->edit_backdrop_);}
@@ -240,13 +420,16 @@ LRESULT CALLBACK Application::EditProc(HWND window,UINT message,WPARAM wp,LPARAM
     if(message==WM_SETFOCUS){
         const auto result=DefSubclassProc(window,message,wp,lp);
         if(app->edit_caret_){POINT position{};GetCaretPos(&position);DestroyCaret();CreateCaret(window,app->edit_caret_,0,0);SetCaretPos(position.x,position.y);ShowCaret(window);}
-        RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW);
+        if(app->edit_badge_label_)RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW);
+        else {try{app->PlaceTextIme();}catch(...){}}
         return result;
     }
-    if(message==WM_IME_STARTCOMPOSITION){app->edit_composing_=true;app->edit_ime_text_.clear();app->edit_ime_original_=EditorText(window);SendMessageW(window,EM_GETSEL,reinterpret_cast<WPARAM>(&app->edit_ime_first_),reinterpret_cast<LPARAM>(&app->edit_ime_last_));}
+    if(message==WM_IME_STARTCOMPOSITION){app->edit_composing_=true;app->edit_ime_cursor_=-1;app->edit_ime_text_.clear();app->edit_ime_original_=EditorText(window);SendMessageW(window,EM_GETSEL,reinterpret_cast<WPARAM>(&app->edit_ime_first_),reinterpret_cast<LPARAM>(&app->edit_ime_last_));}
     if(message==WM_IME_COMPOSITION){if(const HIMC context=ImmGetContext(window)){
         if(lp&GCS_COMPSTR){const LONG bytes=ImmGetCompositionStringW(context,GCS_COMPSTR,nullptr,0);if(bytes>=0&&bytes<=8192){app->edit_ime_text_.resize(static_cast<size_t>(bytes)/sizeof(wchar_t));if(bytes)ImmGetCompositionStringW(context,GCS_COMPSTR,app->edit_ime_text_.data(),static_cast<DWORD>(bytes));}}
-        if(lp&GCS_RESULTSTR)app->edit_ime_text_.clear();ImmReleaseContext(window,context);
+        if(lp&GCS_CURSORPOS)app->edit_ime_cursor_=ImmGetCompositionStringW(context,GCS_CURSORPOS,nullptr,0);
+        if(lp&GCS_RESULTSTR){app->edit_ime_text_.clear();app->edit_ime_cursor_=-1;}
+        ImmReleaseContext(window,context);
     }}
     if(message==WM_IME_ENDCOMPOSITION){app->edit_composing_=false;app->edit_ime_text_.clear();app->edit_ime_original_.clear();PostMessageW(app->edit_host_,kFinishText,0,0);}
     if(message==WM_KEYDOWN&&!app->edit_composing_){
@@ -260,6 +443,15 @@ LRESULT CALLBACK Application::EditProc(HWND window,UINT message,WPARAM wp,LPARAM
     // EDIT also paints synchronously while processing selection and input.
     // Suppress that GDI path, then repaint once with the current native layout.
     const bool changes=message==WM_TIMER||message==EM_SCROLL||message==WM_KILLFOCUS||message==WM_CHAR||message==WM_KEYDOWN||message==WM_KEYUP||message==WM_LBUTTONDOWN||message==WM_LBUTTONUP||message==WM_LBUTTONDBLCLK||message==WM_MOUSEMOVE||message==WM_MOUSEWHEEL||message==WM_HSCROLL||message==WM_VSCROLL||message==WM_SETTEXT||message==WM_SETFONT||message==WM_SIZE||message==EM_SETSEL||message==EM_REPLACESEL||message==EM_SCROLLCARET||message==EM_LINESCROLL||message==WM_CUT||message==WM_PASTE||message==WM_CLEAR||message==WM_UNDO||message==EM_UNDO||message==WM_IME_STARTCOMPOSITION||message==WM_IME_COMPOSITION||message==WM_IME_ENDCOMPOSITION;
+    if(!app->edit_badge_label_){
+        // Nothing native is visible: let EDIT update its model, then repaint
+        // the canvas preview (text, selection, caret, IME) from it.
+        const auto result=DefSubclassProc(window,message,wp,lp);
+        if(changes&&message!=WM_TIMER&&message!=WM_KEYUP&&IsWindow(window)&&app->edit_==window&&(message!=WM_MOUSEMOVE||(wp&MK_LBUTTON))){
+            try{app->UpdateTextPreview();}catch(...){app->Invalidate();}
+        }
+        return result;
+    }
     const bool visible=changes&&IsWindowVisible(window)&&(message!=WM_MOUSEMOVE||(wp&MK_LBUTTON));
     if(visible)DefSubclassProc(window,WM_SETREDRAW,FALSE,0);
     const auto result=DefSubclassProc(window,message,wp,lp);
@@ -291,9 +483,10 @@ void Application::CommitText(bool cancel){
     }
     const HWND editor=std::exchange(edit_,nullptr),host=std::exchange(edit_host_,nullptr);
     const auto text=editor?EditorText(editor):std::wstring{};
-    RECT bounds{};
-    if(editor){GetWindowRect(editor,&bounds);RemoveWindowSubclass(editor,EditProc,1);DestroyWindow(editor);}
-    if(host)DestroyWindow(host);
+    if(editor){RemoveWindowSubclass(editor,EditProc,1);DestroyWindow(editor);}
+    if(host){KillTimer(host,kCaretBlink);DestroyWindow(host);}
+    if(edit_selecting_){edit_selecting_=false;if(GetCapture()==edit_owner_)ReleaseCapture();}
+    state_.text_edit={};
     edit_frame_.reset();
     if(edit_caret_){DeleteObject(edit_caret_);edit_caret_=nullptr;}
     if(edit_font_){DeleteObject(edit_font_);edit_font_=nullptr;}
@@ -319,25 +512,19 @@ void Application::CommitText(bool cancel){
                 if(updated.tool==Tool::Text&&updated.text_auto_size){
                     // Use the wrapping width actually available in this edit
                     // session, including after a scaled object meets an edge.
-                    updated.text_wrap_width=float(bounds.right-bounds.left);
+                    updated.text_wrap_width=edit_wrap_width_;
                     FitTextBounds(updated);
                 }
                 if(updated!=mark){document_.Checkpoint();mark=std::move(updated);}
             }
             if(!text.empty())document_.selected=edit_index_;
         }else if(!text.empty()){
-            Mark mark;mark.tool=Tool::Text;mark.a=edit_point_;mark.b={edit_point_.x+float(bounds.right-bounds.left),edit_point_.y+float(bounds.bottom-bounds.top)};
-            if(IsTextTag(edit_background_)){const auto padding=TextTagMetrics(edit_size_);mark.a.x-=padding.x;mark.a.y-=padding.y;mark.b.x+=padding.x;mark.b.y+=padding.y;}
-            mark.color=edit_color_;mark.font_size=edit_size_;mark.text=text;
-            mark.text_bold=edit_bold_;mark.text_align=edit_align_;mark.text_background=edit_background_;
-            mark.font_family=edit_family_;
-            mark.text_auto_size=true;mark.text_wrap_width=float(bounds.right-bounds.left);FitTextBounds(mark);
-            document_.Add(std::move(mark));
+            document_.Add(EditedTextMark(text));
             document_.selected=static_cast<int>(document_.marks.size())-1;
         }
     }
     state_.hint=std::move(edit_previous_hint_);
-    edit_index_=-1;edit_owner_=nullptr;edit_composing_=edit_initializing_=edit_badge_label_=false;
+    edit_index_=-1;edit_owner_=nullptr;edit_composing_=edit_initializing_=edit_badge_label_=false;edit_base_.reset();edit_ime_cursor_=-1;
     if(!cancel)SyncSelectedProperties();
     Invalidate();
 }

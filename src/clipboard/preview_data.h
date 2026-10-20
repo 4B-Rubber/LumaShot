@@ -11,6 +11,7 @@ struct PreviewData {
     static constexpr size_t MaxTextChars = 65536;
     static constexpr size_t MaxFileChars = 256 * 272;
     bool truncated{};
+    bool interim{};  // `image` is a thumbnail standing in until the full decode arrives
     uint32_t file_count{};
     std::shared_ptr<const Frame> image;
     std::wstring text;

@@ -60,20 +60,30 @@ Session::Session(RECT region, bool dark, Done done, Closed closed)
     Register(kPanelClass, Proc, LoadCursorW(nullptr, IDC_ARROW));
     frame_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         kFrameClass, L"", WS_POPUP, region_.left, region_.top, 1, 1, nullptr, nullptr, instance, this);
-    bar_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kBarClass, L"LumaShot 长截图", WS_POPUP,
+    // Glass: bar and panel sit on the DWM transient-acrylic backdrop (non-layered frame windows, as the menus);
+    // layered opaque fallback when transparency effects are off. The selection frame stays layered.
+    glassy_ = TransparencyEffectsOn();
+    const DWORD glass_ex = glassy_ ? WS_EX_NOREDIRECTIONBITMAP : WS_EX_LAYERED;
+    const DWORD glass_style = glassy_ ? (WS_POPUP | WS_THICKFRAME) : WS_POPUP;
+    bar_ = CreateWindowExW(glass_ex | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kBarClass, L"LumaShot 长截图", glass_style,
         region_.left, region_.bottom, 1, 1, nullptr, nullptr, instance, this);
-    panel_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kPanelClass,
-        L"LumaShot 长截图预览", WS_POPUP, region_.right, region_.top, 1, 1, nullptr, nullptr, instance, this);
+    panel_ = CreateWindowExW(glass_ex | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kPanelClass,
+        L"LumaShot 长截图预览", glass_style, region_.right, region_.top, 1, 1, nullptr, nullptr, instance, this);
     if (!frame_ || !bar_ || !panel_) {
         for (HWND w : {frame_, bar_, panel_}) if (w) DestroyWindow(w);
         throw std::runtime_error("Unable to create long capture windows");
     }
     scale_ = Scale(bar_);
     for (HWND w : {frame_, bar_, panel_}) SetWindowDisplayAffinity(w, WDA_EXCLUDEFROMCAPTURE);
-    ConfigureBorderlessWindow(bar_);
-    ConfigureBorderlessWindow(panel_);
-    acrylic_bar_ = SetSettingsAcrylic(bar_, dark_);
-    acrylic_panel_ = SetSettingsAcrylic(panel_, dark_);
+    if (glassy_) {
+        acrylic_bar_ = ApplyPopupBackdrop(bar_, dark_);
+        acrylic_panel_ = ApplyPopupBackdrop(panel_, dark_);
+    } else {
+        ConfigureBorderlessWindow(bar_);
+        ConfigureBorderlessWindow(panel_);
+        acrylic_bar_ = SetSettingsAcrylic(bar_, dark_);
+        acrylic_panel_ = SetSettingsAcrylic(panel_, dark_);
+    }
     // Layered (UpdateLayeredWindow) windows ignore window regions, so the
     // outline is DWM's native rounded corner + border + shadow, which also
     // clips the acrylic. We paint the full rectangle and never a second,
@@ -96,6 +106,9 @@ Session::Session(RECT region, bool dark, Done done, Closed closed)
     ShowWindow(frame_, SW_SHOWNOACTIVATE);
     ShowWindow(panel_, SW_SHOWNOACTIVATE);
     ShowWindow(bar_, SW_SHOW);
+    // The panel never activates and the bar loses activation to the scrolled app; Windows 11 would show the
+    // flat inactive fallback, so both frames always report active (WM_NCACTIVATE below).
+    if (glassy_) for (HWND w : {bar_, panel_}) SendMessageW(w, WM_NCACTIVATE, TRUE, 0);
     SetForegroundWindow(bar_);
     SetFocus(bar_);
     g_hooked = this;
@@ -774,7 +787,7 @@ void Session::PaintBar() {
         const float s = scale_;
         const auto theme = painter_.Theme();
         const Box all{0, 0, static_cast<float>(screen.right - screen.left), static_cast<float>(screen.bottom - screen.top)};
-        painter_.Backdrop(all, acrylic_bar_);
+        painter_.Backdrop(all, acrylic_bar_, glassy_);
         const auto items = BarItems();
         const auto find = [&](int id) { for (const auto& i : items) if (i.id == id) return i.box; return Box{}; };
         // Status
@@ -858,7 +871,7 @@ void Session::PaintPanel() {
         const float s = scale_;
         const auto theme = painter_.Theme();
         const float w = static_cast<float>(screen.right - screen.left), h = static_cast<float>(screen.bottom - screen.top);
-        painter_.Backdrop({0, 0, w, h}, acrylic_panel_);
+        painter_.Backdrop({0, 0, w, h}, acrylic_panel_, glassy_);
         painter_.Text(L"实时拼接预览", {14 * s, 12 * s, w - 90 * s, 34 * s}, 13, theme.Ink(), true);
         const std::wstring count = Thousands(view_.segments) + L" 段";
         const float cw = painter_.Measure(count, 11.5f).x + 16 * s;
@@ -1072,6 +1085,11 @@ LRESULT CALLBACK Session::MouseHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 LRESULT CALLBACK Session::Proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    // Glass windows carry WS_THICKFRAME only for the DWM backdrop: no minimum track size (arrives before WM_NCCREATE).
+    if (message == WM_GETMINMAXINFO && (GetWindowLongPtrW(window, GWL_STYLE) & WS_THICKFRAME)) {
+        reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {1, 1};
+        return 0;
+    }
     auto* self = reinterpret_cast<Session*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
         self = static_cast<Session*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
@@ -1095,6 +1113,9 @@ LRESULT Session::Message(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_NCCALCSIZE: return 0;
+    case WM_NCACTIVATE:
+        if (glassy_ && window != frame_) return DefWindowProcW(window, message, TRUE, lp);
+        break;
     case WM_MOUSEACTIVATE: return window == bar_ ? MA_ACTIVATE : MA_NOACTIVATE;
     case WM_NCHITTEST: {
         if (window == frame_) return HTTRANSPARENT;

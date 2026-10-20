@@ -175,12 +175,9 @@ void Renderer::Marks(const Frame& frame, const Document& document, const std::op
     mosaic_cache_.resize(document.marks.size()+1);
     for(size_t i=0;i<document.marks.size();++i) {
         const auto& mark=document.marks[i];
-        if(editing_text>=0&&i==static_cast<size_t>(editing_text)) {
-            // Keep stable mosaic indices; only a number's small detail override
-            // needs a copy. Never clone the document or its history for painting.
-            if(mark.tool==Tool::Number){auto visible=mark;visible.text=L"\u200b";MarkShape(frame,visible,i);}
-            continue;
-        }
+        // The in-place editor paints the live copy (ViewState::text_edit) on
+        // top; never draw the committed version underneath it.
+        if(editing_text>=0&&i==static_cast<size_t>(editing_text))continue;
         MarkShape(frame,mark,i);
     }
     if (draft) MarkShape(frame,*draft,document.marks.size());
@@ -199,7 +196,7 @@ void Renderer::Panel(Box rect, ID2D1Bitmap* acrylic, const Frame& frame, bool da
     target_->DrawBitmap(acrylic,Rect(rect),1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
         D2D1::RectF((rect.left-frame.bounds.left)*sx,(rect.top-frame.bounds.top)*sy,
             (rect.right-frame.bounds.left)*sx,(rect.bottom-frame.bounds.top)*sy));
-    Brush(dark ? 0xa923354b : 0xc4eaf3ff);
+    Brush(dark ? 0x9423354b : 0x80eaf3ff);  // tint over the blurred capture: light 50%, dark 58% (was 77% / 66%)
     target_->FillRectangle(Rect(rect),brush_.Get());
     target_->PopLayer();
     Brush(dark ? 0x557b8da5 : 0xd9ffffff);
@@ -214,6 +211,9 @@ void Renderer::Icon(int index, Box rect, uint32_t color) {
         target_->DrawLine({cx+x1*unit,cy+y1*unit},{cx+x2*unit,cy+y2*unit},brush_.Get(),1.65f*unit);
     };
     switch(index) {
+    case 19:
+        // More: three dots.
+        for(const float x:{-7.f,0.f,7.f})target_->FillEllipse(D2D1::Ellipse({cx+x*unit,cy},1.9f*unit,1.9f*unit),brush_.Get());break;
     case 18:
         // Translate: a Han-like glyph on the left, a Latin "A" on the right.
         line(-10,-7,-1,-7);line(-5.5f,-10,-5.5f,-7);line(-9,-4,-2,3);line(-2,-4,-9,3);
@@ -271,6 +271,35 @@ void Renderer::Icon(int index, Box rect, uint32_t color) {
     }
 }
 
+void Renderer::TextEditOverlay(const Frame& frame,const ViewState& state){
+    const auto& edit=state.text_edit;const Mark& mark=*edit.mark;
+    const float scale=std::max(.5f,state.toolbar.scale);
+    const auto geometry=MeasureTextEdit(mark,edit.selection_start,edit.selection_end,edit.caret,edit.composition_start,edit.composition_length);
+    D2D1_MATRIX_3X2_F old;target_->GetTransform(&old);
+    struct Restore {ID2D1RenderTarget* t;D2D1_MATRIX_3X2_F matrix;~Restore(){t->SetTransform(matrix);}} restore{target_.Get(),old};
+    const auto center=MarkCenter(mark);target_->SetTransform(D2D1::Matrix3x2F::Rotation(mark.rotation,{center.x,center.y})*old);
+    const uint32_t ink=mark.tool==Tool::Number?ResolveNoteAppearance(frame,mark).ink:ResolveTextAppearance(frame,mark).ink;
+    // Selection: a translucent system-blue wash keeps the final glyphs legible.
+    Brush(0xff2f86ff,.34f);
+    for(const auto& part:geometry.selection)target_->FillRectangle({part.left,part.top,std::max(part.right,part.left+2*scale),part.bottom},brush_.Get());
+    // IME preedit: underline in the text colour, like native composition.
+    Brush(ink|0xff000000);
+    const float underline=std::max(1.f,std::round(1.5f*scale));
+    for(const auto& part:geometry.composition)target_->FillRectangle({part.left,part.bottom-underline,part.right,part.bottom},brush_.Get());
+    // Dashed outline marks the active edit box without covering the screenshot.
+    const float gap=4*scale;
+    const D2D1_RECT_F outline{geometry.frame.left-gap,geometry.frame.top-gap,geometry.frame.right+gap,geometry.frame.bottom+gap};
+    Brush(0xffffffff,.75f);target_->DrawRectangle(outline,brush_.Get(),2.5f*scale);
+    auto props=D2D1::StrokeStyleProperties();props.dashStyle=D2D1_DASH_STYLE_CUSTOM;
+    const float dashes[]{4,3};ComPtr<ID2D1StrokeStyle> dashed;Check(factory_->CreateStrokeStyle(props,dashes,2,&dashed));
+    Brush(0xff248dff);target_->DrawRectangle(outline,brush_.Get(),std::max(1.f,1.25f*scale),dashed.Get());
+    if(edit.caret_visible&&edit.selection_start==edit.selection_end){
+        const float width=std::clamp(std::round((mark.tool==Tool::Number?mark.number_text_size:mark.font_size)/8)/2,1.5f,3.f);
+        const float x=std::round(geometry.caret.left-width/2);
+        Brush(ink|0xff000000);target_->FillRectangle({x,geometry.caret.top,x+width,geometry.caret.bottom},brush_.Get());
+    }
+}
+
 void Renderer::Chrome(const Frame& frame, const Frame&, const Document& document,
     const std::optional<Mark>& draft, const ViewState& state, RECT monitor,int editing_text) {
     target_->DrawBitmap(screen_bitmap_.Get(),Rect(BoxOf(monitor)),1,D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
@@ -278,17 +307,24 @@ void Renderer::Chrome(const Frame& frame, const Frame&, const Document& document
     Brush(0x790a1220);
     if (!state.selected && !state.dragging && b.right<=b.left) target_->FillRectangle(Rect(desktop),brush_.Get());
     else {
-        for(const Box mask : {Box{desktop.left,desktop.top,desktop.right,b.top},
+        if(!state.clear_outside)for(const Box mask : {Box{desktop.left,desktop.top,desktop.right,b.top},
             Box{desktop.left,b.bottom,desktop.right,desktop.bottom},
             Box{desktop.left,b.top,b.left,b.bottom},Box{b.right,b.top,desktop.right,b.bottom}}) {
             if(mask.right>mask.left && mask.bottom>mask.top)target_->FillRectangle(Rect(mask),brush_.Get());
         }
         target_->PushAxisAlignedClip(Rect(b),D2D1_ANTIALIAS_MODE_ALIASED);
         Marks(frame,document,draft,editing_text);
+        // Text being typed is painted exactly like the committed annotation.
+        if(state.text_edit.mark)MarkShape(frame,*state.text_edit.mark,document.marks.size());
         SnapGuide(state,draft);
         target_->PopAxisAlignedClip();
-        Brush(0xff248dff);target_->DrawRectangle(Rect(b),brush_.Get(),1.5f);
-        if(state.selected) {
+        if(state.text_edit.mark)TextEditOverlay(frame,state);
+        // Over a pin (clear_outside) the selection is the pin itself and is never resized: keep the
+        // border inside it and draw no handles, so the toolbar/tooltip region margins never show half of either.
+        Brush(0xff248dff);
+        if(state.clear_outside)target_->DrawRectangle(Rect(Box{b.left+.75f,b.top+.75f,b.right-.75f,b.bottom-.75f}),brush_.Get(),1.5f);
+        else target_->DrawRectangle(Rect(b),brush_.Get(),1.5f);
+        if(state.selected&&!state.clear_outside) {
             for(const Point p : {Point{b.left,b.top},Point{(b.left+b.right)/2,b.top},Point{b.right,b.top},
                 Point{b.left,(b.top+b.bottom)/2},Point{b.right,(b.top+b.bottom)/2},
                 Point{b.left,b.bottom},Point{(b.left+b.right)/2,b.bottom},Point{b.right,b.bottom}}) {
@@ -296,18 +332,21 @@ void Renderer::Chrome(const Frame& frame, const Frame&, const Document& document
                 Brush(0xff248dff);target_->DrawRectangle({p.x-3,p.y-3,p.x+3,p.y+3},brush_.Get());
             }
         }
-        const float scale=state.toolbar.scale;
-        const float chip_y=std::max(float(monitor.top)+6,b.top-30*scale);
-        Panel({b.left,chip_y,b.left+106*scale,chip_y+25*scale},acrylic_bitmap_.Get(),frame,true,6*scale);
-        Text(std::to_wstring(int(b.right-b.left))+L" × "+std::to_wstring(int(b.bottom-b.top)),
-            {b.left+8*scale,chip_y+3*scale,b.left+104*scale,chip_y+25*scale},13*scale,0xfff5faff);
+        if(!state.clear_outside) {  // size chip: meaningless over a pin, and it could peek into a toolbar margin
+            const float scale=state.toolbar.scale;
+            const float chip_y=std::max(float(monitor.top)+6,b.top-30*scale);
+            Panel({b.left,chip_y,b.left+106*scale,chip_y+25*scale},acrylic_bitmap_.Get(),frame,true,6*scale);
+            Text(std::to_wstring(int(b.right-b.left))+L" × "+std::to_wstring(int(b.bottom-b.top)),
+                {b.left+8*scale,chip_y+3*scale,b.left+104*scale,chip_y+25*scale},13*scale,0xfff5faff);
+        }
     }
-    if(editing_text<0&&document.selected>=0 && static_cast<size_t>(document.selected)<document.marks.size()) {
+    // No resize handles while typing: only the dashed edit box is active.
+    if(editing_text<0&&!state.text_edit.mark&&document.selected>=0 && static_cast<size_t>(document.selected)<document.marks.size()) {
         DrawSelectionEditor(target_.Get(),document.marks[document.selected],document.selected_part,state.toolbar.scale);
     }
     if(state.selected)Toolbar(frame,document,state);
     if(state.selected&&state.tool==Tool::Mosaic&&Contains(state.selection,state.pointer)&&
-        !Contains(state.toolbar.bounds,state.pointer)) {
+        !Contains(state.toolbar,state.pointer)) {
         const auto circle=D2D1::Ellipse(Pt(state.pointer),state.mosaic_brush*state.toolbar.scale/2,state.mosaic_brush*state.toolbar.scale/2);
         Brush(0xbb142238);target_->DrawEllipse(circle,brush_.Get(),3);
         Brush(0xffeff7ff);target_->DrawEllipse(circle,brush_.Get(),1);
@@ -316,9 +355,10 @@ void Renderer::Chrome(const Frame& frame, const Frame&, const Document& document
     Box hint{float(monitor.left)+20*s,float(monitor.bottom)-46*s,
         float(monitor.right)-20*s,float(monitor.bottom)-14*s};
     // Reserve the toolbar and its tooltip area independently of hover state.
-    if(state.selected && state.toolbar.bounds.bottom+6*s>hint.top &&
-        state.toolbar.bounds.top-6*s<hint.bottom) {
-        hint.right=std::min(hint.right,state.toolbar.bounds.left-12*s);
+    const Box toolbar_extent=state.toolbar.Extent();
+    if(state.selected && toolbar_extent.bottom+6*s>hint.top &&
+        toolbar_extent.top-6*s<hint.bottom) {
+        hint.right=std::min(hint.right,toolbar_extent.left-12*s);
     }
     if(hint.right-hint.left>=160*s)
         Text(state.busy?L"正在生成图片…  Esc 取消":state.hint,hint,13*s,0xfff2f6fc);
@@ -395,33 +435,92 @@ Frame Renderer::Flatten(const Frame& frame,const Document& document,RECT selecti
     return output;
 }
 
+Frame Renderer::Canvas(const Frame& frame,const Document& document,const ViewState& state,int editing_text) {
+    Frame output=MakeFrame(frame.bounds);
+    ComPtr<IWICImagingFactory> wic;
+    Check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&wic)));
+    ComPtr<IWICBitmap> bitmap;
+    Check(wic->CreateBitmap(output.Width(),output.Height(),GUID_WICPixelFormat32bppPBGRA,WICBitmapCacheOnLoad,&bitmap));
+    for(auto& cache:mosaic_cache_)cache.bitmap.Reset();
+    brush_.Reset();color_wheel_bitmap_.Reset();target_.Reset();
+    Check(factory_->CreateWicBitmapRenderTarget(bitmap.Get(),D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96),&target_));
+    screen_bitmap_=Bitmap(frame);acrylic_bitmap_=Bitmap(frame);
+    target_->BeginDraw();
+    target_->SetTransform(D2D1::Matrix3x2F::Translation(-float(frame.bounds.left),-float(frame.bounds.top)));
+    Chrome(frame,frame,document,std::nullopt,state,frame.bounds,editing_text);
+    Check(target_->EndDraw());
+    Check(bitmap->CopyPixels(nullptr,output.Width()*4,static_cast<UINT>(output.pixels.size()*4),
+        reinterpret_cast<BYTE*>(output.pixels.data())));
+    return output;
+}
+
+// Software acrylic for the capture chrome (toolbar, property panels, chips):
+// 4x area-average reduction, three 7-tap box passes per axis (close to a Gaussian,
+// ~14 px at full scale), then saturation x1.3 as Fluent acrylic does so colours
+// show through the tint. Integer-only so tests can pin exact pixels.
+uint32_t AcrylicSaturate(unsigned r,unsigned g,unsigned b) {
+    const int gray=static_cast<int>((r*77u+g*150u+b*29u)>>8);
+    const auto boost=[gray](unsigned c){return static_cast<uint32_t>(std::clamp(gray+(static_cast<int>(c)-gray)*13/10,0,255));};
+    return 0xff000000u|(boost(r)<<16)|(boost(g)<<8)|boost(b);
+}
 Frame BlurBackdrop(const Frame& frame) {
-    const int w=std::max(1,frame.Width()/4),h=std::max(1,frame.Height()/4);
+    // On the capture start path (the overlay waits for it), so: R and B are summed together in
+    // one 32-bit word (lanes 0x00RR00BB, at most 16 x 255 per lane), and vertical passes walk
+    // rows with per-column running sums instead of striding down columns.
+    const int fw=frame.Width(),fh=frame.Height();
+    const int w=std::max(1,fw/4),h=std::max(1,fh/4);
     Frame reduced=MakeFrame({0,0,w,h});
-    for(int y=0;y<h;++y)for(int x=0;x<w;++x)
-        reduced.pixels[static_cast<size_t>(y)*w+x]=frame.pixels[static_cast<size_t>(y*4)*frame.Width()+x*4];
-    std::vector<uint32_t> scratch(reduced.pixels.size());
-    for(int pass=0;pass<2;++pass) {
-        const int lines=pass==0?h:w,length=pass==0?w:h;
-        const size_t stride=pass==0?1:static_cast<size_t>(w);
-        for(int line=0;line<lines;++line) {
-            const size_t start=pass==0?static_cast<size_t>(line)*w:static_cast<size_t>(line);
-            const auto sample=[&](int at){return reduced.pixels[start+static_cast<size_t>(std::clamp(at,0,length-1))*stride];};
-            unsigned r{},g{},b{};
-            const auto add=[&](uint32_t c){r+=(c>>16)&255;g+=(c>>8)&255;b+=c&255;};
-            const auto remove=[&](uint32_t c){r-=(c>>16)&255;g-=(c>>8)&255;b-=c&255;};
-            for(int d=-4;d<=4;++d)add(sample(d));
-            for(int at=0;at<length;++at) {
-                scratch[start+static_cast<size_t>(at)*stride]=0xff000000|((r/9)<<16)|((g/9)<<8)|(b/9);
-                remove(sample(at-4));add(sample(at+5));
+    if(fw<=0||fh<=0||frame.pixels.size()<static_cast<size_t>(fw)*static_cast<size_t>(fh))return reduced;
+    constexpr uint32_t Lanes=0x00ff00ffu;
+    auto& px=reduced.pixels;
+    const size_t width=static_cast<size_t>(w);
+    std::vector<uint32_t> rbs(width),gs(width);
+    for(int y=0;y<h;++y) {
+        std::fill(rbs.begin(),rbs.end(),0u);std::fill(gs.begin(),gs.end(),0u);
+        for(int dy=0;dy<4;++dy) {
+            const uint32_t* row=frame.pixels.data()+static_cast<size_t>(std::min(y*4+dy,fh-1))*static_cast<size_t>(fw);
+            if(fw>=4) {
+                for(size_t x=0;x<width;++x){const uint32_t* q=row+x*4;
+                    rbs[x]+=(q[0]&Lanes)+(q[1]&Lanes)+(q[2]&Lanes)+(q[3]&Lanes);
+                    gs[x]+=((q[0]>>8)&255u)+((q[1]>>8)&255u)+((q[2]>>8)&255u)+((q[3]>>8)&255u);}
+            } else {
+                for(size_t x=0;x<width;++x)for(int dx=0;dx<4;++dx){const uint32_t v=row[std::min(static_cast<int>(x)*4+dx,fw-1)];rbs[x]+=v&Lanes;gs[x]+=(v>>8)&255u;}
             }
         }
-        reduced.pixels.swap(scratch);
+        uint32_t* dst=px.data()+static_cast<size_t>(y)*width;
+        for(size_t x=0;x<width;++x)dst[x]=0xff000000u|((((rbs[x]>>16)+8)>>4)<<16)|(((gs[x]+8)>>4)<<8)|(((rbs[x]&0xffffu)+8)>>4);
     }
+    const auto box=[](uint32_t rb,uint32_t g){return 0xff000000u|((((rb>>16)+3)/7)<<16)|(((g+3)/7)<<8)|(((rb&0xffffu)+3)/7);};
+    std::vector<uint32_t> scratch(px.size());
+    for(int round=0;round<3;++round) {
+        for(int y=0;y<h;++y) {  // horizontal: px -> scratch
+            const uint32_t* row=px.data()+static_cast<size_t>(y)*width;uint32_t* dst=scratch.data()+static_cast<size_t>(y)*width;
+            const auto at=[&](int x){return row[std::clamp(x,0,w-1)];};
+            uint32_t rb{},g{};
+            for(int d=-3;d<=3;++d){const uint32_t v=at(d);rb+=v&Lanes;g+=(v>>8)&255u;}
+            for(int x=0;x<w;++x){
+                dst[x]=box(rb,g);
+                const uint32_t gone=at(x-3),next=at(x+4);
+                rb+=(next&Lanes)-(gone&Lanes);g+=((next>>8)&255u)-((gone>>8)&255u);  // exact modulo 2^32; lanes stay in range
+            }
+        }
+        // vertical: scratch -> px, row-major with per-column sums
+        const auto line=[&](int y){return scratch.data()+static_cast<size_t>(std::clamp(y,0,h-1))*width;};
+        std::fill(rbs.begin(),rbs.end(),0u);std::fill(gs.begin(),gs.end(),0u);
+        for(int d=-3;d<=3;++d){const uint32_t* src=line(d);for(size_t x=0;x<width;++x){rbs[x]+=src[x]&Lanes;gs[x]+=(src[x]>>8)&255u;}}
+        for(int y=0;y<h;++y){
+            uint32_t* dst=px.data()+static_cast<size_t>(y)*width;
+            for(size_t x=0;x<width;++x)dst[x]=box(rbs[x],gs[x]);
+            const uint32_t* gone=line(y-3);const uint32_t* next=line(y+4);
+            for(size_t x=0;x<width;++x){rbs[x]+=(next[x]&Lanes)-(gone[x]&Lanes);gs[x]+=((next[x]>>8)&255u)-((gone[x]>>8)&255u);}
+        }
+    }
+    for(auto& v:px)v=AcrylicSaturate((v>>16)&255,(v>>8)&255,v&255);
     return reduced;
 }
 
-Frame Renderer::Demo(bool chrome, bool dark, Tool preview_tool,bool color_picker,int preview_hover,int preview_dropdown,bool highlighter) {
+Frame Renderer::Demo(bool chrome, bool dark, Tool preview_tool,bool color_picker,int preview_hover,int preview_dropdown,bool highlighter,const ToolbarCustomization* customization) {
     Frame frame=MakeFrame({0,0,1280,800});
     for(int y=0;y<800;++y)for(int x=0;x<1280;++x) {
         const float dx=(float(x)-1100)/450,dy=(float(y)-540)/330;
@@ -473,10 +572,16 @@ Frame Renderer::Demo(bool chrome, bool dark, Tool preview_tool,bool color_picker
         pen.color=0xffff68c8;pen.points={{247,518},{442,518}};document.Add(pen);
     }
     if(preview_dropdown==70||preview_dropdown==71)state.number_combo=NumberCombo::Text;
-    state.toolbar=PlaceToolbar(state.selection,frame.bounds,1,preview_tool==Tool::Select?0.f:1.f,preview_tool,state.number_combo);state.hint=L"已包含鼠标指针   ·   Enter / Ctrl+C 复制   ·   Ctrl+S 保存   ·   Esc 取消";
+    state.toolbar=PlaceToolbar(state.selection,frame.bounds,1,preview_tool==Tool::Select||(customization&&!customization->auto_properties)?0.f:1.f,preview_tool,state.number_combo,customization?*customization:ToolbarCustomization{});state.hint=L"已包含鼠标指针   ·   Enter / Ctrl+C 复制   ·   Ctrl+S 保存   ·   Esc 取消";
     if(color_picker){state.color=0xffff4d4f;state.picker.Open(state.color,state.toolbar.Property(28),frame.bounds,1);}
     if(preview_dropdown==70||preview_dropdown==71)state.number_combo=NumberCombo::Text;
-    if(preview_dropdown>=0)OpenToolbarDropdown(state,preview_dropdown,frame.bounds);
+    if(preview_dropdown==ToolbarMoreId)OpenToolbarMoreMenu(state,frame.bounds);
+    else if(preview_dropdown==ToolbarContextMenuId){
+        int target=IsCustomizableToolbarId(preview_hover)?preview_hover:-1;
+        for(int id:state.toolbar.custom.order)if(target<0&&state.toolbar.custom.OnPanel(id))target=id;
+        OpenToolbarContextMenu(state,target,frame.bounds);
+    }
+    else if(preview_dropdown>=0)OpenToolbarDropdown(state,preview_dropdown,frame.bounds);
     prepare();screen_bitmap_=Bitmap(frame);acrylic_bitmap_=Bitmap(acrylic);
     target_->BeginDraw();Chrome(frame,acrylic,document,std::nullopt,state,frame.bounds);Picker(frame,state);Check(target_->EndDraw());
     Check(bitmap->CopyPixels(nullptr,1280*4,static_cast<UINT>(frame.pixels.size()*4),reinterpret_cast<BYTE*>(frame.pixels.data())));

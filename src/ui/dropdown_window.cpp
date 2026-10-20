@@ -2,6 +2,8 @@
 #include "ui/glass_surface.h"
 #include "ui/text_renderer.h"
 #include "capture/frame.h"
+#include "clipboard/composition.h"
+#include <memory>
 #include <dwrite.h>
 #include <wrl/client.h>
 #include <windowsx.h>
@@ -10,7 +12,7 @@ namespace lumashot::ui {
 namespace {
 using Microsoft::WRL::ComPtr;
 struct Popup {
-    TextRenderer text_renderer;HWND window{};Dropdown menu;bool dark{},acrylic{},done{};std::optional<int> choice;
+    TextRenderer text_renderer;HWND window{};Dropdown menu;bool dark{},acrylic{},done{},glassy{};std::optional<int> choice;std::unique_ptr<ClipboardComposition> composition;
     void Choose(int index){if(index>=0&&index<int(menu.items.size()))choice=menu.items[index].second;done=true;}
     void Paint(){
         PAINTSTRUCT ps{};BeginPaint(window,&ps);RECT r{};GetClientRect(window,&r);
@@ -20,13 +22,20 @@ struct Popup {
         if(SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,factory.GetAddressOf()))&&SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(fonts.GetAddressOf())))&&SUCCEEDED(factory->CreateDCRenderTarget(&properties,&target))){
             DibSurface surface(r.right,r.bottom);target->BindDC(surface.Dc(),&r);target->CreateSolidColorBrush(D2D1::ColorF(0),&brush);target->BeginDraw();target->Clear(D2D1::ColorF(0,0.f));
             PaintContext p;p.target=target.Get();p.brush=[&](uint32_t c){brush->SetColor(D2D1::ColorF(c&0xffffff,float(c>>24)/255));return brush.Get();};const Theme theme{menu.scale,dark};
-            DrawGlassSurface(target.Get(),brush.Get(),{0,0,float(r.right),float(r.bottom)},dark,acrylic,8,menu.scale);
+            if(glassy&&acrylic)DrawBackdropTint(target.Get(),brush.Get(),{0,0,float(r.right),float(r.bottom)},dark);else DrawGlassSurface(target.Get(),brush.Get(),{0,0,float(r.right),float(r.bottom)},dark,acrylic,8,menu.scale);
             for(int i=0;i<int(menu.items.size());++i){const auto row=menu.Row(i);const float left=DrawDropdownRow(p,theme,row,i==menu.hover,i==menu.selected);ComPtr<IDWriteTextFormat> format;fonts->CreateTextFormat(ToolFont,nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*menu.scale,L"zh-CN",&format);format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);text_renderer.Draw(target.Get(),fonts.Get(),menu.items[i].first,format.Get(),{left,row.top+5*menu.scale,row.right-8*menu.scale,row.bottom},D2D1::ColorF(theme.Ink()&0xffffff));}
-            if(SUCCEEDED(target->EndDraw())){POINT origin{};SIZE size{r.right,r.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};UpdateLayeredWindow(window,nullptr,nullptr,&size,surface.Dc(),&origin,0,&blend,ULW_ALPHA);}
+            if(SUCCEEDED(target->EndDraw())){
+                if(glassy){try{if(!composition)composition=std::make_unique<ClipboardComposition>();composition->Present(window,UINT(r.right),UINT(r.bottom),surface.Pixels());}catch(...){done=true;}}
+                else{POINT origin{};SIZE size{r.right,r.bottom};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};UpdateLayeredWindow(window,nullptr,nullptr,&size,surface.Dc(),&origin,0,&blend,ULW_ALPHA);}}
         }EndPaint(window,&ps);
     }
-    static LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){auto* p=reinterpret_cast<Popup*>(GetWindowLongPtrW(w,GWLP_USERDATA));if(msg==WM_NCCREATE){p=static_cast<Popup*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);p->window=w;SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(p));}if(!p)return DefWindowProcW(w,msg,wp,lp);
-        switch(msg){case WM_NCCALCSIZE:return 0;case WM_ERASEBKGND:return 1;case WM_PAINT:p->Paint();return 0;
+    static LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
+        if(msg==WM_GETMINMAXINFO&&(GetWindowLongPtrW(w,GWL_STYLE)&WS_THICKFRAME)){reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize={1,1};return 0;}  // glass windows carry WS_THICKFRAME only for the DWM backdrop: no minimum size
+        auto* p=reinterpret_cast<Popup*>(GetWindowLongPtrW(w,GWLP_USERDATA));if(msg==WM_NCCREATE){p=static_cast<Popup*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);p->window=w;SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(p));}if(!p)return DefWindowProcW(w,msg,wp,lp);
+        switch(msg){case WM_NCCALCSIZE:return 0;case WM_ERASEBKGND:return 1;
+        case WM_NCACTIVATE:if(p->glassy)return DefWindowProcW(w,msg,TRUE,lp);break;  // Windows 11 shows a flat fallback for inactive backdrops
+        case WM_NCHITTEST:if(p->glassy)return HTCLIENT;break;
+        case WM_PAINT:p->Paint();return 0;
         case WM_MOUSEMOVE:{const int hit=p->menu.Hit({float(GET_X_LPARAM(lp)),float(GET_Y_LPARAM(lp))});if(hit!=p->menu.hover){p->menu.hover=hit;InvalidateRect(w,nullptr,FALSE);}return 0;}
         case WM_LBUTTONDOWN:if(p->menu.Hit({float(GET_X_LPARAM(lp)),float(GET_Y_LPARAM(lp))})<0)p->done=true;return 0;
         case WM_LBUTTONUP:p->Choose(p->menu.Hit({float(GET_X_LPARAM(lp)),float(GET_Y_LPARAM(lp))}));return 0;
@@ -38,13 +47,14 @@ struct Popup {
 }
 std::optional<int> TrackDropdown(HWND owner,Dropdown menu,bool dark){
     if(menu.items.empty())return {};Popup p;p.menu=std::move(menu);p.dark=dark;const auto bounds=p.menu.bounds;p.menu.bounds={0,0,bounds.right-bounds.left,bounds.bottom-bounds.top};
-    WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=Popup::Proc;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=L"LumaShot.SharedDropdown";RegisterClassW(&wc);
-    const auto w=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED,wc.lpszClassName,L"",WS_POPUP,int(bounds.left),int(bounds.top),int(std::ceil(bounds.right-bounds.left)),int(std::ceil(bounds.bottom-bounds.top)),owner,nullptr,wc.hInstance,&p);if(!w)return {};
-    ConfigureBorderlessWindow(w);ResizeBorderlessWindow(w,p.menu.scale,8);p.acrylic=SetSettingsAcrylic(w,dark);SetWindowDisplayAffinity(w,WDA_EXCLUDEFROMCAPTURE);ShowWindow(w,SW_SHOW);SetFocus(w);SetCapture(w);
+    p.glassy=TransparencyEffectsOn();WNDCLASSW wc{};wc.hInstance=GetModuleHandleW(nullptr);wc.lpfnWndProc=Popup::Proc;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=L"LumaShot.SharedDropdown";RegisterClassW(&wc);
+    const auto w=CreateWindowExW(p.glassy?(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOREDIRECTIONBITMAP):(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED),wc.lpszClassName,L"",p.glassy?(WS_POPUP|WS_THICKFRAME):WS_POPUP,int(bounds.left),int(bounds.top),int(std::ceil(bounds.right-bounds.left)),int(std::ceil(bounds.bottom-bounds.top)),owner,nullptr,wc.hInstance,&p);if(!w)return {};
+    if(p.glassy){SetWindowPos(w,nullptr,0,0,int(std::ceil(bounds.right-bounds.left)),int(std::ceil(bounds.bottom-bounds.top)),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);p.acrylic=ApplyPopupBackdrop(w,dark);}
+    else{ConfigureBorderlessWindow(w);ResizeBorderlessWindow(w,p.menu.scale,8);p.acrylic=SetSettingsAcrylic(w,dark);}
+    SetWindowDisplayAffinity(w,WDA_EXCLUDEFROMCAPTURE);ShowWindow(w,SW_SHOW);SetFocus(w);SetCapture(w);if(p.glassy)SendMessageW(w,WM_NCACTIVATE,TRUE,0);
     MSG msg{};while(!p.done){const BOOL result=GetMessageW(&msg,nullptr,0,0);if(result<=0){if(result==0)PostQuitMessage(int(msg.wParam));break;}TranslateMessage(&msg);DispatchMessageW(&msg);}
     if(GetCapture()==w)ReleaseCapture();DestroyWindow(w);if(IsWindow(owner))SetFocus(owner);return p.choice;
 }
 }
-
 
 

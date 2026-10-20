@@ -121,6 +121,26 @@ struct ClotheslineTest {
 };
 
 struct ClotheslineLiveTest {
+    // The pin canvas plus its floating hover bar over a synthetic backdrop.
+    template<class P> static void Shot(const std::string& path,P& p){
+        RECT a{};GetWindowRect(p.window,&a);RECT b=a;
+        const bool with_bar=p.hbar&&IsWindowVisible(p.hbar)&&p.bar_surface;
+        if(with_bar)GetWindowRect(p.hbar,&b);
+        const RECT u{std::min(a.left,b.left)-16,std::min(a.top,b.top)-16,std::max(a.right,b.right)+16,std::max(a.bottom,b.bottom)+16};
+        const int w=u.right-u.left,h=u.bottom-u.top;std::vector<uint32_t> canvas(size_t(w)*size_t(h));
+        for(int y=0;y<h;++y)for(int x=0;x<w;++x){const uint32_t g=0x50+uint32_t(y*0x28/std::max(1,h)),bl=std::min<uint32_t>(255,g+0x18);canvas[size_t(y)*size_t(w)+size_t(x)]=0xff000000|(g<<16)|(g<<8)|bl;}
+        const auto over=[&](const uint32_t* px,int sw,int sh,int ox,int oy,uint32_t alpha){
+            for(int yy=0;yy<sh;++yy)for(int xx=0;xx<sw;++xx){
+                const int cx=ox+xx,cy=oy+yy;if(cx<0||cy<0||cx>=w||cy>=h)continue;
+                const uint32_t c=px[size_t(yy)*size_t(sw)+size_t(xx)],sa=((c>>24)*alpha)/255;uint32_t& d=canvas[size_t(cy)*size_t(w)+size_t(cx)];uint32_t result=0xff000000;
+                for(int shift:{0,8,16}){const uint32_t sc=(((c>>shift)&255)*alpha)/255,dc=(d>>shift)&255;result|=std::min<uint32_t>(255,sc+dc*(255-sa)/255)<<shift;}
+                d=result;
+            }
+        };
+        over(p.surface->Pixels(),p.surface_width,p.surface_height,a.left-u.left,a.top-u.top,p.alpha);
+        if(with_bar)over(p.bar_surface->Pixels(),p.bar_width,p.bar_height,b.left-u.left,b.top-u.top,255);
+        WriteBmp(path,canvas.data(),w,h);
+    }
     static int Run(){
         int failures{};auto expect=[&](bool ok,const char* text){std::cout<<(ok?"PASS ":"FAIL ")<<text<<std::endl;failures+=!ok;};
 
@@ -445,11 +465,12 @@ struct ClotheslineLiveTest {
             D2D1_RECT_F tools[2]{};
             expect(p.ToolRects(tools)&&tools[0].right<=tools[0].left&&tools[1].right>tools[1].left,"only the close button remains while off");
             p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(40,200));Pump(260);
-            SendMessageW(window,WM_MOUSEMOVE,0,hang_at);
-            expect(p.tool_alpha==1&&p.tool_hover<0&&p.ToolAt(hang_at)<0,"the old hang button spot is plain image while off");
+            p.bar_tracking=true;SendMessageW(p.hbar,WM_MOUSEMOVE,0,hang_at);
+            // The bar is right-aligned: without hang, copy slides into its spot.
+            expect(p.tool_alpha==1&&p.tool_hover!=PinToolHang&&p.ToolAt(hang_at)!=PinToolHang,"the old hang button spot no longer hangs while off");
             Pump(30);WriteBmp("build/agent/pin-hover-clothesline-off.bmp",p.surface->Pixels(),p.surface_width,p.surface_height);
-            SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,hang_at);
-            expect(p.tool_down<0,"clicking the old hang button spot does not press a button");
+            SendMessageW(p.hbar,WM_LBUTTONDOWN,MK_LBUTTON,hang_at);
+            expect(p.tool_down!=PinToolHang,"clicking the old hang button spot does not press hang");
             ReleaseCapture();p.moving=p.selecting=false;
             p.moving=p.dragged=true;
             expect(!manager.DropOnLine(p)&&!p.hung,"dropping at the top edge does not hang while off");
@@ -471,30 +492,110 @@ struct ClotheslineLiveTest {
             expect(p.tool_alpha==0&&p.ToolAt(at(1))<0,"buttons hidden until hovered");
             p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(40,200));Pump(260);
             expect(p.hovered&&p.tool_alpha==1,"hovering fades the buttons in");
-            SendMessageW(window,WM_MOUSEMOVE,0,at(1));
+            p.bar_tracking=true;SendMessageW(p.hbar,WM_MOUSEMOVE,0,at(1));
             expect(p.tool_hover==1&&p.ToolAt(at(1))==1,"close button highlights under the cursor");
             Pump(30);WriteBmp("build/agent/pin-hover-close.bmp",p.surface->Pixels(),p.surface_width,p.surface_height);
-            SendMessageW(window,WM_MOUSEMOVE,0,at(0));Pump(30);WriteBmp("build/agent/pin-hover-hang.bmp",p.surface->Pixels(),p.surface_width,p.surface_height);
-            SendMessageW(window,WM_MOUSELEAVE,0,0);Pump(260);
-            expect(!p.hovered&&p.tool_alpha==0&&p.tool_hover<0,"leaving the pin fades the buttons out");
-            p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,at(0));Pump(260);
-            SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,at(0));
-            expect(p.tool_down==0&&GetCapture()==window&&!p.moving,"pressing a button does not start a pin drag");
-            SendMessageW(window,WM_LBUTTONUP,0,at(0));
+            SendMessageW(p.hbar,WM_MOUSEMOVE,0,at(0));Pump(30);WriteBmp("build/agent/pin-hover-hang.bmp",p.surface->Pixels(),p.surface_width,p.surface_height);
+            SendMessageW(window,WM_MOUSELEAVE,0,0);SendMessageW(p.hbar,WM_MOUSELEAVE,0,0);Pump(650);
+            expect(!p.hovered&&p.tool_alpha==0&&p.tool_hover<0&&!IsWindowVisible(p.hbar),"leaving the pin fades the buttons out");
+            p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(40,200));Pump(260);
+            SendMessageW(p.hbar,WM_LBUTTONDOWN,MK_LBUTTON,at(0));
+            expect(p.tool_down==0&&GetCapture()==p.hbar&&!p.moving,"pressing a button does not start a pin drag");
+            SendMessageW(p.hbar,WM_LBUTTONUP,0,at(0));
             expect(p.hung&&manager.line_->Contains(id)&&p.tool_alpha==0&&!p.hovered,"hang button hangs the pin on the rope");
             Pump(500);manager.line_->Remove(id);manager.RetrievePin(id,{100,10,180,55});Pump(600);
             p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,at(1));Pump(260);
             p.locked=true;manager.UpdateTools(p);Pump(260);
             expect(p.tool_alpha==0&&!p.ToolsWanted()&&p.ToolAt(at(1))<0,"locked pins hide the buttons");
             p.locked=false;manager.UpdateTools(p);Pump(260);
-            SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,at(1));SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(5,5));
+            SendMessageW(p.hbar,WM_LBUTTONDOWN,MK_LBUTTON,at(1));SendMessageW(p.hbar,WM_LBUTTONUP,0,MAKELPARAM(5,5));
             expect(!p.closing&&IsWindowVisible(window),"releasing outside the button cancels");
-            SendMessageW(window,WM_LBUTTONDOWN,MK_LBUTTON,at(1));SendMessageW(window,WM_LBUTTONUP,0,at(1));
+            SendMessageW(p.hbar,WM_LBUTTONDOWN,MK_LBUTTON,at(1));SendMessageW(p.hbar,WM_LBUTTONUP,0,at(1));
             expect(p.closing&&IsWindow(window),"close button starts the fade-out");
             Pump(400);manager.Ready();
             expect(!IsWindow(window)&&!manager.pins_.contains(id),"the pin closes after fading out");
             manager.line_->Hide();Pump(300);
             expect(ClotheslineTest::PollInterval(*manager.line_)==0,"no pins left: the top edge is no longer polled");
+        }
+        // ---- Hover bar window (full.html .pin .hbar) ------------------------
+        {
+            PinManager manager(host);int annotated=0;
+            manager.annotate=[&](uint64_t,std::shared_ptr<const Frame>,Document,RECT){++annotated;return false;};
+            // A synthetic "document" so the glass bar is judged against real-looking content.
+            auto image=MakeFrame({0,0,520,300},0xfff7f8fb);
+            for(int y=0;y<300;++y)for(int x=0;x<520;++x){
+                uint32_t& px=image.pixels[size_t(y)*520+size_t(x)];
+                if(y<40)px=0xff2f6fed;else if((y-60)%28<10&&x>=28&&x<28+((y/28)%3==0?300:440))px=0xffc9ced8;
+            }
+            manager.Create(image,image,{320,300},std::nullopt,{},false);auto& p=*manager.pins_.rbegin()->second;
+            const HWND window=p.window;const float s=p.dpi/96;
+            using Bar=std::remove_reference_t<decltype(p)>::ToolBar;Bar bar{};
+            expect(p.ToolLayout(bar)&&bar.order[0]==PinToolAnnotate&&bar.order[bar.count-2]==PinToolMore&&bar.order[bar.count-1]==PinToolClose,"annotate first, more then close last");
+            expect(bar.count==(p.ocr_tool?6:5)&&(!p.ocr_tool||bar.order[1]==PinToolOcr),"annotate, OCR, copy, hang, more, close");
+            expect(bar.rect[PinToolHang].left>bar.rect[PinToolCopy].right&&bar.rect[PinToolMore].left>bar.rect[PinToolHang].right,"copy, hang, more in order");
+            expect(bar.separator>bar.rect[PinToolMore].right&&bar.separator<bar.rect[PinToolClose].left,"a separator stands before close");
+            bool sized=true;for(int i=0;i<bar.count;++i){const auto& r=bar.rect[bar.order[i]];sized=sized&&std::abs((r.right-r.left)-30*s)<.01f;}
+            expect(sized&&std::abs((bar.bar.bottom-bar.bar.top)-36*s)<.01f,"30 DIP buttons in a 36 DIP bar (full.html .hbar)");
+            expect(!p.hbar||!IsWindowVisible(p.hbar),"no bar until hovered");
+            RECT pin_rect{};GetWindowRect(window,&pin_rect);
+            const float image_left=float(pin_rect.left)+float(p.Inset())+p.offset.x,image_top=float(pin_rect.top)+float(p.Inset())+p.offset.y,image_right=image_left+520*p.zoom;
+            p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(int(image_left-float(pin_rect.left)+60),int(image_top-float(pin_rect.top)+200)));Pump(260);
+            expect(p.tool_alpha==1&&p.hbar&&IsWindowVisible(p.hbar),"hovering the pin shows the bar window");
+            if(!p.hbar){DestroyWindow(window);manager.Ready();return 1;}
+            RECT bar_rect{};GetWindowRect(p.hbar,&bar_rect);p.ToolLayout(bar);
+            expect(!p.bar_below&&std::abs(float(bar_rect.top)+bar.bar.bottom-(image_top-8*s))<=1.5f&&std::abs(float(bar_rect.left)+bar.bar.right-image_right)<=1.5f,"the bar floats 8 DIP above the image, right edges aligned");
+            const LONG styles=GetWindowLongW(p.hbar,GWL_EXSTYLE);
+            expect((styles&WS_EX_NOACTIVATE)&&(styles&WS_EX_LAYERED)&&GetWindow(p.hbar,GW_OWNER)==window,"a layered, non-activating window owned by the pin");
+            {
+                const int cx=int(image_right-float(pin_rect.left)-20*p.zoom),cy=int(image_top-float(pin_rect.top)+20*p.zoom);
+                const uint32_t px=p.surface->Pixels()[size_t(cy)*size_t(p.surface_width)+size_t(cx)];
+                expect(std::abs(int((px>>16)&255)-0x2f)<=3&&std::abs(int(px&255)-0xed)<=3,"the pin's own canvas (and so every export) has no buttons");
+            }
+            Shot("build/toolbar-customization/pinbar-shots/bar.bmp",p);
+            const auto at=[&](int id){const auto& r=bar.rect[id];return MAKELPARAM(int((r.left+r.right)/2),int((r.top+r.bottom)/2));};
+            const char* names[]={"hang","close","annotate","ocr","copy","more"};
+            p.bar_tracking=true;
+            for(int i=0;i<bar.count;++i){
+                const int id=bar.order[i];SendMessageW(p.hbar,WM_MOUSEMOVE,0,at(id));
+                expect(p.tool_hover==id&&p.ToolAt(at(id))==id&&!p.tip_ready,(std::string("hover highlights ")+names[id]).c_str());
+                Pump(450);Shot(std::string("build/toolbar-customization/pinbar-shots/hover-")+names[id]+".bmp",p);
+            }
+            expect(p.tip_ready,"the tooltip shows after the 380 ms delay");
+            SendMessageW(window,WM_MOUSELEAVE,0,0);Pump(450);
+            expect(p.tool_alpha==1&&IsWindowVisible(p.hbar),"moving from the pin onto the bar keeps it shown");
+            SendMessageW(p.hbar,WM_MOUSELEAVE,0,0);Pump(650);
+            expect(p.tool_alpha==0&&!IsWindowVisible(p.hbar)&&p.tool_hover<0,"leaving pin and bar fades the bar out");
+            expect(PinToolLabel(PinToolAnnotate,false,false,false)==L"标注"&&PinToolKey(PinToolAnnotate)==L"空格"&&PinToolLabel(PinToolHang,false,false,false)==L"晾到绳上"&&PinToolKey(PinToolHang)==L"H"
+                &&PinToolLabel(PinToolMore,false,false,false)==L"更多"&&PinToolLabel(PinToolCopy,false,false,false)==L"复制图片（加入历史）","tooltips follow full.html data-tip / data-k");
+            expect(PinToolLabel(PinToolCopy,false,false,true)==L"已复制 · 已加入剪贴板历史"&&PinToolLabel(PinToolOcr,false,true,false)==L"复制识别出的文字"&&PinToolLabel(PinToolOcr,true,false,false)==L"正在识别文字…","copy and OCR tooltips follow the state");
+            p.tracking=true;SendMessageW(window,WM_MOUSEMOVE,0,MAKELPARAM(int(image_left-float(pin_rect.left)+60),int(image_top-float(pin_rect.top)+200)));Pump(260);
+            {
+                RECT before{};GetWindowRect(p.hbar,&before);
+                SetWindowPos(window,nullptr,pin_rect.left+60,pin_rect.top+40,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);Pump(60);
+                RECT after{};GetWindowRect(p.hbar,&after);
+                expect(after.left-before.left==60&&after.top-before.top==40,"the bar follows the pin");
+            }
+            SendMessageW(p.hbar,WM_LBUTTONDOWN,MK_LBUTTON,at(PinToolAnnotate));
+            expect(p.tool_down==PinToolAnnotate&&GetCapture()==p.hbar&&!p.moving,"pressing a bar button captures on the bar; the pin does not move");
+            SendMessageW(p.hbar,WM_LBUTTONUP,0,at(PinToolAnnotate));
+            expect(annotated==1&&!p.editing,"annotate button starts annotation (Space)");
+            DestroyWindow(window);manager.Ready();Pump(100);
+            // Near the top of the work area the bar drops below the image (.hbar.below).
+            MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint({400,400},MONITOR_DEFAULTTONEAREST),&monitor);
+            auto tiny_image=MakeFrame({0,0,int(64*s),int(36*s)},0xff52a36b);
+            manager.Create(tiny_image,tiny_image,{monitor.rcWork.left+400,monitor.rcWork.top+4},std::nullopt,{},false);auto& q=*manager.pins_.rbegin()->second;
+            q.tracking=true;SendMessageW(q.window,WM_MOUSEMOVE,0,MAKELPARAM(q.Inset()+5,q.Inset()+5));Pump(260);
+            expect(q.ToolLayout(bar)&&bar.count==(q.ocr_tool?6:5),"tiny pins still get the whole bar (it floats outside the image)");
+            if(q.hbar){
+                RECT qr{},qb{};GetWindowRect(q.window,&qr);GetWindowRect(q.hbar,&qb);
+                const float q_bottom=float(qr.top)+float(q.Inset())+q.offset.y+float(tiny_image.Height())*q.zoom;
+                expect(q.bar_below&&std::abs(float(qb.top)+bar.bar.top-(q_bottom+8*s))<=1.5f,"no room above: the bar sits 8 DIP below the image");
+                q.bar_tracking=true;const auto& more=bar.rect[PinToolMore];
+                SendMessageW(q.hbar,WM_MOUSEMOVE,0,MAKELPARAM(int((more.left+more.right)/2),int((more.top+more.bottom)/2)));Pump(450);
+                Shot("build/toolbar-customization/pinbar-shots/below.bmp",q);
+            }else expect(false,"tiny pin shows a bar window");
+            DestroyWindow(q.window);manager.Ready();Pump(100);
+            manager.line_->Hide();Pump(200);
         }
         DestroyWindow(host);
         return failures?1:0;

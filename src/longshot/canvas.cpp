@@ -3,6 +3,7 @@
 #include "ui/memory_target.h"
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 
 #pragma comment(lib, "d2d1.lib")
@@ -88,7 +89,8 @@ void Painter::Panel(Box b, bool acrylic, float radius_dip) {
     ui::DrawGlassSurface(target_, brush_.Get(), Rect(b), dark_, acrylic, radius_dip, scale_);
 }
 
-void Painter::Backdrop(Box b, bool acrylic) {
+void Painter::Backdrop(Box b, bool acrylic, bool tint) {
+    if (acrylic && tint) { ui::DrawBackdropTint(target_, brush_.Get(), Rect(b), dark_); return; }
     target_->FillRectangle(Rect(b), Brush(acrylic ? 0x01000000u : (0xff000000u | PanelBackground(dark_))));
 }
 
@@ -289,6 +291,22 @@ void LayeredCanvas::Paint(HWND window, Painter& painter, RECT screen, float scal
     draw();
     painter.End();
     if (target_->EndDraw() == D2DERR_RECREATE_TARGET) target_.Reset();
+    if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) {
+        RECT current{};
+        GetWindowRect(window, &current);
+        if (current.left != screen.left || current.top != screen.top || current.right - current.left != size.cx || current.bottom - current.top != size.cy)
+            SetWindowPos(window, nullptr, screen.left, screen.top, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        // The DIB rows are padded to an even width; the swap chain takes tightly packed rows.
+        const uint32_t* pixels = surface_->Pixels();
+        if (padded.cx != size.cx) {
+            packed_.resize(size_t(size.cx) * size.cy);
+            for (int y = 0; y < size.cy; ++y) std::copy_n(pixels + size_t(y) * padded.cx, size.cx, packed_.data() + size_t(y) * size.cx);
+            pixels = packed_.data();
+        }
+        if (!composition_) composition_ = std::make_unique<ClipboardComposition>();
+        composition_->Present(window, UINT(size.cx), UINT(size.cy), pixels);
+        return;
+    }
     POINT origin{}, position{screen.left, screen.top};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(window, nullptr, &position, const_cast<SIZE*>(&size), surface_->Dc(), &origin, 0, &blend, ULW_ALPHA);

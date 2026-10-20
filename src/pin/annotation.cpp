@@ -2,8 +2,9 @@
 #include <wincodec.h>
 #include <algorithm>
 namespace lumashot {
-Frame PinAnnotationPreview(const Frame& source,RECT display,RECT canvas){
-    auto frame=MakeFrame(canvas,0xfff4f7fb);const int width=std::max(1L,display.right-display.left),height=std::max(1L,display.bottom-display.top);
+Frame PinAnnotationPreview(const Frame& source,RECT display,RECT canvas,const Frame* backdrop){
+    const bool usable=backdrop&&EqualRect(&backdrop->bounds,&canvas)&&backdrop->pixels.size()==static_cast<size_t>(backdrop->Width())*static_cast<size_t>(backdrop->Height());
+    auto frame=usable?*backdrop:MakeFrame(canvas,0xfff4f7fb);const int width=std::max(1L,display.right-display.left),height=std::max(1L,display.bottom-display.top);
     ComPtr<IWICImagingFactory> wic;CheckWin32(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&wic))),"Annotation imaging");
     ComPtr<IWICBitmap> input;CheckWin32(SUCCEEDED(wic->CreateBitmapFromMemory(source.Width(),source.Height(),GUID_WICPixelFormat32bppBGRA,source.Width()*4,UINT(source.pixels.size()*4),reinterpret_cast<BYTE*>(const_cast<uint32_t*>(source.pixels.data())),&input)),"Annotation source");
     ComPtr<IWICBitmapScaler> scaler;wic->CreateBitmapScaler(&scaler);CheckWin32(SUCCEEDED(scaler->Initialize(input.Get(),width,height,WICBitmapInterpolationModeFant)),"Annotation scale");
